@@ -1,0 +1,91 @@
+[project]
+name = "qwen-moe"
+version = "0.1.0"
+description = "Expert parallelism support in nanovllm for Qwen MoE"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch~=2.11.0",
+    "transformers",
+    "safetensors",
+    "tokenizers",
+    "numpy",
+    "jsonlines",
+    "pytest>=8",
+    "ruff",
+    "accelerate>=1.14.0",
+    "ipykernel>=7.3.0",
+    "xxhash",
+    "flash-attn==2.8.3.post1",
+    "ninja",  # parallelizes flash-attn's nvcc build
+]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "qwen_moe"
+module-root = ""
+
+[tool.uv]
+package = true
+python-preference = "managed"
+
+# flash-attn's setup.py imports torch at build time and links its extension
+# against the currently-installed torch's C++ ABI.  We do NOT want an
+# isolated build env — that would resolve a fresh torch (whichever version)
+# and the resulting .so would fail to load under our runtime torch 2.11
+# (that's exactly the "undefined symbol" error we hit with the prebuilt
+# 2.8-torch wheel).  no-build-isolation lets the build see our venv's
+# torch 2.11 directly.
+no-build-isolation-package = ["flash-attn"]
+
+# Pin torch to the PyTorch cu126 wheel index instead of PyPI's default build.
+# PyPI's torch 2.11.0 is `+cu130`, which requires an NVIDIA driver >= r580.
+# The available machines have driver 550 (CUDA 12.4) on A100 GPUs, so we use
+# the cu126 wheel — CUDA 12.x minor-version compatibility lets driver 550
+# run cu126.  `explicit = true` scopes this index to packages that reference
+# it below, so it can't accidentally serve other dependencies.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+# When nanovllm is cloned locally, add:
+# nanovllm = { path = "./nanovllm", editable = true }
+
+# flash-attn: no prebuilt wheel exists for torch 2.11 (latest stable
+# v2.8.3.post1 tops out at torch 2.8; FA4 betas are Hopper-only).  The
+# torch-2.8 wheel loaded but crashed on `import` with an undefined-symbol
+# error against torch 2.11's C++ ABI.  Instead we build the sdist against
+# our runtime torch — see `[tool.uv]` no-build-isolation-package above.
+#
+# Recommended build invocation (~30–60 min on this A100 pod):
+#
+#   TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=4 uv sync -v
+#
+# TORCH_CUDA_ARCH_LIST=8.0 restricts nvcc codegen to A100 (sm_80); MAX_JOBS
+# caps parallel nvcc processes so build doesn't OOM the pod.  CUDA_HOME is
+# NOT needed — torch's cpp_extension falls back to /usr/local/cuda when
+# nvcc isn't on PATH and neither CUDA_HOME nor CUDA_PATH is set.
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "WARNING"
+addopts = "-s"
+# so `import bootcamp.*` works from the repo root without installing bootcamp
+# as a package (bootcamp/ is a sibling of qwen_moe/, not built into the wheel)
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 180
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "E501"]
+
+[tool.ruff.lint]
+extend-select = ["UP"]
+ignore = ["F722"]
