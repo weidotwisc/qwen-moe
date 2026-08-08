@@ -25,9 +25,8 @@ def destroy_dist() -> None:
         dist.destroy_process_group()
 
 
-def all_reduce_sum(x: torch.Tensor, group: dist.ProcessGroup | None = None) -> torch.Tensor:
+def all_reduce_sum(x: torch.Tensor, group: dist.ProcessGroup | None = None) -> None:
     dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
-    return x
 
 
 def all_gather_into_tensor_wrapper(

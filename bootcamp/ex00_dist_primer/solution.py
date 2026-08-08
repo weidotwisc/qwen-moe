@@ -81,8 +81,8 @@ def destroy_dist() -> None:
     Post:  `dist.is_initialized()` is False.
     """
     # TODO(you): `dist.destroy_process_group()` if `dist.is_initialized()`.
-    if dist.is_initialized():
-        dist.destroy_process_group()
+   
+    dist.destroy_process_group()
 
 
 # ============================================================================
@@ -90,18 +90,19 @@ def destroy_dist() -> None:
 # ============================================================================
 
 
-def all_reduce_sum(x: torch.Tensor, group: dist.ProcessGroup | None = None) -> torch.Tensor:
+def all_reduce_sum(x: torch.Tensor, group: dist.ProcessGroup | None = None) -> None:
     """SUM-reduce `x` across `group`; every rank ends up with the sum.
 
     Pre:   x has the SAME shape and dtype on every rank of `group`.
            x is on the CUDA device bound to this rank.
     Post:  x is mutated in place to be sum_{r in group} x_r.
-           Return the same tensor for chaining.
+           Returns None — matches `list.sort()` / `random.shuffle()` convention,
+           which returns None precisely to make the in-place mutation obvious.
     """
     # TODO(you): one call to dist.all_reduce with op=SUM and the given group.
-    raise NotImplementedError
+    dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
 
-
+# weiz all_gather_into_tensor is different from all_gather in that we can use one tensor to get the results, all_gather will require output to be a list of tensors
 def all_gather_into_tensor_wrapper(
     x: torch.Tensor, group: dist.ProcessGroup | None = None
 ) -> torch.Tensor:
@@ -119,7 +120,10 @@ def all_gather_into_tensor_wrapper(
     # 2. Allocate output of shape (world_size, *x.shape) on the same device/dtype.
     # 3. dist.all_gather_into_tensor(output, x, group=group).
     # 4. Return output.
-    raise NotImplementedError
+    world_size = dist.get_world_size(group=group)
+    output = torch.zeros((world_size, *x.shape), device=x.device, dtype=x.dtype)
+    dist.all_gather_into_tensor(output, x, group=group)
+    return output
 
 
 def reduce_scatter_sum_tensor_wrapper(
@@ -140,7 +144,11 @@ def reduce_scatter_sum_tensor_wrapper(
     # 3. Allocate output of shape x.shape[1:].
     # 4. dist.reduce_scatter_tensor(output, x, op=SUM, group=group).
     # 5. Return output.
-    raise NotImplementedError
+    world_size = dist.get_world_size(group=group)
+    assert(x.shape[0] == world_size)
+    output = torch.zeros(*x.shape[1:], device=x.device, dtype=x.dtype)
+    dist.reduce_scatter_tensor(output, x, op=dist.ReduceOp.SUM, group=group)
+    return output
 
 
 def all_to_all_equal(
@@ -157,7 +165,9 @@ def all_to_all_equal(
     # 1. Allocate `output` of the same shape/dtype/device as x.
     # 2. dist.all_to_all_single(output, x, group=group).
     # 3. Return output.
-    raise NotImplementedError
+    output = torch.zeros_like(x)
+    dist.all_to_all_single(output,x, group=group)
+    return output
 
 
 def all_to_all_variable(
@@ -189,4 +199,16 @@ def all_to_all_variable(
     #        input_split_sizes=input_split_sizes,
     #        group=group).
     # 4. Return output.
-    raise NotImplementedError
+    # weiz: input_split_sizes[j] is how many rows this rank is sending to rank[j]
+    #       output_split_sizes[j] is how many rows this rank is recieving from rank[j]
+    world_size = dist.get_world_size(group=group)
+    rank = dist.get_rank(group=group)
+    assert world_size == len(input_split_sizes) and world_size == len(output_split_sizes)
+    total_rows_to_send = sum(input_split_sizes)
+    total_rows_to_recieve = sum(output_split_sizes)
+    recv_buf = torch.zeros((total_rows_to_recieve, *x.shape[1:]), 
+                           device=x.device, dtype=x.dtype) # x is actually the send buffer
+    dist.all_to_all_single(recv_buf, x, output_split_sizes=output_split_sizes, input_split_sizes=input_split_sizes, group=group)
+    return recv_buf
+
+
