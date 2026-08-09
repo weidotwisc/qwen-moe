@@ -40,7 +40,7 @@ Look at [solution.py](solution.py) for the exact signatures and the
 
 ```sh
 # on the qwen-moe root, .venv activated (or use `uv run`)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 pytest -x bootcamp/tests/test_ex01_linear_tp.py -v
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 pytest -x tests/test_ex01_linear_tp.py -v
 ```
 
 The test parametrizes `tp_size ∈ {1, 2, 4, 8}` and `dtype ∈ {fp32, bf16}`.

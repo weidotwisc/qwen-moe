@@ -49,3 +49,44 @@ Exercise 4 will:
   the fix that's missing from `nanovllm-jun/nanovllm/layers/linear.py`.
 
 Get this exercise clean first; ex04 subclasses this one.
+
+## Aside — a code-organization pattern you'll meet in production
+
+By ex03 you have four TP linear classes in this course:
+`ColumnParallelLinear`, `RowParallelLinear`, `MergedColumnParallelLinear`,
+`QKVParallelLinear` — and ex04 will add a fifth. Each hardcodes its
+sharding axis: Column-family slices `dim 0` of `[out, in]`, Row slices
+`dim 1`. Two dedicated implementations of the shard math live in two
+different `weight_loader` bodies.
+
+In production codebases where the class count is much higher (nanovllm's
+[layers/linear.py](../../nanovllm-jun/nanovllm/layers/linear.py) has 5+
+variants, Megatron's has 8+), that duplication becomes a maintenance
+burden. The refactor everyone converges to is a single `LinearBase` that
+takes a `tp_dim` attribute:
+
+```python
+class LinearBase(nn.Module):
+    def __init__(self, ..., tp_dim: int | None = None):
+        self.tp_dim = tp_dim  # 0 for column, 1 for row, None for replicated
+
+    def weight_loader(self, param, loaded_weight):
+        # One implementation that handles both dims via narrow(self.tp_dim, ...)
+        shard_size = param.data.size(self.tp_dim)
+        start = self.tp_rank * shard_size
+        loaded = loaded_weight.narrow(self.tp_dim, start, shard_size)
+        param.data.copy_(loaded)
+```
+
+Then `ColumnParallelLinear`, `RowParallelLinear`, and their variants
+become thin subclasses that only set `tp_dim` at construction time
+(`0`, `1`, or `None`).  This is what `nanovllm-jun/nanovllm/layers/linear.py`
+does — see [`LinearBase`](../../nanovllm-jun/nanovllm/layers/linear.py) and
+how each subclass just passes `tp_dim` upward.
+
+**We keep the classes distinct in the bootcamp for pedagogical clarity**:
+you can see "column shards dim 0, row shards dim 1" as a hardcoded fact
+side-by-side, not as an attribute you have to trace. When you port back
+to nanovllm-jun in the second week of your workshop project, you'll
+refactor toward the `tp_dim` pattern — recognize it when you meet it,
+but don't feel obligated to introduce it here.

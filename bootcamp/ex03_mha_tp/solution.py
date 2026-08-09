@@ -21,6 +21,7 @@ Depends on your ex01 solution.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -52,6 +53,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         num_kv_heads: int,
         tp_size: int,
         tp_rank: int,
+        group: dist.ProcessGroup | None = None,
     ) -> None:
         assert num_heads == num_kv_heads, (
             "ex03 handles MHA only (num_heads == num_kv_heads). "
@@ -66,7 +68,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         # Total merged output = Q_all + K_all + V_all.
         output_size = (num_heads + 2 * num_kv_heads) * head_size
-        super().__init__(hidden, output_size, tp_size, tp_rank)
+        super().__init__(hidden, output_size, tp_size, tp_rank, group=group)
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: str) -> None:  # type: ignore[override]
         """Copy this rank's slice of a full [num_(kv_)heads * head_size, hidden]
@@ -100,6 +102,7 @@ class TPMHA(nn.Module):
         tp_size: int,
         tp_rank: int,
         rope_base: float = 10000.0,
+        group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
         assert n_heads % tp_size == 0
@@ -110,8 +113,8 @@ class TPMHA(nn.Module):
         self.rope_base = rope_base
 
         # TODO(you):
-        # 1. self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank)
-        # 2. self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank)
+        # 1. self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group)
+        # 2. self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank, group=group)
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

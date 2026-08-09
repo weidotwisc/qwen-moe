@@ -16,6 +16,7 @@ Depends on your ex01 solution.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -36,9 +37,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     then `weight_loader(up_full_weight, 1)`.
     """
 
-    def __init__(self, in_features: int, output_sizes: list[int], tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        output_sizes: list[int],
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
         # Reuse ColumnParallelLinear's __init__ with the total output.
-        super().__init__(in_features, sum(output_sizes), tp_size, tp_rank)
+        super().__init__(in_features, sum(output_sizes), tp_size, tp_rank, group=group)
         self.output_sizes = output_sizes
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: int) -> None:  # type: ignore[override]
@@ -73,10 +81,17 @@ class TPSwiGLUMLP(nn.Module):
     would be one too many; this design has EXACTLY ONE.
     """
 
-    def __init__(self, hidden: int, intermediate: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self,
+        hidden: int,
+        intermediate: int,
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         # TODO(you): allocate self.gate_up_proj (MergedColumnParallelLinear)
-        # and self.down_proj (RowParallelLinear).
+        # and self.down_proj (RowParallelLinear). Pass `group=group` down to both.
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

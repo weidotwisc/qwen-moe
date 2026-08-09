@@ -176,4 +176,134 @@ tractable:
 
 ---
 
-<!-- Add Ex01 summary below when done. -->
+## Ex01 — Linear Tensor Parallelism
+
+Two classes: `ColumnParallelLinear` (shards output dim) and
+`RowParallelLinear` (shards input dim). One collective total per
+`Column → Row` pair (the row's all-reduce). The math is easy; the
+conventions around it are where all the friction lives.
+
+### 1. Sharding math
+
+Full weight lives at shape `[out_features, in_features]` in PyTorch's
+convention. Each rank holds a slice:
+
+| Class | Slice on | Per-rank shape | Collective in forward |
+|---|---|---|---|
+| `ColumnParallelLinear` | dim 0 (out) | `[out/N, in]` | none — output stays sharded |
+| `RowParallelLinear`    | dim 1 (in)  | `[out, in/N]` | one `all_reduce(SUM)` on the partial output |
+
+Composed: `Column → Row` gives one all-reduce per pair, which is why
+MLPs are shaped as `col → row` (gate_up → down), not the reverse. The
+row's all-reduce is the *only* cross-rank comm in a whole MLP.
+
+Under Axler's `y = Wx` mental model: **ColumnParallel = shard rows of W
+= each rank computes some rows of `y`**; **RowParallel = shard columns
+of W = each rank contributes a partial sum**, all-reduce sums the
+partials.
+
+### 2. Convention landscape (this is the pedagogical content)
+
+The exercise is *simple*; the conventions are what took time to sort.
+
+- **PyTorch stores `W` in `[out, in]`.** This matches classical
+  linear-algebra `y = Wx` where inputs are column vectors. `.weight.shape`
+  reports this honestly.
+- **`F.linear(x, W)` computes `x @ W.T`** (batched row-vector inputs
+  need a `.T` on `W`). The transpose is a zero-copy view; cuBLAS
+  applies it via the `transb=True` flag with no data movement.
+- **Constructor and shape disagree on ordering.** `nn.Linear(in, out)`
+  is data-flow order (input→output). `.weight.shape == (out, in)` is
+  matrix-notation order (rows-first). Both mathematically legitimate,
+  jarring together.
+- **Megatron's `A = W.T` framing** in the paper vs W-storage in the code
+  is a *known* convention gap, not a bug. Megatron's own code has this
+  comment: *"torch.nn.functional.linear performs XA^T + b and as a
+  result we allocate the transpose."*  ([Megatron layers.py L969](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/layers.py#L969)).
+- **Other frameworks disagree.** JAX/Flax's `Dense`, Keras, and CMU
+  10-714's needle store weight in `[in, out]` (A-shape) — cleaner spec
+  ↔ code correspondence. PyTorch is the awkward outlier for legacy
+  BLAS/Torch7 reasons. The bootcamp sticks with PyTorch's convention
+  for ecosystem alignment.
+- **My chosen mental model**: Axler-camp. Trust `.shape` = W-shape,
+  read Megatron's "columns of A" as "rows of W" on the fly.
+- **Naming translation**: `ColumnParallel` = shard the *out* dim
+  (whether you call that "columns of A" or "rows of W"). `RowParallel`
+  = shard the *in* dim. When in doubt, name axes by their semantic role
+  (out vs in), not by "row/column."
+
+### 3. Traps I hit
+
+- **Operator precedence in shard-index math.** `tp_rank // tp_size * N`
+  ≠ `tp_rank * N // tp_size`. Python evaluates `//` and `*` left-to-right
+  (same precedence). If `tp_rank < tp_size` — always true — then
+  `tp_rank // tp_size = 0` and the whole expression collapses to 0 or
+  `N`, silently producing empty or full slices. My first ColumnParallel
+  passed only the `tp_size=1` cases (2/8 tests). The fix is
+  `tp_rank * (N // tp_size)` — parenthesize what you mean.
+- **`self.weight` should be an `nn.Parameter` allocated in `__init__`
+  with `torch.empty(shape, ...)`, then filled by `weight_loader.data.copy_(shard)`.**
+  I initially created `nn.Parameter(shard)` *inside* `weight_loader`
+  (for Column) or assigned a raw tensor (for Row). Both pass Ex01's
+  tests because `.to()` is called before `weight_loader` and full_weight
+  is already on the target device/dtype. But this pattern:
+  1. Doesn't participate in `.to(device, dtype)` after construction.
+  2. Isn't visible to `nn.Module.parameters()` / optimizer / hooks /
+     `torch.compile` guards.
+  3. **Will break in Ex02**, where `MergedColumnParallelLinear.weight_loader`
+     is called twice at different offsets — the pattern needs the same
+     pre-allocated buffer both times.
+- **Inconsistent attr naming.** I used `self.params` in Column but
+  `self.weight` in Row. Both work for Ex01, but Ex02's subclass expects
+  `self.weight` on Column. Pick one name (the standard is `self.weight`).
+
+### 4. Verification framing
+
+- **`.shape` is the abstraction boundary.** Whichever convention you
+  pick for weight storage, `.shape` is the honest source of truth. The
+  paper's `A` never exists as a real `Parameter`; it's a narrative device
+  for the abstract spec. The transpose lives entirely in `weight_loader`
+  (as a `.T` at load time if you chose A-space storage) or entirely in
+  `forward` (as a `.T` view in `F.linear`, if you chose W-space).
+- **Sharding rule as a spec**: "at end of `weight_loader`, rank r's
+  `self.weight.data == full_weight.narrow(shard_dim, r * shard_size,
+  shard_size)`."  Two lines, straightforward Verus predicate.
+- **Forward invariant**: after `RowParallelLinear.forward` returns,
+  `y` is *replicated* across the TP group. Before the `all_reduce`, it
+  was *partial-sum-sharded*. That single all-reduce is the state
+  transition.
+
+### 5. Deferred: the pattern overhaul (revisit after Ex02)
+
+My Ex01 currently:
+- creates `nn.Parameter` inside `weight_loader` (Column) or assigns raw
+  tensor (Row);
+- uses `self.params` on Column and `self.weight` on Row;
+- lacks the divisibility assert on `RowParallelLinear.__init__`.
+
+All three will be fixed **once Ex02 forces the issue** — the merged
+variant needs a pre-allocated buffer, uniform `self.weight` name, and
+the invariants tightened. Then come back here and:
+
+1. Move `self.weight = nn.Parameter(torch.empty(shard_shape))` into
+   both classes' `__init__`.
+2. Change both `weight_loader` bodies to `self.weight.data.copy_(shard)`.
+3. Rename `self.params → self.weight` in Column.
+4. Add `assert in_features % tp_size == 0` in Row's `__init__`.
+5. Re-run `pytest bootcamp/tests/test_ex01_linear_tp.py` — should still be 8/8.
+
+This "let the next exercise force the earlier fix" pattern is
+deliberate — I learn the invariant by feeling the failure, not by being
+told. Just don't forget to circle back before the paper's proof
+artifact is finalized. The Ex01 code in the paper's artifact should
+have all three fixes applied.
+
+### Reference material worth revisiting
+
+- [Megatron-LM layers.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/layers.py) — the self-aware `# we allocate the transpose` comment.
+- [bootcamp/ex01_linear_tp/README.md](ex01_linear_tp/README.md) — the code-organization aside about `LinearBase` + `tp_dim` that production codebases converge to.
+- [nanovllm-jun/nanovllm/layers/linear.py](../nanovllm-jun/nanovllm/layers/linear.py) — the reference for what my code will look like after the port back.
+
+---
+
+<!-- Add Ex02 summary below when done. -->

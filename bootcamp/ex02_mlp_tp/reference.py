@@ -6,6 +6,7 @@ Imports the ex01 REFERENCE (not solution) so this file works stand-alone.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -14,9 +15,14 @@ from bootcamp.ex01_linear_tp.reference import ColumnParallelLinear, RowParallelL
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
     def __init__(
-        self, in_features: int, output_sizes: list[int], tp_size: int, tp_rank: int
+        self,
+        in_features: int,
+        output_sizes: list[int],
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
     ) -> None:
-        super().__init__(in_features, sum(output_sizes), tp_size, tp_rank)
+        super().__init__(in_features, sum(output_sizes), tp_size, tp_rank, group=group)
         self.output_sizes = output_sizes
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: int) -> None:  # type: ignore[override]
@@ -30,12 +36,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class TPSwiGLUMLP(nn.Module):
-    def __init__(self, hidden: int, intermediate: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self,
+        hidden: int,
+        intermediate: int,
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden, [intermediate, intermediate], tp_size, tp_rank
+            hidden, [intermediate, intermediate], tp_size, tp_rank, group=group
         )
-        self.down_proj = RowParallelLinear(intermediate, hidden, tp_size, tp_rank)
+        self.down_proj = RowParallelLinear(intermediate, hidden, tp_size, tp_rank, group=group)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)

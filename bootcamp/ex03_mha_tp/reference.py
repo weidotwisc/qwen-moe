@@ -6,6 +6,7 @@ Imports the ex01 REFERENCE (not solution) so this file works stand-alone.
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -22,6 +23,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         num_kv_heads: int,
         tp_size: int,
         tp_rank: int,
+        group: dist.ProcessGroup | None = None,
     ) -> None:
         assert num_heads == num_kv_heads, (
             "ex03 handles MHA only (num_heads == num_kv_heads). GQA is exercise 4."
@@ -33,7 +35,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.q_size_per_rank = (num_heads // tp_size) * head_size
         self.kv_size_per_rank = (num_kv_heads // tp_size) * head_size
         output_size = (num_heads + 2 * num_kv_heads) * head_size
-        super().__init__(hidden, output_size, tp_size, tp_rank)
+        super().__init__(hidden, output_size, tp_size, tp_rank, group=group)
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: str) -> None:  # type: ignore[override]
         if shard_id == "q":
@@ -58,6 +60,7 @@ class TPMHA(nn.Module):
         tp_size: int,
         tp_rank: int,
         rope_base: float = 10000.0,
+        group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
         assert n_heads % tp_size == 0
@@ -66,8 +69,12 @@ class TPMHA(nn.Module):
         self.head_dim = head_dim
         self.n_heads_per_rank = n_heads // tp_size
         self.rope_base = rope_base
-        self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank)
-        self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank)
+        self.qkv_proj = QKVParallelLinear(
+            hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group
+        )
+        self.o_proj = RowParallelLinear(
+            n_heads * head_dim, hidden, tp_size, tp_rank, group=group
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape

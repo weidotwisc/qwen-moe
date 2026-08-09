@@ -9,7 +9,14 @@ from torch import nn
 
 
 class ColumnParallelLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         assert out_features % tp_size == 0, (
             f"out_features={out_features} must be divisible by tp_size={tp_size}"
@@ -18,6 +25,7 @@ class ColumnParallelLinear(nn.Module):
         self.out_features = out_features
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.group = group   # stored for API symmetry; no collective in Column.forward
         self.shard_size = out_features // tp_size
         self.weight = nn.Parameter(torch.empty(self.shard_size, in_features))
 
@@ -31,7 +39,14 @@ class ColumnParallelLinear(nn.Module):
 
 
 class RowParallelLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, tp_size: int, tp_rank: int) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        tp_size: int,
+        tp_rank: int,
+        group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         assert in_features % tp_size == 0, (
             f"in_features={in_features} must be divisible by tp_size={tp_size}"
@@ -40,6 +55,7 @@ class RowParallelLinear(nn.Module):
         self.out_features = out_features
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.group = group
         self.shard_size = in_features // tp_size
         self.weight = nn.Parameter(torch.empty(out_features, self.shard_size))
 
@@ -51,5 +67,5 @@ class RowParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.group)
         return y
