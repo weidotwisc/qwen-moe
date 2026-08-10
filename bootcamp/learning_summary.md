@@ -2,6 +2,23 @@
 
 Personal notes on what I picked up in each exercise. Grows as I finish more.
 
+## Progress
+
+| Ex | Topic | Status | Tests | Notes |
+|---|---|---|---|---|
+| Ex00 | torch.dist primer (init/destroy + 5 wrappers) | ✅ done | 24/24 green | – |
+| Ex01 | Linear TP (Column + Row) | ✅ done | 16/16 green | Refactored while doing Ex02 — see §5 of Ex02 for the fixes |
+| Ex02 | SwiGLU MLP under TP (merged column + row) | ✅ done | 8/8 green | Forced the Ex01 refactor |
+| Ex03 | MHA under TP | ⬜ next | – | Batch 1 scaffold ready |
+| Ex04 | GQA + KV replication | ⬜ pending | – | Real project landmark — fixes nanovllm-jun bug |
+| Ex05a | MoE baseline (naive per-expert loop) | ⬜ pending | – | Batch 2 (Claude scaffolds next) |
+| Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Batch 2 |
+| Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
+| Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
+| Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
+
+**Bugs-caught count so far**: 6 distinct bugs across Ex01 + Ex02 — see the "Traps I hit" sections in each entry for the failure mode and fix.
+
 ---
 
 ## Ex00 — `torch.distributed` primer
@@ -178,6 +195,10 @@ tractable:
 
 ## Ex01 — Linear Tensor Parallelism
 
+**Status: done, 16/16 tests green.** Refactored during Ex02 to
+pre-allocate `self.weight` in `__init__` (see §5 below for the log of
+the original deferred plan, and Ex02 §5 for the actual resolution).
+
 Two classes: `ColumnParallelLinear` (shards output dim) and
 `RowParallelLinear` (shards input dim). One collective total per
 `Column → Row` pair (the row's all-reduce). The math is easy; the
@@ -272,10 +293,39 @@ The exercise is *simple*; the conventions are what took time to sort.
   `y` is *replicated* across the TP group. Before the `all_reduce`, it
   was *partial-sum-sharded*. That single all-reduce is the state
   transition.
+- **The 4-phase `nn.Module` lifecycle is what the Verus spec quantifies
+  over.** Every parallel module has the same lifetime:
+
+  | Phase | Trigger | Post-condition |
+  |---|---|---|
+  | 1. Construction | `Module(...)` | Parameter allocated with `torch.empty(shard_shape)`; on default device/dtype; **uninitialized bytes** |
+  | 2. Placement | `.to(device, dtype)` | Parameter re-materialized on target device/dtype; still uninitialized |
+  | 3. Loading | *external* `weight_loader(full_weight [, shard_id])` | `param.data == full_weight.narrow(shard_dim, r * shard_size, shard_size)` |
+  | 4. Inference | `layer(x)` | Reads Parameter; returns `y` (sharded or replicated per class); Parameter unchanged. Repeatable. |
+
+  Two structural facts encoded here:
+    - **Phase 3 is externally driven.** The module never calls its own
+      `weight_loader`; the test / checkpoint walker does. The abstract
+      state machine has one transition per external call, not per
+      internal method invocation.
+    - **Between Phases 2 and 3, the module is in an
+      "allocated-but-uninitialized" state**. Forward called here would
+      produce garbage. The spec's precondition on Phase 4 is
+      *"Phase 3 has completed at least once for every Parameter."*
+
+  The paper's proof for TP correctness can be structured as:
+  *(a) Phase 3's post-condition ⇒ (b) Phase 4's forward preserves the
+  layer's semantic contract (`y ≈ x W^\top` up to reduction order).*
+  Two Hoare triples, one per phase. Clean composition point.
 
 ### 5. Deferred: the pattern overhaul (revisit after Ex02)
 
-My Ex01 currently:
+**Update: resolved after Ex02** — Ex02's merged-variant inheritance
+forced the fix on the same evening. See Ex02 §5 below for the actual
+resolution. The section below is preserved as historical record of
+what was originally planned.
+
+My Ex01 originally:
 - creates `nn.Parameter` inside `weight_loader` (Column) or assigns raw
   tensor (Row);
 - uses `self.params` on Column and `self.weight` on Row;
@@ -306,4 +356,154 @@ have all three fixes applied.
 
 ---
 
-<!-- Add Ex02 summary below when done. -->
+## Ex02 — SwiGLU MLP under TP
+
+**Status: done, 8/8 tests green. Also forced the Ex01 refactor** —
+Ex01 §5's deferred fixes were applied while working through this
+exercise; details in §5 of this section.
+
+First real composition: chain ex01's `ColumnParallelLinear` +
+`RowParallelLinear` into a full SwiGLU MLP, with a **merged** variant
+(`MergedColumnParallelLinear`) that fuses gate + up into a single
+weight buffer.
+
+### 1. Sharding math
+
+Weights (unsharded):
+$W_g, W_u \in \mathbb{R}^{I \times H}, \; W_d \in \mathbb{R}^{H \times I}$.
+
+**Merged column shard**: vertically stack gate + up, then row-shard on
+`tp_size`:
+
+$$
+W_{gu} = \begin{bmatrix} W_g \\ W_u \end{bmatrix} \in \mathbb{R}^{2I \times H},
+\qquad
+W_{gu}^{(r)} \in \mathbb{R}^{(2I/N) \times H}.
+$$
+
+Per-rank forward:
+
+$$
+\begin{aligned}
+[G_r \mid U_r] &= X\,(W_{gu}^{(r)})^{\top}     & \text{shape } [B, 2I/N] \\
+Z_r &= \mathrm{SiLU}(G_r) \odot U_r             & \text{shape } [B, I/N], \text{elementwise, no comm} \\
+y &= Z_r\,(W_d^{(r)})^{\top} + \text{allreduce} & \text{shape } [B, H], \text{replicated}
+\end{aligned}
+$$
+
+**Total comm: one all-reduce per forward** (inside RowParallel's
+down_proj). This is the canonical "column → row" pattern's collective
+budget.
+
+### 2. The design pattern: N-projection merged columns
+
+`MergedColumnParallelLinear(in_features, output_sizes: list[int], ...)`
+generalizes to **N projections sharing one input `x`**. Three concrete
+cases in the bootcamp:
+
+| Case | N | `output_sizes` | Where |
+|---|---|---|---|
+| SwiGLU MLP | 2 | `[I, I]` | Ex02 (now) |
+| MHA QKV | 3 | `[n_heads·D, n_heads·D, n_heads·D]` | Ex03 |
+| GQA QKV | 3 | `[n_heads·D, n_kv·D, n_kv·D]` (unequal) | Ex04 |
+
+Merging is legal iff the projections share their input. **No symmetric
+`MergedRowParallel`** exists because row-parallel's structure
+(partial-sum → all-reduce) has no N-way fusion opportunity — you'd need
+N row projections summing into one target, and transformers don't have
+that shape.
+
+**Historical**: pre-gated MLPs (GeLU-style, Megatron 2019) didn't need
+merged column parallel at all. vLLM (SOSP 2023) crystallized the class
+hierarchy for gated MLPs + QKV. nanovllm inherited it verbatim. For the
+Verus spec, one theorem parameterized by `output_sizes` covers SwiGLU
+and QKV under the same framework.
+
+### 3. Traps I hit
+
+- **Operator precedence carried over from Ex01.** My first offset math
+  *added the source-rank offset to the target offset*, placing each
+  shard in the wrong location. Fix: the target and source offsets are
+  independent — source is `full_weight.chunk(N, 0)[tp_rank]`, target is
+  `sum(output_sizes[:shard_id]) // tp_size`, no addition between them.
+- **Indexing an empty list in a build loop.** Wrote
+  `self.slices = []` then `self.slices[shard_id].append(...)` — the
+  outer indexing errors immediately because the list is empty. Meant
+  `self.slices.append((offset, length))`. Basic mistake, easy fix once
+  the traceback fingers the line.
+- **`len` shadowing the built-in.** Python's LEGB scoping rule: *any*
+  assignment to a name in the function body makes that name local for
+  the entire function, from line 1 to line last. Naming a local
+  variable `len` triggered `UnboundLocalError` on an earlier line where
+  I called `len(...)` as the built-in. Fix: rename to `length`. Enabled
+  `ruff` rule `A00X` (flake8-builtins) to catch this class of bug at
+  write time going forward.
+
+### 4. Verification framing
+
+- **The 4-phase lifecycle carries over.** Phase 3 (weight_loader) is
+  invoked **N times per Merged instance**, once per `shard_id`. Each
+  call establishes a **disjoint sub-invariant** over its slice of the
+  merged buffer. Post-condition after all N calls:
+
+  $$
+  \forall\, k \in [0, N):\;\; \text{param}[o_k : o_k + s_k,\, :] \;=\; \text{full}_k[r \cdot s_k : (r{+}1) \cdot s_k,\, :]
+  $$
+
+  where $o_k = \sum_{i<k} s_i / N$ (target offset) and $s_k = \text{output\_sizes}[k] / N$
+  (per-rank shard size). Cleanly composable across projections.
+
+- **Weight_loader calls commute.** Filling gate then up produces the
+  same buffer state as up then gate — disjoint memory regions, no
+  interference. For the Verus spec: the N Phase-3 calls can be modeled
+  as an unordered set of transitions, not a strict sequence. That
+  simplifies the proof — one less axiom about call ordering.
+
+- **Composed-layer invariant across the SiLU⊙ boundary.** At the exit
+  of `MergedColumnParallelLinear`, the intermediate tensor is
+  *column-sharded on the last axis*. `RowParallelLinear`'s
+  precondition (input sharded on in-dim) is exactly this
+  post-condition, so composition is **immediate** — one Hoare triple
+  chains straight into the next, no intermediate collective needed.
+  This is what makes the whole MLP pay only one all-reduce.
+
+### 5. Ex01 pattern overhaul — resolved
+
+The three items I deferred in Ex01 §5 got fixed in the pass that
+unblocked Ex02:
+
+1. `self.weight = nn.Parameter(torch.empty(...))` allocated in
+   `__init__` for both `ColumnParallelLinear` and `RowParallelLinear`.
+2. Both `weight_loader` methods now use `self.weight.data.copy_(shard)`.
+3. Renamed `self.params → self.weight` in Column for symmetry with Row.
+4. Added `assert in_features % tp_size == 0` in Row's `__init__`.
+
+All 16 Ex01 tests still pass after the refactor. Merged inheritance now
+works cleanly — Ex02's `self.weight.narrow(...)` refers to a
+pre-allocated buffer allocated by `super().__init__()`.
+
+**Ex02 test result: 8/8 green.** Confirms both the merged pattern and
+the Ex01 refactor work end-to-end.
+
+### 6. Terminology observations worth noting for the paper
+
+- **`shard_id` overloads "shard".** In TP it usually means "the 1/N
+  slice held by rank r." In `MergedColumnParallelLinear.weight_loader`,
+  it means "which of the N merged projections is this call for."
+  Different concept, same word. Cleaner Verus terminology:
+  `role_id` / `projection_index` for the merged case; keep `tp_rank`
+  for the mechanical TP shard.
+- **The naming is retroactively locked in** because vLLM shipped first
+  and every downstream project inherits its API. Paper can safely
+  rename in the abstract Verus model with a one-line refinement lemma;
+  the concrete Python code stays as-is for ecosystem compatibility.
+
+### Reference material worth revisiting
+
+- vLLM's [`MergedColumnParallelLinear` in linear.py](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/linear.py) — the API origin.
+- [Shazeer 2020, "GLU Variants Improve Transformer"](https://arxiv.org/abs/2002.05202) — the paper that motivated widespread gated MLPs, and thus the need for MergedColumnParallelLinear in the first place.
+- [nanovllm-jun/nanovllm/layers/linear.py](../nanovllm-jun/nanovllm/layers/linear.py) — production shape my bootcamp code targets for the port back.
+
+---
+
+<!-- Add Ex03 summary below when done. -->

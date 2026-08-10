@@ -40,7 +40,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
         in_features: int,
-        output_sizes: list[int],
+        output_sizes: list[int], # weiz in FFN case output_sizes:[intermediate, intermediate]
         tp_size: int,
         tp_rank: int,
         group: dist.ProcessGroup | None = None,
@@ -48,6 +48,18 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # Reuse ColumnParallelLinear's __init__ with the total output.
         super().__init__(in_features, sum(output_sizes), tp_size, tp_rank, group=group)
         self.output_sizes = output_sizes
+
+        # weiz 2026-08-10 add assertions 
+        for output_size in output_sizes:
+            assert(output_size % tp_size == 0) # each output_size must be dividable by tp_size
+        # shards[i] is the (start, length) section of linear layer [i]
+        self.num_of_shards = len(output_sizes)
+        self.slice_of_local_weight_start_len_pairs = []
+        for shard_id in range(self.num_of_shards):
+            offset = sum(output_sizes[:shard_id]) // tp_size # bug fix: we just need to get othe offset within my own share of linear layers
+            length = output_sizes[shard_id] // self.tp_size
+            self.slice_of_local_weight_start_len_pairs.append((offset, length))
+
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: int) -> None:  # type: ignore[override]
         """Copy this rank's slice of the shard_id-th projection into the correct
@@ -65,7 +77,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # 2. Compute this rank's slice of `full_weight` on dim 0 (same math as
         #    ex01's ColumnParallelLinear.weight_loader).
         # 3. Copy the slice into self.weight.data.narrow(0, offset, shard_size).
-        raise NotImplementedError
+        
+        # weiz 
+        M,N = full_weight.shape # full_weight is the gate (shard_id=0) or up (shard_id=1) full tensor
+        assert M== self.output_sizes[shard_id] and N == self.in_features
+        slice_start, slice_len = self.slice_of_local_weight_start_len_pairs[shard_id]
+        self.weight.narrow(dim=0, start=slice_start, length=slice_len).data.copy_(full_weight.chunk(chunks=self.tp_size, dim=0)[self.tp_rank]) 
 
 
 class TPSwiGLUMLP(nn.Module):
@@ -92,7 +109,9 @@ class TPSwiGLUMLP(nn.Module):
         super().__init__()
         # TODO(you): allocate self.gate_up_proj (MergedColumnParallelLinear)
         # and self.down_proj (RowParallelLinear). Pass `group=group` down to both.
-        raise NotImplementedError
+        self.gate_up_proj = MergedColumnParallelLinear(in_features=hidden, output_sizes=[intermediate, intermediate],
+                                                       tp_size=tp_size, tp_rank = tp_rank, group=group)
+        self.down_proj = RowParallelLinear(in_features=intermediate, out_features=hidden, tp_size = tp_size, tp_rank=tp_rank, group=group)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # TODO(you):
@@ -100,4 +119,7 @@ class TPSwiGLUMLP(nn.Module):
         # 2. split into gate, up on the last dim.
         # 3. hidden = F.silu(gate) * up       # [..., intermediate / tp_size]
         # 4. return self.down_proj(hidden)    # replicated [..., hidden]
-        raise NotImplementedError
+        gate_up = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(chunks=2, dim=-1)
+        hidden = F.silu(gate) * up
+        return self.down_proj(hidden)

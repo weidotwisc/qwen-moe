@@ -62,7 +62,9 @@ class ColumnParallelLinear(nn.Module):
         self.tp_size = tp_size
         self.tp_group = group
         self.in_features = in_features # 
-        self.out_features = out_features // tp_size 
+        self.out_features = out_features 
+        self.shard_out_features = out_features // tp_size
+        self.weight = nn.Parameter(torch.zeros(self.shard_out_features, self.in_features)) # the weight is in the transpose form
         
 
     def weight_loader(self, full_weight: torch.Tensor) -> None:
@@ -73,12 +75,12 @@ class ColumnParallelLinear(nn.Module):
         M, _ = full_weight.shape
         start_row = self.tp_rank * M // self.tp_size
         end_row = (self.tp_rank + 1) * M // self.tp_size 
-        self.params = nn.Parameter(full_weight[start_row:end_row, :])
+        self.weight.data.copy_(full_weight[start_row:end_row, :])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., in_features]. Returns [..., out_features // tp_size].
         # TODO(you): a single F.linear call. Do NOT all-reduce.
-        return torch.nn.functional.linear(x, self.params)
+        return torch.nn.functional.linear(x, self.weight)
 
 
 class RowParallelLinear(nn.Module):
@@ -118,6 +120,9 @@ class RowParallelLinear(nn.Module):
         self.group = group
         self.in_features = in_features
         self.out_features = out_features
+        assert(in_features % tp_size == 0)
+        self.in_features_shard = in_features // tp_size
+        self.weight = nn.Parameter(torch.zeros(self.out_features, self.in_features_shard))
 
     def weight_loader(self, full_weight: torch.Tensor) -> None:
         """Copy this rank's slice from `full_weight` [out_features, in_features]
@@ -126,7 +131,7 @@ class RowParallelLinear(nn.Module):
         _, N = full_weight.shape
         start_column= self.tp_rank * N // self.tp_size
         end_column = (self.tp_rank + 1) * N // self.tp_size
-        self.weight = full_weight[:, start_column:end_column]
+        self.weight.data.copy_(full_weight[:, start_column:end_column])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., in_features // tp_size]. Returns [..., out_features] (replicated).
