@@ -2,6 +2,118 @@
 
 **Goal**: TP-shard a full MHA block (Q, K, V, O + RoPE + SDPA).
 
+## The math
+
+Let $X \in \mathbb{R}^{B \times T \times H}$ (batch $B$, sequence $T$,
+hidden $H$), with $H_q$ heads of dim $D$ (so $H_q \cdot D$ is the total
+attention-projection dim; for this exercise $H_k = H_v = H_q$, i.e. pure
+MHA). Weights:
+
+$$
+W_q, W_k, W_v \in \mathbb{R}^{(H_q D) \times H}, \qquad
+W_o \in \mathbb{R}^{H \times (H_q D)}.
+$$
+
+The attention block (no TP) computes:
+
+$$
+\begin{aligned}
+Q &= X\,W_q^{\top},\quad K = X\,W_k^{\top},\quad V = X\,W_v^{\top}
+\quad \text{— each shape } [B, T, H_q D] \\
+Q,K &\gets \mathrm{RoPE}(Q, K) \\
+\text{per head } h: \quad \mathrm{attn}_h &= \mathrm{softmax}\!\left(\tfrac{Q_h K_h^{\top}}{\sqrt{D}}\right) V_h
+\quad \text{— shape } [B, T, D] \\
+\mathrm{attn\_out} &= [\,\mathrm{attn}_0 \mid \mathrm{attn}_1 \mid \cdots \mid \mathrm{attn}_{H_q - 1}\,]
+\quad \text{— shape } [B, T, H_q D] \\
+Y &= \mathrm{attn\_out}\, W_o^{\top}
+\quad \text{— shape } [B, T, H]
+\end{aligned}
+$$
+
+### Fused QKV weight (before TP sharding)
+
+Since $W_q, W_k, W_v$ share their input $X$, stack them vertically for
+one merged GEMM:
+
+$$
+W_{qkv} \;=\; \begin{bmatrix} W_q \\[2pt] W_k \\[2pt] W_v \end{bmatrix}
+\in \mathbb{R}^{3 H_q D \times H},
+\qquad
+[Q \mid K \mid V] \;=\; X\,W_{qkv}^{\top} \in \mathbb{R}^{B \times T \times 3 H_q D}.
+$$
+
+Split with explicit sizes (**not `.chunk(3)`** — Ex04 will have unequal Q/K/V sizes):
+$Q, K, V = \mathtt{qkv.split([H_q D, H_q D, H_q D], dim{=}{-}1)}$.
+
+### Under TP with $N$ ranks
+
+Each rank $r$ owns **$H_q / N$ heads** — a contiguous range of the head
+axis. The three weights shard as follows:
+
+**QKV (column-parallel — shard the head-out dim of the merged weight):**
+
+$$
+W_{qkv}^{(r)} \;\in\; \mathbb{R}^{3 (H_q/N) D \; \times \; H}
+\quad\text{(rows: this rank's Q-heads, K-heads, V-heads stacked)}.
+$$
+
+**Attention (per-rank, no cross-rank comm):**
+
+$$
+[Q_r \mid K_r \mid V_r] \;=\; X\,(W_{qkv}^{(r)})^{\top} \;\in\; \mathbb{R}^{B \times T \times 3 (H_q/N) D}
+$$
+
+$$
+\mathrm{attn}_r \;=\; \mathrm{SDPA}\bigl(\mathrm{RoPE}(Q_r), \mathrm{RoPE}(K_r), V_r\bigr)
+\;\in\; \mathbb{R}^{B \times T \times (H_q/N) D}.
+$$
+
+RoPE is computed independently on each rank (the cos/sin cache is the
+same across ranks — depends only on head_dim and position, not head index).
+
+**O (row-parallel — shard the head-input dim):**
+
+$$
+W_o^{(r)} \;\in\; \mathbb{R}^{H \times (H_q/N) D}
+\quad\text{(columns of } W_o \text{: this rank's head shard)}.
+$$
+
+$$
+Y_r^{\text{partial}} \;=\; \mathrm{attn}_r\,(W_o^{(r)})^{\top} \;\in\; \mathbb{R}^{B \times T \times H}
+\qquad Y \;=\; \sum_{r=0}^{N-1} Y_r^{\text{partial}} \;\;\text{via one all-reduce.}
+$$
+
+### Why one `all_reduce` suffices — the identity
+
+Full $\mathrm{attn\_out} = [\,\mathrm{attn}_0 \mid \cdots \mid \mathrm{attn}_{N-1}\,]$
+is the horizontal concatenation of per-rank attention outputs.
+Column-block $W_o = [\,W_o^{(0)} \mid W_o^{(1)} \mid \cdots \mid W_o^{(N-1)}\,]$.
+Then
+
+$$
+Y \;=\; \mathrm{attn\_out}\, W_o^{\top}
+\;=\; [\,\mathrm{attn}_0 \mid \cdots \mid \mathrm{attn}_{N-1}\,]
+\cdot
+\begin{bmatrix} W_o^{(0)\top} \\[2pt] W_o^{(1)\top} \\[2pt] \vdots \end{bmatrix}
+\;=\; \sum_{r=0}^{N-1} \mathrm{attn}_r\, (W_o^{(r)})^{\top}.
+$$
+
+**Concat-times-vstack collapses to sum-of-per-rank-products** — same
+identity that makes MLP's `down_proj` row-parallel work. Row-parallel
+$W_o$ + `all_reduce(SUM)` reconstructs $Y$ exactly, without ever
+materializing the concatenated intermediate. Total collectives per
+attention block: **one all-reduce**.
+
+### Mapping to code
+
+| Math | In your `solution.py` |
+|---|---|
+| $W_{qkv}^{(r)}$ storage + fused GEMM | `QKVParallelLinear` (inherits from `ColumnParallelLinear`) |
+| `weight_loader(W_q, "q")`, `weight_loader(W_k, "k")`, `weight_loader(W_v, "v")` | `QKVParallelLinear.weight_loader` at offsets $0,\, H_q D / N,\, 2 H_q D / N$ |
+| $\mathtt{qkv.split([\dots], dim=-1)}$ | `TPMHA.forward` — explicit sizes, not `chunk` |
+| RoPE + SDPA per-rank heads | `TPMHA.forward` middle block |
+| $\mathrm{attn}_r\, (W_o^{(r)})^{\top}$ + `all_reduce` | `RowParallelLinear` (already in ex01) |
+
 ## The key idea
 
 Sharding attention is natural because attention is **head-parallel**: each
