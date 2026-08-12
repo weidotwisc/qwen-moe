@@ -10,14 +10,14 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex01 | Linear TP (Column + Row) | ✅ done | 16/16 green | Refactored while doing Ex02 — see §5 of Ex02 for the fixes |
 | Ex02 | SwiGLU MLP under TP (merged column + row) | ✅ done | 8/8 green | Forced the Ex01 refactor |
 | Ex03 | MHA under TP (QKV column + O row) | ✅ done | 8/8 green | Introduced string `shard_id` + RoPE layout convention |
-| Ex04 | GQA + KV replication | ⬜ next | – | Real project landmark — fixes nanovllm-jun bug |
+| Ex04 | GQA + KV replication | ✅ done | 8/8 green | **Nanovllm-jun bug fixed** — TP-8 on Qwen3-30B-A3B unblocked |
 | Ex05a | MoE baseline (naive per-expert loop) | ⬜ pending | – | Batch 2 (Claude scaffolds next) |
 | Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Batch 2 |
 | Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
 | Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
 | Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
 
-**Bugs-caught count so far**: 8 distinct bugs across Ex01 + Ex02 + Ex03 — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 13 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -618,4 +618,145 @@ projections (SiLU⊙ for MLP, SDPA for attention).
 
 ---
 
-<!-- Add Ex04 summary below when done. -->
+## Ex04 — GQA + KV-head replication under TP
+
+**Status: done, 8/8 tests green. Real project milestone** — this
+implementation fixes nanovllm-jun's `assert num_kv_heads % tp_size == 0`
+failure at TP-8 on Qwen3-30B-A3B (num_kv_heads=4). The code here ports
+back directly.
+
+### 1. Sharding math
+
+Given $H_q$ Q heads and $H_{kv}$ KV heads with $H_{kv} \le H_q$ and
+$H_q \bmod H_{kv} = 0$. Under TP-$N$:
+
+$$
+\begin{aligned}
+n_q^{(r)}   &= H_q / N   &&\text{(Q heads per rank)} \\
+n_{kv}^{(r)} &= \max\!\left(1,\; H_{kv} / N\right)   &&\text{(KV heads per rank)} \\
+r_{kv}      &= \max\!\left(1,\; N / H_{kv}\right)    &&\text{(replicas of each KV head)}
+\end{aligned}
+$$
+
+Per-rank storage: $(n_q^{(r)} + 2 n_{kv}^{(r)}) D$ rows in the merged
+QKV weight. Total across ranks: $N \cdot (n_q^{(r)} + 2 n_{kv}^{(r)}) D
+= (H_q + 2 H_{kv} r_{kv}) D$.
+
+Under replication, the total is **larger than the raw un-sharded weight
+$(H_q + 2 H_{kv}) D$** — because KV is redundantly stored on $r_{kv}$
+ranks. Memory cost, correctness gain (every rank can attend locally).
+
+### 2. Design patterns worth noting
+
+- **The `max(1, ...)` clause is the whole KV-replication fix.**
+  `n_{kv}^{(r)} = max(1, H_{kv} / N)` clamps to 1 head per rank when
+  $N > H_{kv}$; the `r_{kv} = max(1, N / H_{kv})` clause tells how many
+  ranks share each KV head. One conditional-free formula covers both
+  regimes.
+- **Unified chunk math**: the `weight_loader` uses
+  `full_kv.chunk(tp_size // kv_replicas, dim=0)[tp_rank // kv_replicas]`.
+  Under normal sharding (`kv_replicas=1`), this is
+  `chunk(tp_size)[tp_rank]` — identical to ex03. Under replication
+  (`kv_replicas>1`), it becomes `chunk(H_{kv})[tp_rank // r_{kv}]`,
+  which gives multiple ranks the same slice. One code path for both
+  regimes.
+- **KV replication = implicit DP sub-group inside TP.** Under training
+  (not our scope), the replica group would need `all_reduce(SUM)` on
+  the KV weight gradients to keep replicas byte-identical. That's a
+  DDP-shaped operation nested inside a TP framework — a two-axis
+  parallelism revealed by the design. For inference (Ex04), invisible
+  — no backward, no gradient sync.
+- **`repeat_interleave` after RoPE, before SDPA** (or equivalent
+  broadcasting): required to bring K/V head count up to Q's before
+  SDPA. Can happen either in BTHD layout on `dim=2` (reference style)
+  or in BHTD layout on `dim=1` (my solution). Both correct;
+  materialize the same duplicated tensor. Modern PyTorch 2.6+
+  auto-detects GQA in SDPA and would skip the materialization —
+  future perf work.
+
+### 3. Traps I hit (5 bugs, in the order I hit them)
+
+- **`out_features` conceptual mismatch: per-rank vs global.**
+  My first `super().__init__(hidden, self.q_shard + self.k_shard + self.v_shard, tp_size, tp_rank, group)`
+  passed the per-rank size where the parent expected the total. Parent
+  then allocated `self.weight` with shape `(per_rank / tp_size,
+  in_features)` — an under-sized buffer. Fix: multiply by `tp_size`
+  to get the global total: `out_features = tp_size * (q_shard + k_shard + v_shard)`.
+- **`RowParallelLinear.in_features` same conceptual mistake.** Passed
+  `n_heads_per_rank * head_dim` (per-rank input width) where the
+  parent expects the total across ranks. Both parent classes take
+  **global** dims and divide internally.
+- **Missing `super().__init__()` call.** I put `self.hidden = ...`
+  and `self.weight = nn.Parameter(...)` in `QKVParallelLinearGQA.__init__`
+  without ever calling the parent's `__init__`. Result:
+  `AttributeError: cannot assign parameters before Module.__init__() call`
+  — the `nn.Module` framework needs its `_parameters` dict initialized
+  before any Parameter attribute can be assigned. C++-style thinking
+  (base class constructor is auto-called) doesn't apply — in Python,
+  `super().__init__()` is a manual invocation.
+- **Missing `repeat_interleave` on K, V** in TPGQA.forward. Under
+  GQA with `num_kv_heads < num_heads` per rank, K and V have fewer
+  heads than Q. SDPA (in most PyTorch versions) requires matched Q/K/V
+  head counts. Fix: `k.repeat_interleave(n_rep, dim=1)` (BHTD) or
+  `k.repeat_interleave(n_rep, dim=2)` (BTHD) to broadcast KV heads up
+  to Q's head count. Either placement works; both materialize the
+  duplicated tensor.
+- **`group=group` missing on `o_proj`.** Only `qkv_proj` got the
+  group; `o_proj` defaulted to the world group. Currently invisible
+  because test's world group == TP group, but silently wrong under
+  ex07's TP+EP hybrid where TP is a sub-group of world.
+
+### 4. Verification framing
+
+- **Ex04 is a strict superset of Ex03's spec.** Under the special case
+  $H_{kv} = H_q$ and $N \le H_{kv}$, Ex04's math degenerates to Ex03's
+  MHA. The `max(1, ...)` clause is inert in that regime. So the
+  Verus theorem for Ex04 subsumes Ex03's — one proof covers both.
+- **The KV-replication invariant is a bijection property**: at any
+  point in the model's lifecycle, KV heads on replica ranks have
+  **identical byte values**. Post-Phase 3 (weight_loader), this is
+  established by the loader giving identical slices to co-replicas.
+  Post-forward, unchanged (weights are read-only). Post-optimizer-step
+  (training, not our scope), preserved only if the replica-group
+  gradient all-reduce runs before the step.
+- **Attention math per rank is *identical* to a single-GPU GQA**
+  restricted to this rank's Q heads. No cross-rank dependency during
+  the attention math itself (the O all-reduce is the only cross-rank
+  event, and it's post-attention). This is the "block-level invariant"
+  from ex01-03 preserved through GQA.
+
+### 5. Prior-exercise cross-cutting lesson: global vs per-rank
+
+Two bugs in Ex04 (out_features + in_features) had the same root:
+**parent classes take *global* dims and divide internally by tp_size**.
+The pattern:
+
+- Constructor: `Parent(in_features=<global>, out_features=<global>, tp_size, tp_rank)`.
+- Internal: allocates `weight` of shape `<global> // tp_size` per rank.
+- Caller: passes the semantic model dims (`hidden`, `num_heads * head_dim`),
+  not the sharded values.
+
+This is the correct convention (matches `nn.Linear` and industry TP
+practice) but requires discipline. Whenever a subclass computes a total
+"across all ranks," check twice that you're multiplying rather than
+dividing.
+
+### 6. Terminology observations
+
+- **`kv_replicas` (my naming) vs `num_kv_replicas`** — the reference
+  uses the longer name for clarity. Either is fine; consistent naming
+  within your codebase is what matters.
+- **`num_q_heads_per_rank` vs `num_heads_per_rank`** — I disambiguated
+  by including `q` in the name because Ex04 has two "per-rank" head
+  counts (Q and KV). Reference used just `num_heads_per_rank` for Q.
+  The disambiguated form is more explicit; matter of style.
+
+### Reference material worth revisiting
+
+- [nanovllm-jun `Qwen3Attention.__init__`](../nanovllm-jun/nanovllm/models/qwen3.py) — the exact `assert num_kv_heads % tp_size == 0` line this exercise's KV replication fixes.
+- HF's [`Qwen3MoeAttention`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) — production GQA implementation without KV replication (they don't need it because HF forward is not TP-sharded).
+- PyTorch 2.6+ [`F.scaled_dot_product_attention` GQA auto-detection](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html) — the perf optimization that skips `repeat_interleave` when Q/K head counts differ.
+
+---
+
+<!-- Add Ex05 summary below when done. -->
