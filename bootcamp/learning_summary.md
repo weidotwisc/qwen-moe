@@ -759,4 +759,116 @@ dividing.
 
 ---
 
+## Cross-cutting: TP vs FSDP / Zero-Inference for LLM serving
+
+This came up while thinking about DeepSpeed-MII. Worth extracting from
+the exercise-by-exercise notes because it's a general framing that
+guides the whole paper's positioning.
+
+### Core insight
+
+**TP transfers activations. FSDP / Zero-Inference transfers weights.**
+For a model that fits under TP-$N$, TP is dramatically more
+bandwidth-efficient because activations are much smaller than weights
+at typical inference workloads.
+
+### The asymmetry, quantified
+
+For Qwen3-30B-A3B under 8-way parallelism:
+
+|  | TP-8: activation comm | ZI-8: weight comm |
+|---|---|---|
+| Per forward at batch=1, seq=1 (decode) | ~400 KB | ~42 GB |
+| Per forward at batch=64, seq=1024 (prefill) | ~25 GB | ~42 GB |
+| Per forward at batch=256, seq=1024 | ~100 GB | ~42 GB |
+
+Weight comm is **fixed** — it doesn't depend on batch or sequence
+length. Activation comm scales with `batch × seq`. At decode-scale,
+TP moves ~100,000× less data than ZI. At heavy prefill, they get
+comparable. At extreme long-context / high-batch, ZI wins the comm
+race.
+
+### The crossover threshold
+
+The point where TP activation comm equals ZI weight comm:
+
+$$
+B \cdot T \;\approx\; \frac{\tfrac{N-1}{N} \cdot \text{total\_params}}{2 \cdot \text{hidden} \cdot \text{n\_layers}}
+$$
+
+For Qwen3-30B-A3B (30B params, hidden=2048, 48 layers, TP-8, bf16):
+
+$$
+B \cdot T \;\approx\; 130{,}000 \text{ tokens/forward.}
+$$
+
+Below this threshold, TP is bandwidth-cheaper. Above, ZI is. **Typical
+inference is well below** (batch × seq usually in the thousands, not
+hundreds of thousands), so TP dominates practically all realistic
+inference workloads.
+
+### The general principle: parallelism trades one comm axis for another
+
+| Scheme | What flows across ranks | Cost scales with |
+|---|---|---|
+| **TP** | activations | $B \cdot T \cdot \text{hidden}$ |
+| **FSDP / ZI** | weights | fixed = model size |
+| **PP** | activations at layer boundaries | $B \cdot T \cdot \text{hidden} \cdot N$ |
+| **EP** (MoE) | tokens (post-routing) | $B \cdot \text{top-}K \cdot \text{hidden}$ |
+| **DP** (training only) | gradients | fixed = model size |
+
+Each scheme is optimal in a different regime. **TP wins when
+activations ≪ weights**, which is the LLM-inference regime because of
+architectural facts: `hidden ≪ total_params / num_layers`, and inference
+batches are small.
+
+### Why single-GPU is a stiff baseline (surprisingly)
+
+For a model that fits on one GPU, single-GPU inference is very
+efficient: 100% HBM bandwidth utilized, zero cross-GPU comm. Any
+distributed scheme has to overcome its own comm overhead to catch up:
+
+- **TP-N**: still ~90-95% efficient because activation comm is tiny.
+- **ZI-N**: efficiency drops significantly at low batch because
+  weight comm is 100,000× activation comm. For a model that fits under
+  TP, ZI-N is often **slower than single-GPU** at low batch.
+
+So the "distribute to speed up" reflex isn't automatic — you have to
+check that your comm cost is less than the compute win.
+
+### When ZI / FSDP wins (only when the model doesn't fit under TP)
+
+- **175B / 405B / 671B models** on 8×80GB clusters where TP-8 alone
+  can't fit them. ZI's memory-per-rank scales as `total_params / N`,
+  so at N=8 you cut memory 8× further via ZI-3 layout. Models TP-8
+  can't hold, ZI-8 can.
+- **Very long-context prefill** (>>100K tokens per pass) where
+  activation memory itself is the bottleneck. ZI can offload
+  activations too via `activation_checkpointing`.
+- **Fine-tuning + inference in the same framework**: switch cost of
+  leaving DeepSpeed / FSDP for a TP-only inference server is high.
+
+For everything else — TP wins.
+
+### Consequence for this paper
+
+The paper's target (nanovllm with TP+EP for Qwen3-30B-A3B) is exactly
+the workload where TP dominates: mid-sized model that fits under TP-8,
+inference-only, moderate batches. **Choice of TP+EP is not arbitrary
+— it's dictated by the workload's bandwidth economics.** The paper's
+methodology section can state this in one paragraph: verify the
+parallelism scheme that industry already uses for this class of
+workload.
+
+### Reference
+
+- ZeRO paper (Rajbhandari et al., SC 2020) — introduces the sharding
+  levels ZeRO-1/2/3.
+- DeepSpeed-Inference blog (2022) — TP with fused kernels.
+- DeepSpeed Zero-Inference (2022) — extends Zero-3 to inference with
+  CPU/NVMe offload.
+- FSDP paper (Zhao et al., VLDB 2023) — PyTorch's Zero-3 equivalent.
+
+---
+
 <!-- Add Ex05 summary below when done. -->
