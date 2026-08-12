@@ -9,15 +9,15 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex00 | torch.dist primer (init/destroy + 5 wrappers) | ✅ done | 24/24 green | – |
 | Ex01 | Linear TP (Column + Row) | ✅ done | 16/16 green | Refactored while doing Ex02 — see §5 of Ex02 for the fixes |
 | Ex02 | SwiGLU MLP under TP (merged column + row) | ✅ done | 8/8 green | Forced the Ex01 refactor |
-| Ex03 | MHA under TP | ⬜ next | – | Batch 1 scaffold ready |
-| Ex04 | GQA + KV replication | ⬜ pending | – | Real project landmark — fixes nanovllm-jun bug |
+| Ex03 | MHA under TP (QKV column + O row) | ✅ done | 8/8 green | Introduced string `shard_id` + RoPE layout convention |
+| Ex04 | GQA + KV replication | ⬜ next | – | Real project landmark — fixes nanovllm-jun bug |
 | Ex05a | MoE baseline (naive per-expert loop) | ⬜ pending | – | Batch 2 (Claude scaffolds next) |
 | Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Batch 2 |
 | Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
 | Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
 | Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
 
-**Bugs-caught count so far**: 6 distinct bugs across Ex01 + Ex02 — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 8 distinct bugs across Ex01 + Ex02 + Ex03 — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -506,4 +506,116 @@ the Ex01 refactor work end-to-end.
 
 ---
 
-<!-- Add Ex03 summary below when done. -->
+## Ex03 — Multi-Head Attention under TP
+
+**Status: done, 8/8 tests green.** Introduces `QKVParallelLinear`
+(N=3 merged column with equal-size projections for MHA) and `TPMHA`
+composing QKV → RoPE → SDPA → RowParallel O.
+
+### 1. Sharding math
+
+Under TP-$N$ with $H$ heads and head_dim $D$:
+
+$$
+W_q, W_k, W_v \in \mathbb{R}^{H D \times \text{hidden}}, \qquad
+W_o \in \mathbb{R}^{\text{hidden} \times H D}
+$$
+
+Merged QKV, per-rank shape $[3 (H/N) D, \text{hidden}]$:
+
+$$
+W_{qkv}^{(r)} = \begin{bmatrix} W_q^{(r)} \\ W_k^{(r)} \\ W_v^{(r)} \end{bmatrix} \in \mathbb{R}^{3 (H/N) D \times \text{hidden}}
+$$
+
+Per-rank forward (one collective total, from Row's O all-reduce):
+
+$$
+\begin{aligned}
+[Q_r \mid K_r \mid V_r] &= X (W_{qkv}^{(r)})^\top && \text{shape } [B, T, 3 (H/N) D] \\
+Q_r, K_r &\gets \mathrm{RoPE}(Q_r, K_r) && \text{applied in } [B, T, H/N, D] \text{ layout} \\
+\mathrm{attn}_r &= \mathrm{SDPA}(Q_r, K_r, V_r) && \text{on } [B, H/N, T, D] \text{ layout after transpose} \\
+Y &= \sum_r \mathrm{attn}_r (W_o^{(r)})^\top && \text{via one all-reduce inside Row}
+\end{aligned}
+$$
+
+Same "column → row + one all-reduce" pattern as MLP (Ex02). Confirms
+the block-level invariant: **attention and MLP have identical TP shape**,
+their only difference is the per-shard operation between the two
+projections (SiLU⊙ for MLP, SDPA for attention).
+
+### 2. Design patterns worth noting
+
+- **QKV as N=3 merged column** with equal sizes for MHA (`num_heads == num_kv_heads`).
+  Same abstract pattern as Ex02's merged MLP, just N=3 instead of N=2.
+  `output_sizes = [n_heads·D, n_heads·D, n_heads·D]`.
+- **String `shard_id`** (`"q"`, `"k"`, `"v"`) — matches HF safetensors keys.
+  Ex02's SwiGLU used int (`0`=gate, `1`=up) for the same abstract role.
+  Both work; the string version is more self-documenting for QKV.
+- **RoPE layout convention: `[B, T, H, D]`** (not `[B, H, T, D]`). We
+  apply RoPE **before** the SDPA transpose, matching the older
+  vLLM/LLaMA-1 style. Modern HF `modeling_qwen3_moe.py` transposes
+  first — same math, opposite convention. Bootcamp matches vLLM for
+  port-compatibility with nanovllm-jun.
+- **SDPA needs `[B, H, T, D]`** — hard-required by every attention
+  kernel (F.scaled_dot_product_attention, flash-attn, cuDNN, Xformers).
+  Both convention styles converge here via a mandatory transpose. The
+  only question is whether RoPE happens before or after that transpose.
+- **`.reshape` after transpose**, not `.view`. The transposed
+  `[B, T, H, D]` tensor may not be contiguous; `.reshape` handles the
+  copy-if-needed transparently, `.view` would error.
+
+### 3. Traps I hit
+
+- **`torch.split(qkv, [q_size, kv_size, kv_size], dim=0)`** — splitting
+  the batch dim instead of the feature dim. Would produce shape errors
+  or silently wrong slices depending on values. Fix: `dim=-1`. Classic
+  "which axis am I actually splitting" mistake, easy to catch by
+  reading the shape at the call site.
+- **Missing `return o` at end of `forward`**. Function fell off the
+  end, returned `None`, test failed with a shape-of-None error. Trivial
+  but real — the `TODO(you)` comment listed 9 steps and I stopped at
+  step 9's action without adding the final return statement.
+
+### 4. Verification framing
+
+- **Block-level invariant**: `TPMHA.forward(x)` obeys **replicated in,
+  replicated out** — same invariant as MLP. Interior sharding on heads
+  is entirely encapsulated within the block.
+- **Composition with MLP is trivial**: attention exits with $Y$
+  replicated across TP group → LayerNorm operates elementwise on
+  replicated $Y$ → residual add on replicated tensors → MLP receives
+  replicated input → MLP exits with replicated output. One boolean
+  invariant carried through the entire residual stream.
+- **RoPE's spec is layout-invariant.** The abstract Verus predicate:
+  "for each (batch, seq_pos, head, dim_pair), apply the position-
+  dependent 2D rotation." Whether the Python code does this in BTHD
+  or BHTD is an implementation detail below the spec's abstraction
+  level — same theorem covers both conventions.
+- **SDPA as an axiom.** Since `F.scaled_dot_product_attention` is a
+  differentiable primitive with a full backward, the Verus spec treats
+  it as an opaque operation with the well-known softmax-attention
+  post-condition. No need to prove SDPA's internals; the theorem
+  quantifies over "for a spec-conforming SDPA, TP-parallel attention
+  produces the correct output." Same abstraction that flash-attn / cuDNN
+  attention / Ring Attention all satisfy — proof transfers freely.
+
+### 5. Terminology observations
+
+- **Renamed `head_size` → `head_dim`** in `QKVParallelLinear`. vLLM /
+  Megatron use `head_size`; HF and Qwen3 config use `head_dim`. Kept
+  a one-line comment noting the alias, so a reader (or the intern
+  porting to Verus) sees the correspondence explicitly.
+- **`num_kv_heads` is `num_k_heads == num_v_heads`.** K and V heads
+  always come in matched pairs — a KV head "owns" both a K projection
+  and a V projection. Naming reflects this rather than pretending they
+  could differ.
+
+### Reference material worth revisiting
+
+- HF's [`modeling_qwen3_moe.py::Qwen3MoeAttention`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) — modern transpose-first attention pattern (contrast to bootcamp's convention).
+- vLLM's [`QKVParallelLinear` in linear.py](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/linear.py) — the source of the industry-standard API shape we're matching.
+- [Meta's LLaMA-1 reference code](https://github.com/meta-llama/llama) — where the "RoPE before transpose" convention originated.
+
+---
+
+<!-- Add Ex04 summary below when done. -->

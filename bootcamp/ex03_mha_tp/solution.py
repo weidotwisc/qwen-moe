@@ -48,7 +48,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
         hidden: int,
-        head_size: int,
+        head_dim: int,   # nanovllm/vLLM call this `head_size`; we match HF's `head_dim` (Qwen3 config uses `head_dim` too)
         num_heads: int,
         num_kv_heads: int,
         tp_size: int,
@@ -59,19 +59,19 @@ class QKVParallelLinear(ColumnParallelLinear):
             "ex03 handles MHA only (num_heads == num_kv_heads). "
             "GQA is exercise 4."
         )
-        assert num_heads % tp_size == 0, "num_heads must be divisible by tp_size"
-        self.head_size = head_size
+        assert num_heads % tp_size == 0, "num_heads must be divisible by tp_size" # weiz: num_heads must be greater than tp_size
+        self.head_dim = head_dim
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.q_size_per_rank = (num_heads // tp_size) * head_size
-        self.kv_size_per_rank = (num_kv_heads // tp_size) * head_size
+        self.num_kv_heads = num_kv_heads # weiz: num_kv_heads really means num_k_heads == num_v_heads == num_kv_heads
+        self.q_size_per_rank = (num_heads // tp_size) * head_dim
+        self.kv_size_per_rank = (num_kv_heads // tp_size) * head_dim
 
         # Total merged output = Q_all + K_all + V_all.
-        output_size = (num_heads + 2 * num_kv_heads) * head_size
+        output_size = (num_heads + 2 * num_kv_heads) * head_dim # weiz: output_size is the most importan to figure out here
         super().__init__(hidden, output_size, tp_size, tp_rank, group=group)
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: str) -> None:  # type: ignore[override]
-        """Copy this rank's slice of a full [num_(kv_)heads * head_size, hidden]
+        """Copy this rank's slice of a full [num_(kv_)heads * head_dim, hidden]
         projection weight into the appropriate section of self.weight.
 
         shard_id: "q", "k", or "v".
@@ -84,7 +84,12 @@ class QKVParallelLinear(ColumnParallelLinear):
         #    Its length is q_size_per_rank (for "q") or kv_size_per_rank (for "k"/"v").
         # 2. Split full_weight into tp_size chunks on dim 0 and take this rank's.
         # 3. Copy that chunk into self.weight.data.narrow(0, offset, length).
-        raise NotImplementedError
+        if shard_id == "q":
+            self.weight.narrow(dim=0, start=0, length=self.q_size_per_rank).data.copy_(full_weight.chunk(dim=0, chunks=self.tp_size)[self.tp_rank])
+        elif shard_id == "k":
+            self.weight.narrow(dim=0, start= self.q_size_per_rank, length=self.kv_size_per_rank).data.copy_(full_weight.chunk(dim=0, chunks=self.tp_size)[self.tp_rank])
+        else: # shard_id == "v"
+            self.weight.narrow(dim=0, start=self.q_size_per_rank+self.kv_size_per_rank, length=self.kv_size_per_rank).data.copy_(full_weight.chunk(dim=0, chunks=self.tp_size)[self.tp_rank])
 
 
 class TPMHA(nn.Module):
@@ -115,11 +120,15 @@ class TPMHA(nn.Module):
         # TODO(you):
         # 1. self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group)
         # 2. self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank, group=group)
-        raise NotImplementedError
-
+        self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group)
+        self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank, group=group)
+        
+    # weiz 2026-08-11 the input x is B,T,Hidden (where Hidden=num_heads*head_dim). 
+    # Up: Hidden x (num_heads_per_rank*head_dim). 
+    # Down: (num_heads_per_rank*head_dim) * hidden
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, hidden]
-        B, T, _ = x.shape
+        B, T, hidden = x.shape
         # TODO(you):
         # 1. qkv = self.qkv_proj(x)   # [B, T, 3 * n_heads_per_rank * head_dim]
         # 2. Split into q, k, v — each [B, T, n_heads_per_rank * head_dim].
@@ -134,4 +143,31 @@ class TPMHA(nn.Module):
         #    [B, T, n_heads_per_rank * head_dim] — this is the sharded input
         #    for the RowParallelLinear.
         # 9. return self.o_proj(...)
-        raise NotImplementedError
+        
+        # weiz: step 1 local qkv 
+        qkv  = self.qkv_proj(x) # qkv: B x T x head_dim * n_heads_per_rank * 3
+        q_size = self.head_dim * self.n_heads_per_rank
+        kv_size = self.head_dim * self.n_heads_per_rank
+        # q,k,v, each of B x T x head_dim * n_heads_per_rank,  BTHD, old convention for llama and vllm
+        # Meta's LLaMA-1 reference code — where the "RoPE before transpose" convention originated.
+        q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1) # bug fix, we should split based on dim=-1
+        q = q.view((B,T,self.n_heads_per_rank, self.head_dim)) # B x T x n_heads x dim, aka BTHD
+        k = k.view((B,T,self.n_heads_per_rank, self.head_dim)) # BTHD
+        v = v.view((B,T,self.n_heads_per_rank, self.head_dim)) # BTHD 
+
+        # weiz: build RoPE, TODO, add self-test later
+        # Meta's LLaMA-1 reference code — where the "RoPE before transpose" convention originated.
+        cos, sin = build_rope_cache(
+                    T, self.head_dim, base=self.rope_base, device=x.device, dtype=x.dtype
+                )
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+
+        # BHTD modern format 
+        q=q.transpose(1,2) # weiz: permute it to BHTD so that we can call SDPA/flash-attn
+        k=k.transpose(1,2)
+        v=v.transpose(1,2)
+        o = nn.functional.scaled_dot_product_attention(q,k,v, is_causal=True) # BHTD
+        o= o.transpose(1,2).reshape(B,T,self.n_heads_per_rank*self.head_dim)
+        o = self.o_proj(o)
+        return o

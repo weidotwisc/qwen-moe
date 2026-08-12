@@ -18,7 +18,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
         hidden: int,
-        head_size: int,
+        head_dim: int,   # nanovllm/vLLM call this `head_size`; we use `head_dim` (matches HF + Qwen3 config)
         num_heads: int,
         num_kv_heads: int,
         tp_size: int,
@@ -29,12 +29,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             "ex03 handles MHA only (num_heads == num_kv_heads). GQA is exercise 4."
         )
         assert num_heads % tp_size == 0
-        self.head_size = head_size
+        self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.q_size_per_rank = (num_heads // tp_size) * head_size
-        self.kv_size_per_rank = (num_kv_heads // tp_size) * head_size
-        output_size = (num_heads + 2 * num_kv_heads) * head_size
+        self.q_size_per_rank = (num_heads // tp_size) * head_dim
+        self.kv_size_per_rank = (num_kv_heads // tp_size) * head_dim
+        output_size = (num_heads + 2 * num_kv_heads) * head_dim
         super().__init__(hidden, output_size, tp_size, tp_rank, group=group)
 
     def weight_loader(self, full_weight: torch.Tensor, shard_id: str) -> None:  # type: ignore[override]
@@ -46,7 +46,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             offset, size = self.q_size_per_rank + self.kv_size_per_rank, self.kv_size_per_rank
         else:
             raise ValueError(f"shard_id must be 'q'|'k'|'v', got {shard_id!r}")
-        # full_weight is [num_(kv_)heads * head_size, hidden]; slice for this rank on dim 0.
+        # full_weight is [num_(kv_)heads * head_dim, hidden]; slice for this rank on dim 0.
         rank_slice = full_weight.chunk(self.tp_size, dim=0)[self.tp_rank]
         self.weight.data.narrow(0, offset, size).copy_(rank_slice)
 
