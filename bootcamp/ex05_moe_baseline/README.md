@@ -15,15 +15,72 @@ skills you need before Ex06 sprinkles all-to-all comm on top.
 ## The math
 
 Given input tokens $X \in \mathbb{R}^{N \times H}$, a router weight
-$W_g \in \mathbb{R}^{E \times H}$ (E = num_experts), and E expert
+$W_R \in \mathbb{R}^{H \times E}$ ($E$ = num_experts), and $E$ expert
 SwiGLU MLPs $\{f_e\}_{e=0}^{E-1}$ each with weights
 $W_g^{(e)}, W_u^{(e)}, W_d^{(e)}$.
+
+*(Convention throughout this document: math notation with $W$ applied on
+the right, "A-space" — matrices have shape `[in, out]`. This matches the
+Megatron paper's expository style. PyTorch stores the transposed form
+in memory; see Ex01/Ex02 for the storage-vs-math discussion. Nothing
+here changes because of that — the storage convention is below this
+abstraction level.)*
+
+### The SwiGLU expert MLP
+
+Each expert $f_e$ is a **SwiGLU MLP** with three weight matrices:
+
+$$
+W_g^{(e)},\, W_u^{(e)} \;\in\; \mathbb{R}^{H \times I} \qquad
+W_d^{(e)} \;\in\; \mathbb{R}^{I \times H}
+$$
+
+where $H$ = hidden (residual-stream width) and $I$ = intermediate (each
+expert's expansion dim; for Qwen3-30B-A3B, $I = 768$ with $H = 2048$).
+
+Applied to input tokens $X \in \mathbb{R}^{N \times H}$:
+
+$$
+\boxed{\;\; f_e(X) \;=\; \Bigl(\;\mathrm{SiLU}(X W_g^{(e)}) \;\odot\; (X W_u^{(e)})\;\Bigr)\; W_d^{(e)} \;\in\; \mathbb{R}^{N \times H} \;\;}
+$$
+
+Note two things:
+
+- **$X W_u^{(e)}$ is a SEPARATE projection of $X$**, not applied to
+  $\mathrm{SiLU}(X W_g^{(e)})$. Both projections consume the same input
+  $X$ and produce two tensors of shape $[N, I]$; they're combined by
+  elementwise multiplication.
+- **$\odot$ is elementwise multiply**, not matmul. $\mathrm{SiLU}(X W_g)$
+  and $X W_u$ have the same shape $[N, I]$; $\odot$ gives another
+  $[N, I]$ tensor, which is then projected back down by $W_d$ to
+  $[N, H]$.
+
+Expanded step-by-step:
+
+$$
+\begin{aligned}
+G &= X\, W_g^{(e)} & &\in \mathbb{R}^{N \times I} & \text{gate pre-activation} \\
+U &= X\, W_u^{(e)} & &\in \mathbb{R}^{N \times I} & \text{up (value being gated)} \\
+Z &= \mathrm{SiLU}(G) \odot U & &\in \mathbb{R}^{N \times I} & \text{gated hidden} \\
+f_e(X) &= Z\, W_d^{(e)} & &\in \mathbb{R}^{N \times H} & \text{expert output}
+\end{aligned}
+$$
+
+This is exactly the SwiGLU MLP from Ex02 (same math, applied per
+expert). If SwiGLU still feels unfamiliar, re-read Ex02's math section
+before continuing.
+
+### MoE routing
 
 **Routing** (softmax over experts, then top-k):
 
 $$
-G \;=\; \mathrm{softmax}(X W_g^\top) \;\in\; \mathbb{R}^{N \times E}
+G \;=\; \mathrm{softmax}(X W_R) \;\in\; \mathbb{R}^{N \times E}
 $$
+
+(Router weight $W_R \in \mathbb{R}^{H \times E}$, so $X W_R \in \mathbb{R}^{N \times E}$
+gives per-token logits over experts. Softmax is applied per token, in fp32
+for numerical stability, before top-k.)
 
 Take the top-k values per row:
 
