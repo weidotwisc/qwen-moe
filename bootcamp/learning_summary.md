@@ -11,13 +11,13 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex02 | SwiGLU MLP under TP (merged column + row) | ✅ done | 8/8 green | Forced the Ex01 refactor |
 | Ex03 | MHA under TP (QKV column + O row) | ✅ done | 8/8 green | Introduced string `shard_id` + RoPE layout convention |
 | Ex04 | GQA + KV replication | ✅ done | 8/8 green | **Nanovllm-jun bug fixed** — TP-8 on Qwen3-30B-A3B unblocked |
-| Ex05a | MoE baseline (naive per-expert loop) | ⬜ pending | – | Batch 2 (Claude scaffolds next) |
-| Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Batch 2 |
+| Ex05a | MoE baseline (naive per-expert loop) | ✅ done | 2/2 green | Single-GPU. Consolidated `torch.where` / `index_add_` / broadcasting fluency |
+| Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Next |
 | Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
 | Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
 | Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
 
-**Bugs-caught count so far**: 13 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 14 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -871,4 +871,173 @@ workload.
 
 ---
 
-<!-- Add Ex05 summary below when done. -->
+## Ex05a — Naive Sparse MoE (single-GPU, per-expert loop)
+
+**Status: done, 2/2 tests green.** Single-GPU baseline. No TP, no EP —
+this exercise is about the sparse routing math + per-expert loop
+pattern that HF's `Qwen3MoeSparseMoeBlock` uses in production. Ex05b
+will re-implement the same math in the permuted layout; Ex06 will
+bolt all-to-all onto that permuted variant.
+
+### 1. Sparse MoE math
+
+Given tokens $X \in \mathbb{R}^{N \times H}$, router $W_R \in \mathbb{R}^{H \times E}$,
+and $E$ SwiGLU MLP experts $\{f_e\}$:
+
+$$
+\begin{aligned}
+G &= \mathrm{softmax}(X W_R) \in \mathbb{R}^{N \times E} & \text{routing probs (fp32 in-kernel)} \\
+(w_{ij}, e_{ij})_{j=1..k} &= \mathrm{topk}(G_i, k) & \text{per-token top-k experts} \\
+w_{ij} &\gets w_{ij} \Big/ \textstyle\sum_{j'} w_{ij'} & \text{if norm\_topk\_prob} \\
+Y_i &= \textstyle\sum_{j=1}^{k} w_{ij}\, f_{e_{ij}}(X_i) & \text{weighted combine}
+\end{aligned}
+$$
+
+Per-token top-k = "each token uses only k of the E experts." Weighted
+combine = "sum the k expert outputs with softmax weights." That's the
+whole MoE forward.
+
+### 2. The `softmax(topk(logits))` equivalence
+
+I implemented the routing as `topk(logits)` → `softmax(top-k values)`,
+which is mathematically equivalent to `softmax(all logits)` → `topk`
+→ renormalize (for the `norm_topk_prob=True` case). Because softmax
+is monotonic, top-k indices are the same either way; and:
+
+$$
+\mathrm{softmax}(\mathrm{topk}(l))_i = \frac{e^{l_i}}{\sum_{j \in \text{topk}} e^{l_j}} = \frac{e^{l_i}/Z}{\sum_{j \in \text{topk}} e^{l_j}/Z} = \frac{\mathrm{softmax}(l)_i}{\sum_{j \in \text{topk}} \mathrm{softmax}(l)_j}
+$$
+
+The $Z$ (full-sum normalization) cancels. So `softmax` over just the
+top-k logits gives the same weights as full-softmax renormalized over
+top-k. This saves the full-softmax over $E$ (= 128 for Qwen3-30B-A3B)
+when top_k=8. Only the `norm_topk_prob=True` branch is equivalent; the
+un-normalized branch keeps the full softmax and gathers.
+
+Numerical caveat: full-softmax should still be **fp32-cast then back**
+for stability. My initial version skipped this and passed anyway
+because $E=8$ in the test config leaves plenty of bf16 headroom; at
+Qwen3 scale (E=128) it would matter.
+
+### 3. Per-expert loop pattern
+
+```python
+for e in range(num_experts):
+    token_idx, k_idx = torch.where(selected_experts == e)      # both [num_tokens_for_e]
+    if token_idx.numel() == 0: continue
+    expert_out = self.experts[e](x_flat[token_idx])            # [t, H]
+    expert_out = expert_out * routing_weights[token_idx, k_idx, None]
+    y_flat.index_add_(0, token_idx, expert_out)
+```
+
+The elegance: **loop over experts, not over tokens**. Each iteration
+gathers the (typically few) tokens routed to expert $e$, runs one
+forward on the mini-batch, weights by that token's routing prob for
+$e$, scatter-adds into the output. Poor GEMM efficiency because each
+expert sees $N \cdot k / E$ tokens on average (small tensor,
+kernel-launch dominated) — Ex05b's permuted layout is the
+grouped-compute fix.
+
+### 4. PyTorch mechanics consolidated in this exercise
+
+Not new, but the ones that showed up together and are worth having as
+a mental checklist:
+
+- **`torch.where(cond)` returns a tuple of coordinate tensors**, one
+  per axis of `cond`. `token_idx, k_idx = torch.where(selected_experts == e)`
+  destructures a 2-D condition into two 1-D index tensors. Same idea
+  as `numpy.nonzero`, different name.
+- **`torch.topk(x, k, dim)` returns `(values, indices)`** — same
+  shape signature as `torch.max` (`torch.max` is just `topk(k=1)`
+  under the hood). Both `values` and `indices` have shape
+  `(..., k)` (the reduced dim replaced with $k$).
+- **`x[..., None]` = `.unsqueeze(-1)` in Triton and NumPy dialect.**
+  Extra axis for broadcasting; here used to align 1-D routing weights
+  `[t]` with 2-D expert output `[t, H]` for elementwise multiply.
+- **`index_add_(dim, index, source)`** is the scatter-add primitive.
+  Not deterministic on CUDA by default — multiple threads can race on
+  the same output row. For our tests the tolerance handles it; for
+  the paper's determinism argument we'll need
+  `torch.use_deterministic_algorithms(True)` (or a deterministic
+  reduction kernel).
+- **`.view()` vs `.reshape()`**: `.view()` requires contiguous;
+  `.reshape()` handles non-contiguous silently by copying. For
+  `y_flat = torch.zeros_like(x_flat)` the input is contiguous so
+  either works; `.reshape()` is more robust to code churn.
+
+### 5. `nn.ModuleList` vs plain Python list — the real reason
+
+Long side-discussion, worth codifying. Plain list in place of
+`nn.ModuleList([SwiGLU_MLP(...) for _ in range(E)])` has four failure
+modes, three of which matter for inference-only workloads too:
+
+| Failure mode | Training? | Inference? |
+|---|---|---|
+| Optimizer skips params | Yes | N/A |
+| Gradient tracking off | Yes | N/A |
+| `.to(device, dtype)` skips experts | Yes | **Yes** — 1st forward errors |
+| `state_dict()` / `load_state_dict()` skips experts | Yes | **Yes** — random-init experts |
+| `torch.compile` graph capture incomplete | Yes | **Yes** — fusion misses |
+| `sum(p.numel() for p in .parameters())` under-reports | Yes | **Yes** — memory sizing wrong |
+
+The only situations plain list works for inference: construct on
+target device via `set_default_device` AND load weights via direct
+attribute access (bypass `state_dict`) AND don't use `torch.compile`
+AND don't do introspection. Narrow set of conditions.
+
+Root cause is Python's `nn.Module.__setattr__` **only registers
+`nn.Module` and `nn.Parameter` values by name**. Assigning a plain
+list of `nn.Module` instances stores the list itself, and the list is
+not a `Module` — so the framework can't see through it during
+`.parameters()` / `.to()` / `.state_dict()` walks. `nn.ModuleList` IS
+an `nn.Module` subclass, so it registers, and its internal `.append`
+does the per-child `_modules[i] = child` bookkeeping. Same trick
+`nn.ModuleDict` and `nn.ParameterList` use.
+
+### 6. Traps I hit (1 bug)
+
+- **`nn.Linear(hidden, num_experts)` missing `bias=False`** on the
+  router. `nn.Linear` defaults to `bias=True`. The test's
+  `_copy_weights` only copies `.weight`, so the un-copied random
+  `bias ~ U[-1/\sqrt{H}, 1/\sqrt{H}] \approx \pm 0.02` corrupts
+  routing. Test failed until fixed. `RefSparseMoE` uses `bias=False`
+  (matches HF/vLLM convention — routers have no additive bias in
+  every production MoE codebase). **Pair every MoE router `nn.Linear`
+  with `bias=False`** — mnemonic: "router is a scoring function, not
+  an affine map."
+
+### 7. Verification framing
+
+- **Ex05a's forward is single-GPU, no comm.** So the correctness
+  spec is just "output matches per-token weighted sum of top-k
+  expert outputs" — same functional predicate as
+  `RefSparseMoE.forward`. No collective invariants yet.
+- **The permutation vocabulary starts here** in a rudimentary form:
+  `torch.where(selected_experts == e)` is a *partial* permutation
+  (extract one expert's tokens at a time). Ex05b will build the
+  **full** permutation (argsort by expert → contiguous blocks) that
+  Ex06's all-to-all dispatch operates on.
+- **The routing function's post-condition** is worth stating
+  precisely, because it's the interface between Ex05a's naive path
+  and Ex05b's permuted path (and Ex06's EP path):
+
+  For each token $i$, produce $(e_{i,1..k}, w_{i,1..k})$ such that:
+  1. $e_{ij} \in \{0, \dots, E-1\}$, all distinct within a token
+     (top-k gives distinct indices);
+  2. $\sum_j w_{ij} = 1$ if `norm_topk_prob`, else $\sum_j w_{ij} \le 1$;
+  3. $w_{ij} \ge 0$ (softmax outputs are non-negative).
+
+  Any downstream MoE variant that satisfies these three properties is
+  interchangeable at the routing interface. Ex05b's permuted layout
+  gives the same $(e, w)$ but reorganizes the physical layout; Ex06's
+  EP splits the compute across ranks. Same routing spec, three
+  physical realizations.
+
+### Reference material worth revisiting
+
+- HF's [`Qwen3MoeSparseMoeBlock`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py) — the naive per-expert loop shipped in production.
+- [nanovllm-jun `Qwen3SparseMoeBlock._forward_expert_parallel`](../nanovllm-jun/nanovllm/models/qwen3.py) — the EP variant. Uses the permuted layout Ex05b introduces, plus all-to-all comm from Ex06.
+- Shazeer et al. 2017 ["Outrageously Large Neural Networks"](https://arxiv.org/abs/1701.06538) — the paper that introduced Sparsely-Gated MoE. Router + top-k + weighted combine is theirs.
+- Fedus et al. 2021 ["Switch Transformer"](https://arxiv.org/abs/2101.03961) — top-1 special case, popularized MoE for large-scale LLM training.
+
+<!-- Add Ex05b summary below when done. -->

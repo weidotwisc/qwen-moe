@@ -19,6 +19,7 @@ The math:
 """
 
 from __future__ import annotations
+from turtle import forward
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,19 @@ from torch import nn
 
 from bootcamp.ref.mlp import RefSwiGLU_MLP
 
+class SwiGLU_MLP(nn.Module):
+    def __init__(
+        self,
+        hidden:int,
+        intermediate:int
+    ):
+        super().__init__()
+        self.gate_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False) # for MoE FFN, the bias is false
+        self.up_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False)
+        self.down_proj = nn.Linear(in_features=intermediate, out_features=hidden, bias=False)
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 class NaiveSparseMoE(nn.Module):
     """Single-GPU sparse MoE with per-expert loop.
@@ -54,7 +68,13 @@ class NaiveSparseMoE(nn.Module):
         # 3. self.experts = nn.ModuleList([
         #        RefSwiGLU_MLP(hidden, intermediate) for _ in range(num_experts)
         #    ])
-        raise NotImplementedError
+        self.hidden = hidden
+        self.intermediate = intermediate
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.norm_topk_prob = norm_topk_prob
+        self.gate = nn.Linear(hidden, num_experts,bias=False) # the router layer, bug fix bias=False
+        self.experts = nn.ModuleList(SwiGLU_MLP(intermediate=intermediate, hidden=hidden) for _ in range(num_experts))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Sparse-routed MoE forward.
@@ -65,10 +85,10 @@ class NaiveSparseMoE(nn.Module):
         Returns:
             Tensor of the same shape as x.
         """
-        original_shape = x.shape
-        x_flat = x.reshape(-1, original_shape[-1])
-        N = x_flat.shape[0]
-
+        original_shape = x.shape # B,T,D
+        x_flat = x.reshape(-1, original_shape[-1]) # B*T, D
+        N = x_flat.shape[0] # N = B*T
+        y_flat = torch.zeros_like(x_flat) # B*T, D
         # TODO(you):
         # 1. router_logits = self.gate(x_flat)                             # [N, num_experts]
         # 2. routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
@@ -89,4 +109,25 @@ class NaiveSparseMoE(nn.Module):
         #        expert_out = expert_out * routing_weights[token_idx, k_idx, None]
         #        output.index_add_(0, token_idx, expert_out)
         # 8. return output.reshape(original_shape)
-        raise NotImplementedError
+        
+        # weiz step 1 build up router
+        router_logits = self.gate(x_flat) # N x num_expert
+        top_k_weights, top_k_experts = torch.topk(router_logits, k=self.top_k, dim=-1) # both N x top_k
+        if self.norm_topk_prob:
+            top_k_weights = F.softmax(top_k_weights, dim=-1) 
+        else:
+            top_k_weights = F.softmax(router_logits, dim=-1).gather(dim=-1, index=top_k_experts)
+        # weiz step 2 loop over expert
+        for expert_id in range(self.num_experts):
+            token_ids, weight_indices = torch.where(top_k_experts==expert_id) # both are list of size t, which is how many tokens correspond to this expert
+            if len(token_ids) == 0:
+                continue
+            tokens = x_flat[token_ids] # (t,D)
+            weights = top_k_weights[token_ids, weight_indices] # (t,)
+            tokens_raw_projection = self.experts[expert_id](tokens) # (t,D)
+            expert_tokens_contribution = tokens_raw_projection * weights[:,None] # (t,D)
+            y_flat.index_add_(dim=0, index=token_ids,source=expert_tokens_contribution)
+        return y_flat.view(original_shape)
+
+
+        

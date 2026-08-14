@@ -65,6 +65,19 @@ from torch import nn
 
 from bootcamp.ref.mlp import RefSwiGLU_MLP
 
+class SwiGLU_MLP(nn.Module):
+    def __init__(
+        self,
+        hidden:int,
+        intermediate:int
+    ):
+        super().__init__()
+        self.gate_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False) # for MoE FFN, the bias is false
+        self.up_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False)
+        self.down_proj = nn.Linear(in_features=intermediate, out_features=hidden, bias=False)
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 class PermutedSparseMoE(nn.Module):
     """Single-GPU sparse MoE with permutation + grouped compute.
@@ -84,7 +97,13 @@ class PermutedSparseMoE(nn.Module):
         super().__init__()
         # TODO(you): same as Ex05a's __init__. Store hyperparams and allocate
         # self.gate (Linear) + self.experts (ModuleList of RefSwiGLU_MLP).
-        raise NotImplementedError
+        self.hidden = hidden
+        self.intermediate = intermediate
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.norm_topk_prob = norm_topk_prob
+        self.gate = nn.Linear(hidden, num_experts) # H,E  e.g 2048, 128
+        self.experts = nn.ModuleList(SwiGLU_MLP(hidden, intermediate) for _ in range(num_experts))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Permuted forward.
@@ -94,9 +113,9 @@ class PermutedSparseMoE(nn.Module):
         Returns:
             Tensor of the same shape as x.
         """
-        original_shape = x.shape
-        x_flat = x.reshape(-1, original_shape[-1])
-        N = x_flat.shape[0]
+        original_shape = x.shape # B,T,H
+        x_flat = x.reshape(-1, original_shape[-1]) # BxT, H
+        N = x_flat.shape[0] 
 
         # ============ Step 1: Router (SAME as Ex05a) ============
         # TODO(you):
@@ -108,6 +127,9 @@ class PermutedSparseMoE(nn.Module):
         # After this step:
         #   selected_experts: [N, top_k]  expert IDs per token per k
         #   routing_weights:  [N, top_k]  weights per token per k (sum to 1 per token if norm)
+
+        router_logits = self.gate(x_flat) # N,H
+        routing_weights, selected_experts = torch.topk(router_logits, k=self.top_k, dim=-1) # both N,k
 
         # ============ Step 2: Flatten routing to (N * top_k) triples ============
         # Every (token, expert-choice) pair becomes an independent record.
