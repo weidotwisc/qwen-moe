@@ -15,7 +15,8 @@
 // See PROPERTIES.md for the semi-formal spec these lemmas realize.
 
 use vstd::prelude::*;
-use vstd::seq::*;
+use vstd::calc;
+use vstd::arithmetic::div_mod::lemma_fundamental_div_mod;
 
 verus! {
 
@@ -55,7 +56,7 @@ pub open spec fn gather_from(w: Tensor, tp_size: nat, start: nat) -> Tensor
         start <= tp_size,
     decreases tp_size - start,
 {
-    if start == tp_size {
+    if start >= tp_size {
         Seq::<Row>::empty()
     } else {
         shard(w, start, tp_size) + gather_from(w, tp_size, (start + 1) as nat)
@@ -88,6 +89,18 @@ pub proof fn gather_from_equals_suffix(w: Tensor, tp_size: nat, start: nat)
     decreases tp_size - start,
 {
     let s = (w.len() / tp_size) as int;
+    let n = w.len() as int;
+    let p = tp_size as int;
+    lemma_fundamental_div_mod(n, p);
+    assert(n % p == 0);
+    assert(s == n / p);
+    calc! {
+        (==)
+        n; {}
+        p * (n / p) + n % p; {}
+        p * (n / p) + 0; {}
+        p * s;
+    }
     if start == tp_size {
         // Base: gather_from(w, tp_size, tp_size) == empty.
         // w.subrange(tp_size * s, w.len()) == w.subrange(w.len(), w.len()) == empty.
@@ -99,6 +112,18 @@ pub proof fn gather_from_equals_suffix(w: Tensor, tp_size: nat, start: nat)
         // Now: gather_from(w, tp_size, start+1) == w.subrange((start+1)*s, |w|)
         // Goal: shard(w, start, tp_size) + w.subrange((start+1)*s, |w|)
         //    == w.subrange(start*s, |w|)
+        assert(p * s == n);
+        assert(0 <= s);
+        assert(0 <= start as int);
+        assert(0 <= (start as int) * s) by (nonlinear_arith)
+            requires 0 <= start as int, s >= 0;
+        assert(((start + 1) as int) * s <= w.len() as int) by (nonlinear_arith)
+            requires start < tp_size,
+                     (tp_size as int) * s == w.len() as int,
+                     s >= 0;
+        assert((start as int) * s <= ((start + 1) as int) * s) by (nonlinear_arith)
+            requires s >= 0;
+        assert((start as int) * s <= w.len() as int);
         assert(shard(w, start, tp_size)
                == w.subrange((start as int) * s, ((start + 1) as int) * s));
         // Slicing decomposition: w[a..b] + w[b..c] == w[a..c].
@@ -210,8 +235,8 @@ pub proof fn axiom_m1(x: Tensor, w0: Tensor, w1: Tensor)
         w1.len() > 0,
         // Both weight halves have uniform row length.
         exists|rowlen: nat|
-            (forall|i: int| 0 <= i < w0.len() ==> #[trigger] w0[i].len() == rowlen)
-         && (forall|i: int| 0 <= i < w1.len() ==> #[trigger] w1[i].len() == rowlen),
+            #[trigger] well_formed(w0, w0.len(), rowlen)
+         && well_formed(w1, w1.len(), rowlen),
         matmul(x, transpose(w0)).len() == matmul(x, transpose(w1)).len(),
     ensures
         matmul(x, transpose(w0 + w1))
@@ -236,7 +261,7 @@ pub proof fn c4_forward_correctness_tp2(x: Tensor, w: Tensor)
         w.len() > 0,
         w.len() % 2 == 0,
         exists|rowlen: nat|
-            forall|i: int| 0 <= i < w.len() ==> #[trigger] w[i].len() == rowlen,
+            #[trigger] well_formed(w, w.len(), rowlen),
         matmul(x, transpose(shard(w, 0, 2))).len()
             == matmul(x, transpose(shard(w, 1, 2))).len(),
     ensures
@@ -261,6 +286,27 @@ pub proof fn c4_forward_correctness_tp2(x: Tensor, w: Tensor)
     assert(gather_from(w, 2, 0) == shard(w, 0, 2) + gather_from(w, 2, 1));
     assert(w0 + w1 =~= w);
 
+    // Transfer the full weight row length to both subrange shards.
+    let rowlen = choose|rowlen: nat| well_formed(w, w.len(), rowlen);
+    assert(well_formed(w, w.len(), rowlen));
+    assert(well_formed(w0, w0.len(), rowlen)) by {
+        assert forall|i: int| 0 <= i < w0.len()
+            implies #[trigger] w0[i].len() == rowlen by {
+            assert(w0[i] == w[i]);
+        }
+    }
+    assert(well_formed(w1, w1.len(), rowlen)) by {
+        assert forall|i: int| 0 <= i < w1.len()
+            implies #[trigger] w1[i].len() == rowlen by {
+            let offset = (w.len() / 2) as int;
+            assert(w1[i] == w[offset + i]);
+            assert(0 <= offset + i < w.len());
+        }
+    }
+    assert(exists|rowlen: nat|
+        #[trigger] well_formed(w0, w0.len(), rowlen)
+        && well_formed(w1, w1.len(), rowlen));
+
     // Now invoke axiom M1.
     axiom_m1(x, w0, w1);
 }
@@ -274,7 +320,7 @@ pub proof fn c4_forward_correctness_general(x: Tensor, w: Tensor, tp_size: nat)
         w.len() > 0,
         w.len() % tp_size == 0,
         exists|rowlen: nat|
-            forall|i: int| 0 <= i < w.len() ==> #[trigger] w[i].len() == rowlen,
+            #[trigger] well_formed(w, w.len(), rowlen),
     ensures
         // Gathered forward output equals unsharded matmul.
         // Formal statement omitted for the stub; the induction pattern

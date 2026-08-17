@@ -15,12 +15,22 @@ The proof files below realize that spec in three different systems.
 |---|---|---|---|
 | [PROPERTIES.md](PROPERTIES.md) | none | Properties + axioms + model | n/a |
 | [column_parallel.dfy](column_parallel.dfy) | Dafny 4.x | C1, C2, C3, C4 (tp=2); C4-general stubbed | No — Dafny not installed on pod |
-| [column_parallel.rs](column_parallel.rs) | Verus 0.2024+ | C1, C2, C3, C4 (tp=2); C4-general stubbed | No — Verus not installed on pod |
+| [column_parallel.rs](column_parallel.rs) | Verus 0.2025.07 | C1, C2, C3, C4 (tp=2); C4-general stubbed | **Yes — 12 verified, 0 errors** |
+| [COLUMN_PARALLEL_PROOF_GUIDE.zh-CN.md](COLUMN_PARALLEL_PROOF_GUIDE.zh-CN.md) | Markdown | `column_parallel.rs` 中文逐行证明导读 | n/a |
 | [column_parallel_z3.py](column_parallel_z3.py) | z3-solver (Python) | C1–C4 for 7 concrete shapes | **Yes — 28/28 pass** |
 
 ## Quick check
 
-Run the Z3 bounded verification now (only tool with automated CI on this pod):
+Run the Verus parameterized proof from this directory:
+
+```sh
+verus column_parallel.rs
+```
+
+Expected output: `verification results:: 12 verified, 0 errors`. This was
+confirmed with Verus `0.2025.07.12.0b6f3cb` and Rust `1.88.0`.
+
+Run the Z3 bounded verification from the repository root:
 
 ```sh
 uv run --with z3-solver python bootcamp/ex01_linear_tp/verification/column_parallel_z3.py
@@ -30,8 +40,8 @@ Expected output: `Summary: 28 passed, 0 failed`, ~0.2s wall time.
 
 ## Running the parameterized proofs (Dafny, Verus)
 
-Neither tool is available on the shared pod. Options for the intern to
-verify these:
+Verus has been run successfully on the shared pod. Dafny was not installed
+during this verification session. To install or run either tool elsewhere:
 
 ### Dafny (recommended for first pass — friendliest syntax)
 
@@ -70,7 +80,7 @@ export PATH="$PWD/target-verus/release:$PATH"
 verus column_parallel.rs
 ```
 
-**What verifies**:
+**What verifies** (`12 verified, 0 errors`):
 - `gather_from_equals_suffix`
 - `c1_shard_gather_roundtrip`
 - `c2_sharding_disjoint` (uses nonlinear-arith hints — see the `by (nonlinear_arith)` clauses)
@@ -88,16 +98,18 @@ inductive extension as the Dafny version.
 |---|---|---|---|
 | **Proof style** | Universal over `seq<T>` | Universal over `Seq<T>` (Rust) | Bounded per shape |
 | **Native LA** | No — matmul uninterpreted | No — matmul uninterpreted | Yes — matmul as symbolic sum |
-| **What it proves** | C1–C4 for all shapes (up to M1) | Same as Dafny | C1–C4 for enumerated shapes |
+| **What it proves** | C1–C3 universally; C4 for tp=2 (up to M1); general C4 stubbed | Same current coverage as Dafny | C1–C4 for enumerated shapes |
 | **Depends on axiom M1?** | Yes | Yes | No — LA checked directly |
 | **Failure mode** | Verification timeout / stuck proof search | Verification error / hint needed | Solver timeout |
 | **Install effort** | Medium (dotnet tool) | Higher (build from source) | Trivial (`pip install z3-solver`) |
 | **Learning curve** | Low — friendly syntax | Higher — Rust + verifier idioms | Trivial for Python users |
 | **Paper positioning** | Primary parameterized proof | Alternative parameterized proof, same theorem | Concrete regression evidence |
 
-**Complementary, not redundant**: the parameterized proofs (Dafny/Verus)
-give the theorem the paper cites — "for all TP sizes, our column-parallel
-linear layer satisfies C1–C4." The Z3 concrete check catches encoding
+**Complementary, not redundant**: the parameterized Dafny/Verus proofs currently
+establish C1–C3 for all valid TP sizes and C4 concretely for `tp_size == 2`.
+Completing the general C4 stub will establish the paper-target theorem —
+"for all TP sizes, our column-parallel linear layer satisfies C1–C4." The Z3
+concrete check catches encoding
 bugs — if some `(tp_size, M, N)` violates C4 in Z3 but the parameterized
 proofs claim otherwise, one of them is wrong. Historically this
 cross-validation has caught real bugs in formal specs.
@@ -153,10 +165,9 @@ cost of coverage. Z3 is our "regression tester" — Dafny/Verus are our
 
 For Wei's immediate purposes:
 
-- **You** don't need to install Dafny/Verus. Read [PROPERTIES.md](PROPERTIES.md)
-  and the three proof files as reference for what the paper's spec will
-  look like. The Z3 script runs on your existing setup and confirms the
-  properties hold for the shapes it enumerates.
+- **You** can run the Verus proof directly on the shared pod and use the Z3
+  script for bounded cross-checking. Read [PROPERTIES.md](PROPERTIES.md) and
+  the three proof files as reference for the paper's specification.
 - **The intern** (verification specialist) picks up the Dafny file first,
   gets `dafny verify column_parallel.dfy` to green (fills in the
   `{:verify false}` stub), then ports the same skeleton to Verus, then
