@@ -12,12 +12,12 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex03 | MHA under TP (QKV column + O row) | ✅ done | 8/8 green | Introduced string `shard_id` + RoPE layout convention |
 | Ex04 | GQA + KV replication | ✅ done | 8/8 green | **Nanovllm-jun bug fixed** — TP-8 on Qwen3-30B-A3B unblocked |
 | Ex05a | MoE baseline (naive per-expert loop) | ✅ done | 2/2 green | Single-GPU. Consolidated `torch.where` / `index_add_` / broadcasting fluency |
-| Ex05b | MoE permuted (grouped compute) | ⬜ pending | – | Next |
+| Ex05b | MoE permuted (grouped compute) | ✅ done | 2/2 green | Introduces the argsort/bincount/offsets vocabulary the rest of the MoE stack rides on |
 | Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
 | Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
 | Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
 
-**Bugs-caught count so far**: 14 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 16 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -1040,4 +1040,244 @@ does the per-child `_modules[i] = child` bookkeeping. Same trick
 - Shazeer et al. 2017 ["Outrageously Large Neural Networks"](https://arxiv.org/abs/1701.06538) — the paper that introduced Sparsely-Gated MoE. Router + top-k + weighted combine is theirs.
 - Fedus et al. 2021 ["Switch Transformer"](https://arxiv.org/abs/2101.03961) — top-1 special case, popularized MoE for large-scale LLM training.
 
-<!-- Add Ex05b summary below when done. -->
+## Ex05b — Permuted Sparse MoE (single-GPU, grouped compute)
+
+**Status: done, 2/2 tests green.** Same math as Ex05a; different data
+layout. Tokens get **permuted into per-expert contiguous blocks** so
+each expert's compute is a contiguous-slice matmul instead of a
+fancy-index gather. Introduces the argsort/bincount/offsets vocabulary
+that every downstream MoE step (Ex06 EP, Ex08 fused kernel) rides on.
+
+### 1. The permutation vocabulary — 7 steps
+
+Given routing output `top_k_experts: [N, top_k]` and `top_k_weights: [N, top_k]`:
+
+| Step | Operation | Shape produced |
+|---|---|---|
+| 1 | Router (same as Ex05a) | `top_k_experts`, `top_k_weights` [N, k] |
+| 2 | Flatten to (N·k) records | `token_ids_flat`, `expert_ids_flat`, `weights_flat` [Nk] |
+| 3 | Argsort by expert (`torch.sort` returns values + perm indices) | `sort_perm` [Nk] |
+| 4 | Bincount + cumsum → offsets | `offsets` [E+1] |
+| 5 | Gather sorted input via fancy indexing | `sorted_x` [Nk, H] |
+| 6 | Per-expert compute on contiguous slice `sorted_x[offsets[e]:offsets[e+1]]` | `sorted_out` [Nk, H] |
+| 7 | Weight + unpermute + `index_add_` back to [N, H] | `y_flat` [N, H] |
+
+Steps 3–5 are the "permutation dance." Steps 6–7 are the compute +
+combine. Ex06 will insert `all_to_all_variable` between steps 5 and 6
+(dispatch) and again between steps 6 and 7 (combine). Ex08 will
+replace step 6 with a single Triton kernel launch.
+
+### 2. The naive-vs-argsort equivalence (worth internalizing)
+
+A `for expert_id in range(E): torch.where(top_k_experts == expert_id)`
+loop **already produces the same per-expert grouping** as an explicit
+argsort — the loop order IS the permutation. For single-GPU Ex05b in
+isolation, either form gives the same output.
+
+The argsort form is a strict prep step for what comes next:
+
+| Concern | Naive loop (`torch.where` per expert) | Argsort form |
+|---|---|---|
+| Correctness for Ex05b | ✅ same output | ✅ same output |
+| Kernel launches (E=128 case) | ~3E launches (`where` × E + `gather` × E + expert forwards) | ~E+4 launches (1 argsort + 1 gather + E expert forwards) |
+| Materializes `[Nk, H]` contiguous buffer | Needs a `torch.cat` at end | Falls out naturally |
+| Compatible with `all_to_all_variable` (Ex06) | Needs the cat first | Ready |
+| Compatible with fused Triton kernel (Ex08) | Needs restructuring | Ready |
+| Compatible with `torch.compile` / CUDA graphs | Dynamic shapes per iter | Static graph |
+
+**Argsort is preparation, not necessity.** Ex05b's job is to install
+the vocabulary that Ex06 and Ex08 require. The mnemonic:
+"same math, three physical realizations" — naive/permuted/fused all
+satisfy the same routing spec at different memory layouts.
+
+### 3. Memory cost of the permuted layout
+
+`sorted_x` and `sorted_out` are each `[N·top_k, H]` — a **factor-k
+blowup** on the activation tensor. At Qwen3-30B-A3B (N≈1024, k=8,
+H=2048, bf16): ~32 MB per tensor per MoE layer, peak ~64 MB
+per-layer transient. Trivial on 80 GB A100.
+
+**Not a new cost, just re-shaped**: Ex05a's naive loop also allocates
+E small `x[token_idx]` tensors totaling the same bytes; the difference
+is peak vs cumulative allocation. Ex05b trades higher peak for lower
+allocator churn (2 slabs vs E small tensors).
+
+**The blowup is unavoidable once EP is on the table**: `all_to_all_variable`
+in Ex06 requires one contiguous send buffer of shape `[Nk, H]`. Ex05b
+pays this memory cost one exercise early; from there it's monotone
+through Ex06/Ex08 with no undo.
+
+Top-1 MoE (Switch Transformer) escapes this — top_k=1 means no blowup.
+Top-k MoE (Qwen3, Mixtral, DeepSeek, etc.) always pays the k× cost.
+
+### 4. The "three tensors, one permutation" rule
+
+In the permuted layout, three parallel 1-D tensors travel in
+lockstep, all keyed on the same axis `p ∈ [0, N·top_k)`:
+
+| Tensor | Semantics |
+|---|---|
+| `sorted_token_ids[p]` | which token this record refers to |
+| `sorted_expert_ids[p]` | which expert receives this record |
+| `sorted_weights[p]` | routing weight for this (token, expert) pair |
+
+**Every one of them must get permuted by the SAME `sort_perm`.**
+Skipping the permutation on any of the three means the correspondence
+between positions breaks silently — and my Ex05b bug (§6 below) hit
+exactly that failure mode. `argsort` returns an index tensor
+specifically so you can apply the same permutation to multiple
+tensors — this is what makes gather/scatter reusable across
+downstream steps.
+
+### 5. PyTorch mechanics consolidated in this exercise
+
+- **Fancy indexing shape rule**: `x[idx].shape == idx.shape + x.shape[1:]`.
+  Output leading shape follows the index tensor's shape, not the
+  source's. So `x[sorted_token_ids]` where `sorted_token_ids: [Nk]`
+  gives `[Nk, H]` output — even though the source `x` has only N
+  rows. `max(idx) < len(x)` is all that's required for validity.
+- **Reads with duplicates are cheap and race-free** — each output
+  thread reads one source row, no cross-thread contention. **Writes
+  with duplicates race** and need `index_add_` (which uses atomics
+  on CUDA).
+- **Fancy indexing → copy; slice indexing → view.**
+  `x_flat[sorted_token_ids]` allocates a new tensor;
+  `sorted_x[offsets[e]:offsets[e+1]]` is a zero-copy view. Ex05b uses
+  both.
+- **`torch.sort(x)` returns `(values, indices)`** — same info as
+  `torch.argsort` but the values come along, saving a re-gather. Use
+  `stable=True` for reproducibility across runs (default is False
+  in torch < 2.4).
+- **`torch.bincount(x, minlength=E)`** — the `minlength` argument is
+  mandatory when the tail experts may be empty. Without it, output
+  shape is `[max(x) + 1]`, not `[E]`.
+- **`F.pad(cumsum(counts), (1, 0))`** is the cleanest prepend-zero
+  idiom for the offsets tensor. Alternatives (`torch.cat([zeros(1),
+  ...])`) work but are more verbose.
+- **`torch.topk(..., sorted=True)` (the default) makes indices come
+  out in descending-weight order** — irrelevant for correctness
+  (subsequent argsort re-orders them), but a determinism gift for the
+  paper: the tie-breaking is stable across runs without extra effort.
+
+### 6. Traps I hit (2 bugs)
+
+- **`nn.Linear(hidden, num_experts)` missing `bias=False` on the
+  gate** — literal repeat of the Ex05a bug. Same failure mode
+  (`_copy_weights` copies only `.weight`, un-copied random bias
+  corrupts routing). Fix: pair every MoE router with `bias=False`
+  by reflex. Every production MoE codebase does this — no exceptions.
+- **Weight lookup used the wrong index space.** After building
+  `token_idx_rep_permuted_by_experts` (token IDs in expert-grouped
+  order), I indexed `top_k_weights_flat` with those token IDs to get
+  the weights for each expert's tokens. Wrong index space:
+  `top_k_weights_flat` is keyed by **flat routing record position
+  `p ∈ [0, Nk)`**, not by token ID `t ∈ [0, N)`. Passing token IDs
+  fetched arbitrary weights (routing records at positions matching
+  the token-ID numeric values), silently producing wrong output that
+  matched shape but not values. Fix: build a `top_k_weights_flat_permuted`
+  tensor once (`top_k_weights_flat[top_k_experts_permutation]`) and
+  slice IT via `[start : start+token_cnt]` inside the loop — symmetric
+  with how `token_idx_rep_permuted_by_experts` is used. This is the
+  "three tensors, one permutation" rule violated.
+
+### 7. Verification framing
+
+**Ex05b's abstract post-condition is identical to Ex05a's** — same
+three routing invariants (distinct indices per token, non-negative
+weights, sum-to-1 under `norm_topk_prob`), same weighted-combine
+result per token. **Both implementations refine the same abstract
+spec**: they compute the same $Y_i = \sum_j w_{ij} f_{e_{ij}}(X_i)$
+up to fp reduction-order.
+
+For Verus/Dafny: this is a bisimulation-type observation. Two
+concrete implementations satisfying the same abstract post-condition
+are interchangeable at the paper's spec level. The permutation π
+that groups by expert-id is quantified existentially in the abstract
+model; both naive-loop-order and argsort realize it. **Same proof
+covers both implementations without change.** This is a nice payoff
+of picking a mostly-declarative spec — the physical layout is below
+the abstraction level.
+
+The interesting NEW spec content in Ex05b, compared to Ex05a:
+
+- **Permutation invariants**: `sort_perm` is a bijection on
+  `[0, N·top_k)`. Applied to `expert_ids_flat`, the result is
+  sorted (monotone non-decreasing). This is a proof of concept for
+  the argsort-permutation-schema that Ex06 will inherit.
+- **Offset well-formedness**: `offsets[E+1]` is a strictly
+  monotone-non-decreasing sequence with `offsets[0] = 0` and
+  `offsets[E] = N·top_k`. Any block-based iteration over the sorted
+  layout obeys `sum of block lengths = total records`. Bincount +
+  cumsum + prepend-zero produces exactly this shape.
+- **Scatter-add commutativity**: `index_add_(sorted_token_ids, ...)`
+  accumulates each token's `top_k` contributions in some order. The
+  abstract sum is commutative, so any order gives the same result up
+  to fp reduction-order. **This is the one non-trivial fp-associativity
+  bookkeeping** the paper will need to state precisely (tolerance is
+  ~1e-2 in bf16 for 128-expert × top_k=8).
+
+### 8. Looking ahead — no atomics for Ex08 fused kernel
+
+The Triton kernel in Ex08 (grouped MoE GEMM) is **atomics-free** —
+structurally identical to FA2 forward. Each expert's block
+`[offsets[e]:offsets[e+1]]` is a disjoint tile of the output; no two
+kernel blocks write to the same output row. All reduction
+(matmul-inner-sum) is intra-block via shared memory. `tl.atomic_*`
+only appears if step 7 (the scatter-add) is fused INTO the same
+kernel — most production kernels (Megablocks, vLLM `FusedMoE`) keep
+step 7 as PyTorch's `index_add_` outside the kernel, avoiding
+in-kernel atomics entirely. For the paper's verification story this
+is a clean choice: `index_add_` is a well-defined abstract collective
+event; in-kernel atomics would require weak-memory reasoning inside
+Triton.
+
+### Reference material worth revisiting
+
+- Fedus et al. 2021 ["Switch Transformer"](https://arxiv.org/abs/2101.03961) — top-k=1 case; no factor-k blowup, but same permutation pattern in an EP setting.
+- Megablocks ["Efficient MoE Training" (Gale et al. 2022)](https://arxiv.org/abs/2211.15841) — sparse MoE kernels with the same permutation vocabulary; different naming (`bin_ids`, `bin_offsets`).
+- vLLM `FusedMoE` in [`vllm/model_executor/layers/fused_moe/`](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/fused_moe) — the production Triton kernel implementation. `sorted_token_ids`, `expert_ids`, `num_tokens_post_padded` naming.
+- [nanovllm-jun `Qwen3SparseMoeBlock._forward_expert_parallel`](../nanovllm-jun/nanovllm/models/qwen3.py) — the EP variant our bootcamp is preparing us to fix. Uses the same permutation vocabulary + `all_to_all_variable`.
+
+---
+
+## Cross-cutting: Ecosystem naming conventions (MoE)
+
+Every MoE codebase reinvents slightly different names for the same
+concepts. Below is my translation table between the bootcamp's
+naming (chosen to match my own mental model, matching the
+[README.md](ex05_moe_baseline/README.md) math notation where
+possible), HF Transformers, and vLLM / nanovllm-jun. Use this as the
+port-back document when moving bootcamp code into nanovllm-jun.
+
+| Concept | Bootcamp (mine) | HF Transformers | vLLM / nanovllm-jun |
+|---|---|---|---|
+| Router pre-activation | `router_logits` | `router_logits` | `router_logits` |
+| Full softmax over experts | `routing_probs` (mid-computation, discarded) | `routing_weights` | `router_probs` |
+| Post-top-k weights | `top_k_weights` | `routing_weights` (reused name) | `topk_weights` |
+| Post-top-k expert indices | `top_k_experts` | `selected_experts` | `topk_ids` |
+| Renormalize top-k flag | `norm_topk_prob` | `norm_topk_prob` (config) | `renormalize` (constructor arg) |
+| Router linear layer | `self.gate` | `self.gate` | `self.gate` (as `ReplicatedLinear`) |
+| Experts container | `self.experts: nn.ModuleList` | `self.experts: nn.ModuleList` | `self.experts` (single `FusedMoE` object, or `ModuleList` in nanovllm-jun) |
+| Full flat expert-id tensor | `top_k_experts_flat` (or `expert_ids_flat`) | *(N/A — HF doesn't permute)* | `expert_ids` (in kernel signatures) |
+| Argsort permutation index | `top_k_experts_permutation` (or `sort_perm`) | *(N/A)* | `sorted_indices` / `permutation` |
+| Post-sort expert IDs | `top_k_experts_ids` | *(N/A)* | `sorted_expert_ids` |
+| Post-sort token IDs | `token_idx_rep_permuted_by_experts` (or `sorted_token_ids`) | *(N/A)* | `sorted_token_ids` |
+| Post-sort routing weights | `top_k_weights_flat_permuted` (or `sorted_weights`) | *(N/A)* | `sorted_weights` |
+| Bincount by expert | `expert_bincnt` | *(N/A)* | `num_tokens_per_expert` |
+| Cumulative offsets | `offsets` (or start-position tracked in loop) | *(N/A)* | `expert_offsets` / `token_offsets` (Megablocks: `bin_offsets`) |
+| Permuted input tensor `[N·k, H]` | `sorted_x` | *(N/A)* | `permuted_hidden_states` / `sorted_hidden_states` |
+| Post-scatter final output | `y_flat` | (implicit in HF's naive combine loop) | `hidden_states` (overwritten) |
+
+**HF is the "readable tutorial" naming** — descriptive, close to
+math notation. **vLLM / nanovllm-jun is the "kernel-friendly"
+naming** — shorter tokens that match Triton argument names.
+**Bootcamp is somewhere in between**, biased toward descriptive
+names where they line up with the paper's math.
+
+**When porting**: the port from bootcamp to nanovllm-jun is a
+mechanical search-and-replace against this table, roughly a
+one-commit refactor. Don't rename now — rename when actually porting.
+
+---
+
+<!-- Add Ex06 summary below when done. -->
