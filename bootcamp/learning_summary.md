@@ -1373,4 +1373,158 @@ one-commit refactor. Don't rename now — rename when actually porting.
 
 ---
 
+## Cross-cutting: Sparse MoE as Strang's 4th way of matmul
+
+An abstract framing I want to keep at hand — the "loop over experts,
+not tokens" reordering that felt like a clever data-path trick in
+Ex05a is actually **Strang's 4th way of matrix multiplication**
+applied to a sparse rank decomposition. Same idea as PCA, LoRA, and
+tiled GEMM. Naming this precisely helps position the paper.
+
+### Recall — Strang's four ways to compute $C = AB$
+
+| Way | Formula | Iteration |
+|---|---|---|
+| 1. Inner products | $C_{ij} = \sum_k A_{ik} B_{kj}$ | (i, j) outer, k inner |
+| 2. Column-by-column | $C_{:,j} = A \cdot B_{:,j}$ | j outer |
+| 3. Row-by-row | $C_{i,:} = A_{i,:} \cdot B$ | i outer |
+| **4. Sum of rank-1 outer products** | $C = \sum_{k} A_{:,k}\, B_{k,:}$ | **k outer** — sum over shared axis |
+
+Way #4 is Strang's headline framing: matmul as accumulation of
+rank-1 contributions, one per shared-axis index.
+
+### MoE combine as way #4
+
+The MoE combine is a matmul-like contraction over the expert axis:
+
+$$
+Y = \sum_{e=0}^{E-1} R_{:,e} \odot f_e(X)
+$$
+
+Where:
+- $R \in \mathbb{R}^{N \times E}$ is the (sparse) routing matrix,
+  $R_{ie} = w_{ij}$ if $e_{ij} = e$ else 0 — only top_k non-zeros per row.
+- $f_e(X) \in \mathbb{R}^{N \times H}$ is expert $e$'s output on all
+  tokens (a nonlinear function, so not quite "matmul" — but the
+  outer-sum structure is identical).
+- The sum ranges over the expert axis $e$ — Strang's shared axis.
+
+Each term $R_{:,e} \odot f_e(X)$ is a **rank-slice-in-e contribution**
+to $Y$. Sum over $E$ terms → total output. Structurally way #4.
+
+**The per-expert loop physically realizes this decomposition.** Each
+iteration computes one term of the sum. The sparsity of $R$ (only
+top_k non-zeros per row) means you compute $f_e$ only for the tokens
+routing to $e$ — a **sparse rank-slice**, not a full one — but the
+outer-decomposition structure is intact.
+
+**The per-token loop (the "obvious" alternative that Ex05a rejects)**
+would be way #3 (row-by-row): compute $Y_i$ for each token
+independently by iterating its top_k experts. Terrible GEMM shape —
+Nk tiny matmuls, one per (token, expert) pair, no batching. Way #4
+pools tokens by shared expert, giving each iteration a proper
+`[t_e, H] @ [H, I]` batch.
+
+### PCA connection
+
+Truncated PCA:
+
+$$
+X \approx \sum_{k=1}^{K} \sigma_k u_k v_k^\top
+$$
+
+Truncated sum of rank-1 outer products; top-K captures the "important"
+contributions.
+
+Sparse MoE:
+
+$$
+Y = \sum_{e \in \text{active}} R_{:,e} \odot f_e(X)
+$$
+
+Truncated sum of rank-slice contributions; **top_k routing captures the
+"important" experts per token**.
+
+| PCA | MoE |
+|---|---|
+| Basis $u_k, v_k$ | Expert function $f_e$ + column of $R$ |
+| Weight $\sigma_k$ | Routing weight $w_{ie}$ |
+| Truncate to top-K by $\sigma$ | Truncate to top-k by softmax |
+| Sum contribution = $\sigma_k u_k v_k^\top$ | Sum contribution = $w_{ie} \cdot f_e(X_i)$ |
+
+**Both are top-K truncations of a rank-decomposed sum.** Different
+"basis" (linear singular vectors vs. nonlinear expert functions),
+same structural pattern.
+
+The truncation is why sparse-MoE is efficient. **Without top-k, MoE
+would be a rank-E outer sum over all tokens — cost of $E$ MLPs per
+token.** Top-k drops to $k \ll E$ active contributions, an $E/k$
+speedup. That's the whole efficiency case for sparse MoE in one
+observation.
+
+### The bigger pattern — Strang's #4 shows up everywhere
+
+The "reorder the summation axis" move is a fundamental HPC pattern:
+
+| Where | The decomposition | Purpose |
+|---|---|---|
+| GEMM loop tiling (M-first vs K-first) | Reorder $\sum_k$ vs $\sum_i$ vs $\sum_j$ | Cache alignment |
+| Sparse attention (Longformer / BigBird) | $Y = \sum_{\text{block}} A_{\text{block}} V_{\text{block}}$ | Skip empty blocks |
+| Einsum reordering | Choose which axis to reduce first | Cost heuristics |
+| Multi-head attention | Head axis outer: $Y = \text{concat}_h A_h V_h$ | Head-parallel independent compute |
+| LoRA | $W = W_0 + BA$ (rank-r additive contribution) | Cheap fine-tuning |
+| GPTQ / block-diagonal quantization | $W = \sum_b W_b$ (block sum) | Independent quantization per block |
+| Tensor-train / low-rank compression | High-D tensor as sum of low-rank cores | Memory saving |
+
+**Every one of these is way #4 applied to a specific structure.**
+Sparse MoE is just: "way #4 over the expert axis, sparse in the
+non-selected experts."
+
+### Implication for parallelism
+
+Once MoE is framed as Strang's #4 over the expert axis, the
+parallelism-axis story becomes clean:
+
+- **TP (Tensor Parallelism)** shards within each rank-slice — shards
+  the *hidden* axis inside a single expert's compute.
+- **EP (Expert Parallelism)** shards the outer sum axis — assigns
+  different terms of $\sum_e$ to different ranks.
+
+**TP and EP are orthogonal because they partition different axes of
+the Strang-4 decomposition.** The paper's Ex07 composition theorem
+is: partitioning distinct axes of a rank-decomposable sum preserves
+correctness under fixed collective schedules. Verus/Dafny quantify
+this as a Hoare-triple over the sum-decomposed spec.
+
+### Implication for verification
+
+The paper's abstract spec of the MoE forward is:
+
+$$
+Y \;=\; \bigoplus_{e=0}^{E-1} \bigl(R_{:,e} \odot f_e(X)\bigr)
+$$
+
+Where $\oplus$ is the abstract "sum" collective (commutative,
+associative up to fp reduction-order tolerance). Every physical
+realization — Ex05a naive, Ex05b permuted, Ex06 EP, Ex07 TP+EP,
+Ex08 fused kernel — refines this spec by choosing:
+
+1. **The order of the sum** (per-expert iteration order).
+2. **The physical layout** ($[N, H]$ vs $[Nk, H]$ intermediate).
+3. **The parallelism partition** (which ranks own which $e$).
+4. **The kernel fusion boundary** (which sums live inside one kernel launch).
+
+The correctness theorem in each case is: "this physical schedule
+computes the abstract Strang-4 sum, up to declared reduction-order
+tolerance." **Six exercises, one theorem shape.** Clean composition
+point for the paper.
+
+### The one-line takeaway
+
+**Sparse MoE = Strang's 4th way of matmul, truncated by top-k routing,
+with expert functions replacing rank-1 outer products.** TP shards
+within a term; EP shards across terms; the sum is preserved.
+
+---
+
 <!-- Add Ex06 summary below when done. -->
