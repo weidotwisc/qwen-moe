@@ -116,7 +116,7 @@ class PermutedSparseMoE(nn.Module):
         original_shape = x.shape # B,T,H
         x_flat = x.reshape(-1, original_shape[-1]) # BxT, H, aka (N,H)
         N = x_flat.shape[0] 
-        y_flat = torch.zeros_like(x_flat) # 
+        y_flat = torch.zeros_like(x_flat) # (N,H)
         # ============ Step 1: Router (SAME as Ex05a) ============
         # TODO(you):
         # - router_logits = self.gate(x_flat)                               # [N, E]
@@ -141,8 +141,9 @@ class PermutedSparseMoE(nn.Module):
         expert_bincnt = torch.bincount(top_k_experts_ids, minlength=self.num_experts) # (E,)
         token_ids_rep = torch.repeat_interleave(torch.arange(N, device=x.device), repeats=self.top_k) # (Nk,)
         token_idx_rep_permuted_by_experts = token_ids_rep[top_k_experts_permutation] # (Nk,), already grouped by experts, we just need to figure out the start and offset for each expert
-        x_flat_permuted = x_flat[token_idx_rep_permuted_by_experts] # (Nk,H) improvment! prepare the input X upfront
+        x_flat_permuted = x_flat[token_idx_rep_permuted_by_experts] # (Nk,H) improvment 1! prepare the input X upfront
         top_k_weights_flat_permuted = top_k_weights_flat[top_k_experts_permutation] # bug fix! (Nk,), now this weights is grouped by expert id
+        expert_output = torch.zeros_like(x_flat_permuted) # (Nk,H) improvement 2, having a write buffer, 
         start=0
         for expert_id, token_cnt_tensor in enumerate(expert_bincnt):
             token_cnt = token_cnt_tensor.item() # token_cnt is number of tokens corresponding to this expert
@@ -151,13 +152,16 @@ class PermutedSparseMoE(nn.Module):
             # get the slice of token ids that routed to this expert 
             tokens_for_this_expert = x_flat_permuted[start:start+token_cnt] #(num_tokens_for_this_expert, H), improvement i already have x_flat_permuted
             # get the scaling factors for this expert for the corresponding tokens
-            experts_output_weights = (top_k_weights_flat_permuted[start:start+token_cnt])[:,None] #(num_tokens_for_this_expert,1), bug fix! we need to directly go into top_k_weights_flat_permuted
-            experts_output = self.experts[expert_id](tokens_for_this_expert) * experts_output_weights # (num_tokens_for_this_expert, H)
+            #experts_output_weights = (top_k_weights_flat_permuted[start:start+token_cnt])[:,None] #(num_tokens_for_this_expert,1), bug fix! we need to directly go into top_k_weights_flat_permuted
+            #experts_output = self.experts[expert_id](tokens_for_this_expert) * experts_output_weights # (num_tokens_for_this_expert, H)
+            expert_output[start:start+token_cnt]= self.experts[expert_id](tokens_for_this_expert)
             # write into y_flat
-            perm =  token_idx_rep_permuted_by_experts[start:start+token_cnt]
-            y_flat.index_add_(dim=0, index=perm, source=experts_output)
+            #perm =  token_idx_rep_permuted_by_experts[start:start+token_cnt]
+            #y_flat.index_add_(dim=0, index=perm, source=experts_output)
             # update start
             start += token_cnt
+        expert_output *= top_k_weights_flat_permuted[:,None] # (Nk,H) improvement! one big scaling, 
+        y_flat.index_add_(dim=0, index=token_idx_rep_permuted_by_experts, source=expert_output) # imporvement on big scaling
         return y_flat.reshape(original_shape)
             
 

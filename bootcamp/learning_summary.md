@@ -1067,28 +1067,50 @@ combine. Ex06 will insert `all_to_all_variable` between steps 5 and 6
 (dispatch) and again between steps 6 and 7 (combine). Ex08 will
 replace step 6 with a single Triton kernel launch.
 
-### 2. The naive-vs-argsort equivalence (worth internalizing)
+### 2. Naive vs argsort — same math, three implementation forms
 
 A `for expert_id in range(E): torch.where(top_k_experts == expert_id)`
 loop **already produces the same per-expert grouping** as an explicit
 argsort — the loop order IS the permutation. For single-GPU Ex05b in
 isolation, either form gives the same output.
 
-The argsort form is a strict prep step for what comes next:
+**What actually differs is materialization discipline** — how much of
+the pipeline lives outside the expert-loop body. My Ex05b went through
+three variants of increasing lift-out:
 
-| Concern | Naive loop (`torch.where` per expert) | Argsort form |
+| Form | Loop body does | Outside the loop |
 |---|---|---|
-| Correctness for Ex05b | ✅ same output | ✅ same output |
-| Kernel launches (E=128 case) | ~3E launches (`where` × E + `gather` × E + expert forwards) | ~E+4 launches (1 argsort + 1 gather + E expert forwards) |
-| Materializes `[Nk, H]` contiguous buffer | Needs a `torch.cat` at end | Falls out naturally |
-| Compatible with `all_to_all_variable` (Ex06) | Needs the cat first | Ready |
-| Compatible with fused Triton kernel (Ex08) | Needs restructuring | Ready |
-| Compatible with `torch.compile` / CUDA graphs | Dynamic shapes per iter | Static graph |
+| **V1: `torch.where` per iter** (my first draft) | `where` + gather + mul + scatter + expert forward | argsort + bincount only |
+| **V2: `x_flat_permuted` upfront** (after 1st refactor) | slice + mul + scatter + expert forward | argsort + gather + bincount + weights permute |
+| **V3: full reference form** (final) | slice + expert forward + slice-write | argsort + gather + expert-output buffer + one final `expert_output *= sorted_weights[:, None]` + one final `y_flat.index_add_(...)` |
 
-**Argsort is preparation, not necessity.** Ex05b's job is to install
-the vocabulary that Ex06 and Ex08 require. The mnemonic:
-"same math, three physical realizations" — naive/permuted/fused all
-satisfy the same routing spec at different memory layouts.
+Corrected launch-count comparison (accounting for E `copy_` launches
+in V3's `expert_output[s:e] = self.experts[e](...)` slice-writes,
+which I initially undercounted):
+
+| Form | Non-expert launches (E=128) | Total launches (E=128, incl. ~5E from expert bodies) |
+|---|---|---|
+| V1 (`torch.where` per iter) | ~3E = 384 | ~8E = 1024 |
+| V2 (`x_flat_permuted` upfront) | ~2E + 1 = 257 | ~7E = 897 |
+| V3 (full reference form) | ~E + 3 = 131 | ~6E = 771 |
+
+**V3 is ~25% fewer launches than V1, not the ~100× ratio my initial
+writeup claimed.** The real advantage of V3 over V1/V2 isn't launch
+count; it's **memory-access pattern + Ex06 readiness**:
+
+| Concern | V1 | V2 | V3 |
+|---|---|---|---|
+| Expert forward reads via | fancy-index gather (strided HBM) | contiguous slice view | contiguous slice view |
+| Materialized `[Nk, H]` input buffer | No | Yes (`x_flat_permuted`) | Yes + `expert_output` |
+| `all_to_all_variable` (Ex06) input | Needs added gather | Ready | Ready |
+| Ex08 fused-kernel input format | Needs restructuring | Compatible | Compatible |
+| Loop body reads/writes | scattered | contiguous read, per-iter scatter | contiguous read, contiguous write |
+
+**Argsort + full-lift-out is preparation, not necessity.** Ex05b's job
+is to install the vocabulary + data layout that Ex06 and Ex08 require.
+The mnemonic: "same math, three physical realizations" —
+naive/permuted-partial/permuted-reference all satisfy the same routing
+spec; only the memory-access shape and Ex06/Ex08 compatibility differ.
 
 ### 3. Memory cost of the permuted layout
 
@@ -1230,6 +1252,77 @@ in-kernel atomics entirely. For the paper's verification story this
 is a clean choice: `index_add_` is a well-defined abstract collective
 event; in-kernel atomics would require weak-memory reasoning inside
 Triton.
+
+### 9. Materialization discipline — why V3 is Ex06-ready
+
+The V1 → V3 refactor path is worth codifying because it's the
+**exact structural progression** Ex06 will demand. In V3, the code
+has a clean three-block shape:
+
+```python
+# Block A: LOCAL prep (router + argsort + prep buffers)
+router_logits = self.gate(x_flat)
+top_k_weights, top_k_experts = torch.topk(...)
+...
+x_flat_permuted = x_flat[token_idx_rep_permuted_by_experts]      # [Nk, H]
+top_k_weights_flat_permuted = top_k_weights_flat[permutation]     # [Nk]
+expert_output = torch.zeros_like(x_flat_permuted)                 # [Nk, H]
+
+# Block B: LOCAL expert loop (compute-only, no weight math, no scatter)
+start = 0
+for expert_id in range(self.num_experts):
+    ...
+    expert_output[start:start+cnt] = self.experts[expert_id](x_flat_permuted[start:start+cnt])
+    start += cnt
+
+# Block C: LOCAL combine (one big multiply + one big scatter)
+expert_output *= top_k_weights_flat_permuted[:, None]
+y_flat.index_add_(0, token_idx_rep_permuted_by_experts, expert_output)
+```
+
+**Ex06 slots in with minimal surgery**: two `all_to_all_variable`
+collectives wrap Block B, and Block B's loop range narrows from
+`num_experts` to `experts_per_rank`. Nothing else changes.
+
+```python
+# Block A: same as V3.
+
+# NEW: DISPATCH (all_to_all_variable) — send my sorted_x to expert-owning ranks
+input_splits, output_splits = compute_splits(top_k_experts_ids, self.experts_per_rank)
+local_x = all_to_all_variable(x_flat_permuted, input_splits, output_splits)
+local_expert_output = torch.empty_like(local_x)
+
+# Block B, MODIFIED: local loop over only my experts (E/EP iterations)
+for local_e in range(self.experts_per_rank):
+    ...
+    local_expert_output[s:e] = self.experts[local_e](local_x[s:e])
+
+# NEW: COMBINE (all_to_all_variable) — reverse dispatch, results back to originating rank
+expert_output = all_to_all_variable(local_expert_output, output_splits, input_splits)
+
+# Block C: unchanged — multiply-by-weights and scatter on ORIGINATING side, no cross-rank comm.
+expert_output *= top_k_weights_flat_permuted[:, None]
+y_flat.index_add_(0, token_idx_rep_permuted_by_experts, expert_output)
+```
+
+**Six new lines, one line changed.** That's the payoff of the
+materialization discipline in V3.
+
+**The key semantic observation**: Block C stays on the originating
+rank because `sorted_token_ids` and `sorted_weights` never leave.
+The compute rank (which owns some experts) doesn't have those
+tensors — they're purely local to the token's originator. This
+mirrors the paper's abstract framing: an expert is a **pure function
+$R^H \to R^H$**; routing weights are a property of the (token, router)
+interaction, not (token, expert). Dispatch and combine carry only
+hidden states; weights and token IDs stay put. Slimmer collective
+payloads, cleaner Verus spec.
+
+**Why V1 doesn't extend to Ex06 cleanly**: without a materialized
+`[Nk, H]` buffer, there's nothing to `all_to_all_variable` — the
+collective wants one contiguous send buffer, not a stream of per-expert
+tiny tensors. V1 → V3 isn't a perf-only refactor; it's a **prerequisite
+for the very-next-exercise's collectives**.
 
 ### Reference material worth revisiting
 
