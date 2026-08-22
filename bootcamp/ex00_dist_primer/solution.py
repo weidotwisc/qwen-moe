@@ -199,8 +199,10 @@ def all_to_all_variable(
     #        input_split_sizes=input_split_sizes,
     #        group=group).
     # 4. Return output.
+    
     # weiz: input_split_sizes[j] is how many rows this rank is sending to rank[j]
     #       output_split_sizes[j] is how many rows this rank is recieving from rank[j]
+    # 2026-08-22, this method allocates returned memory buffer
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
     assert world_size == len(input_split_sizes) and world_size == len(output_split_sizes)

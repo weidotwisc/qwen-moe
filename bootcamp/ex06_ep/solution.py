@@ -44,8 +44,21 @@ import torch.nn.functional as F
 from torch import nn
 
 from bootcamp.ex00_dist_primer.solution import all_to_all_variable
-from bootcamp.ref.mlp import RefSwiGLU_MLP
+#from bootcamp.ref.mlp import RefSwiGLU_MLP
 
+class SwiGLU_MLP(nn.Module):
+    def __init__(
+        self,
+        hidden:int,
+        intermediate:int
+    ):
+        super().__init__()
+        self.gate_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False) # for MoE FFN, the bias is false
+        self.up_proj = nn.Linear(in_features=hidden, out_features=intermediate, bias=False)
+        self.down_proj = nn.Linear(in_features=intermediate, out_features=hidden, bias=False)
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 class EPSparseMoE(nn.Module):
     """Expert-parallel sparse MoE.
@@ -91,7 +104,28 @@ class EPSparseMoE(nn.Module):
         #        for _ in range(self.experts_per_rank)     # ← only OUR experts
         #    ])
         #    — SHARDED across ranks. Rank r only holds experts_per_rank MLPs.
-        raise NotImplementedError
+
+        # weiz step 1: assertion
+        assert (num_experts % ep_size == 0)
+        # weiz step 2: setters and getters
+        self.hidden = hidden
+        self.intermediate = intermediate 
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.group = group
+        self.norm_topk_prob = norm_topk_prob
+        # weiz step 3: compute per rank expers information
+        self.experts_per_rank = num_experts // ep_size
+        self.expert_start = ep_rank * self.experts_per_rank
+        self.expert_end = self.expert_start + self.experts_per_rank
+        # weiz step 4: replicate the gate
+        self.gate = nn.Linear(hidden, num_experts, bias=False) # remember the bias is False
+        # weiz step 5: build my share of experts
+        self.experts = nn.ModuleList(
+            [SwiGLU_MLP(hidden, intermediate) for _ in range(self.experts_per_rank)]
+        )
 
     def weight_loader(
         self,
@@ -117,7 +151,16 @@ class EPSparseMoE(nn.Module):
         #      copy expert_gate_weights[global_e] into self.experts[local_e].gate_proj.weight.data
         #      copy expert_up_weights[global_e]   into self.experts[local_e].up_proj.weight.data
         #      copy expert_down_weights[global_e] into self.experts[local_e].down_proj.weight.data
-        raise NotImplementedError
+        
+        # weiz step 1 copy gate
+        self.gate.weight.data.copy_(gate_weight)
+        # weiz step 2
+        for local_expert_id in range(self.experts_per_rank):
+            global_expert_id = local_expert_id + self.expert_start
+            self.experts[local_expert_id].gate_proj.weight.data.copy_(expert_gate_weights[global_expert_id])
+            self.experts[local_expert_id].up_proj.weight.data.copy_(expert_up_weights[global_expert_id])
+            self.experts[local_expert_id].down_proj.weight.data.copy_(expert_down_weights[global_expert_id])
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """EP forward.
@@ -127,8 +170,8 @@ class EPSparseMoE(nn.Module):
         Returns:
             [B, T, H] or [N, H], REPLICATED (reconstructed via all_gather).
         """
-        original_shape = x.shape
-        x_flat = x.reshape(-1, original_shape[-1])
+        original_shape = x.shape # B, T, H
+        x_flat = x.reshape(-1, original_shape[-1]) # N, H
         N = x_flat.shape[0]
         assert N % self.ep_size == 0, (
             f"N={N} must be divisible by ep_size={self.ep_size} for contiguous partition"
@@ -143,6 +186,10 @@ class EPSparseMoE(nn.Module):
         # - local_end   = local_start + local_N
         # - local_x     = x_flat[local_start:local_end]        # [local_N, H]
 
+        local_start = self.ep_rank * local_N
+        local_end = local_start + local_N
+        local_x = x_flat[local_start:local_end] # [local_N, H]
+
         # =====================================================================
         # Phase 1: local router (same math as Ex05b, applied to local_x only).
         # =====================================================================
@@ -154,6 +201,13 @@ class EPSparseMoE(nn.Module):
         #   else:
         #       top_k_weights = F.softmax(router_logits, dim=-1).gather(-1, top_k_experts)
         # - top_k_weights = top_k_weights.to(local_x.dtype)
+
+        router_logits = self.gate(local_x) # [local_N, num_experts]
+        top_k_weights, top_k_experts = torch.topk(router_logits, self.top_k, dim=-1) # [local_N, k]
+        if self.norm_topk_prob:
+            top_k_weights = F.softmax(top_k_weights, dim=-1)
+        else:
+            top_k_weights = F.softmax(router_logits, dim=-1).gather(dim=-1,index=top_k_experts)
 
         # =====================================================================
         # Phase 2: local argsort by GLOBAL expert_id (same vocabulary as Ex05b).
@@ -167,6 +221,15 @@ class EPSparseMoE(nn.Module):
         # - sorted_weights            = top_k_weights_flat[sort_perm]                # [local_N * k]
         # - local_x_permuted          = local_x[sorted_local_token_ids]              # [local_N * k, H]
 
+        top_k_experts_flat = top_k_experts.reshape(-1) # [local_N * k,]
+        top_k_weights_flat = top_k_weights.reshape(-1) # [local_N * k,]
+        sorted_expert_ids, sort_perm = torch.sort(top_k_experts_flat) # [local_N * k,]
+        local_token_ids_rep = torch.arange(local_N, device=x.device).repeat_interleave(dim=-1, repeats=self.top_k) #[local_N*k, ]
+        sorted_local_tokens_ids = local_token_ids_rep[sort_perm] # [local_N * k,]
+        sorted_weights = top_k_weights_flat[sort_perm] # [local_N * k]
+        local_x_permuted = local_x[sorted_local_tokens_ids] # [local_N *k, H]
+
+
         # =====================================================================
         # Phase 3: compute per-destination-rank splits.
         # For each record, dest_rank = expert_id // experts_per_rank.
@@ -175,6 +238,8 @@ class EPSparseMoE(nn.Module):
         # - dest_ranks        = sorted_expert_ids // self.experts_per_rank            # [local_N * k]
         # - input_split_sizes = torch.bincount(dest_ranks, minlength=self.ep_size)    # [ep_size], torch.long
         # - Rationale: input_split_sizes[j] = how many records I send to rank j.
+        dest_ranks = sorted_expert_ids // self.experts_per_rank # [local_N *k]
+        send_buf_sizes = torch.bincount(dest_ranks, minlength=self.ep_size) # [ep_size, ], weiz: 
 
         # =====================================================================
         # Phase 4: negotiate output_split_sizes via all_gather_into_tensor.

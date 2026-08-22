@@ -1,5 +1,27 @@
 # Exercise 6 — Expert Parallelism (EP) with all-to-all dispatch/combine
 
+> ⚠ **Note on the design pre-condition**
+>
+> This exercise sets up EP with **input replicated across the entire
+> EP group** — a pre-condition that is a **TP-scope property**, not
+> an EP-scope one. It happens to hold when `tp_size == ep_size ==
+> world_size` (nanovllm-jun / vLLM default topology), which is why
+> the pattern shows up in production. But under this specific
+> overlap, the dispatch collective is **redundant** — it moves data
+> that's already at the destination. A single `all_reduce` at the
+> end suffices; see [reference_lean.py](reference_lean.py) for the
+> optimized variant.
+>
+> **For a "pure EP" formulation where dispatch is structurally
+> necessary** (each rank owns a distinct 1/ep_size share of the
+> tokens, as under DP + EP training or multi-tenant serving), see
+> [../ex06_ep_pure/](../ex06_ep_pure/).
+>
+> Both exercises are kept because their comparison is exactly the
+> paper's contribution: identifying that nanovllm-jun's EP inherits
+> a training-scale dispatch pattern that becomes wasteful when its
+> input pre-condition is provided by TP rather than by data partitioning.
+
 **Goal**: distribute the MoE compute across `ep_size` GPUs by
 partitioning the E experts across ranks. Each rank owns `E / ep_size`
 experts and participates in two `all_to_all_variable` collectives

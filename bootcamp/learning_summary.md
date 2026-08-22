@@ -13,11 +13,13 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex04 | GQA + KV replication | ✅ done | 8/8 green | **Nanovllm-jun bug fixed** — TP-8 on Qwen3-30B-A3B unblocked |
 | Ex05a | MoE baseline (naive per-expert loop) | ✅ done | 2/2 green | Single-GPU. Consolidated `torch.where` / `index_add_` / broadcasting fluency |
 | Ex05b | MoE permuted (grouped compute) | ✅ done | 2/2 green | Introduces the argsort/bincount/offsets vocabulary the rest of the MoE stack rides on |
-| Ex06 | Expert Parallelism (all-to-all) | ⬜ pending | – | Design chat with Claude first |
-| Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — paper's main artifact |
+| Ex06_ep | Expert Parallelism (replicated-input, canonical dispatch) | ⏸ reference-only | ref 8/8 green; **not implemented** | Framing conflates TP-scope with EP-scope — pattern belongs in Ex07 |
+| Ex06_ep_lean | EP with single all_reduce (replicated-input) | ⏸ reference-only | ref 8/8 green; **not implemented** | Same TP-scope conflation as Ex06_ep — pattern belongs in Ex07 |
+| Ex06_ep_pure | Pure EP with DP-partitioned inputs | ✅ done | 8/8 green | Dispatch structurally necessary — EP's natural form |
+| Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — will re-do the replicated-input EP question in its proper context |
 | Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
 
-**Bugs-caught count so far**: 16 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 18 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -184,6 +186,77 @@ tractable:
 - **`torch.empty(x.shape[1:], ...)`** is safer than `torch.empty(*x.shape[1:],
   ...)` — the star-unpack silently breaks for 1-D input where
   `x.shape[1:]` is empty.
+
+### 7. Collectives-as-functions: the mental model behind torch's naming
+
+torch and MPI use different vocabularies for the same primitives, and
+the difference is not cosmetic — it reflects two different mental
+models:
+
+| Vocabulary | Mental model |
+|---|---|
+| **MPI: `sendbuf` / `recvbuf` / `sendcounts` / `recvcounts`** | Collective = coordinated message-passing between peers |
+| **torch: `input` / `output` / `input_split_sizes` / `output_split_sizes`** | Collective = pure function: `output = collective(input, ...)` |
+
+Under torch's framing, a collective is **a function/channel** — every
+rank calls it with its `input` tensor and receives its `output` tensor
+back. What happens **inside** the function (send/recv, ring/tree
+algorithms, RDMA path) is an implementation detail the caller doesn't
+see. The naming is **operation-local**: `input`/`output` refer to
+THIS call's flow, not to any pipeline of prior calls.
+
+This has three concrete consequences I keep tripping over:
+
+**(a) `input_split_sizes` and `output_split_sizes` are local to the
+current call.** When implementing `combine = reverse(dispatch)`, my
+instinct was to keep the same variable names for the same
+"originally-sent" data and pass them through. Wrong.
+
+For **dispatch**: `input=send_counts, output=recv_counts` — I'm
+sending `send_counts[j]` to rank j, receiving `recv_counts[i]` from
+rank i.
+
+For **combine** (reverse): I now send back what I received. So
+`input=recv_counts, output=send_counts`. **Swap the split lists.**
+The names `input`/`output` don't inherit meaning from the prior call —
+they always describe THIS call's send/receive counts.
+
+Mnemonic: **each collective is standalone**. The reader who lands on
+this line without seeing the previous call must be able to describe
+what happens from `input_split_sizes` and `output_split_sizes` alone.
+
+**(b) The function view enables autograd.** Because collectives look
+like `output = f(input)`, torch can differentiate through them.
+`all_reduce`'s backward is another `all_reduce` (identity on gradient);
+`all_gather`'s backward is `reduce_scatter`. If we'd named things
+`sendbuf`/`recvbuf` a la MPI, this would feel like a category error
+("we're differentiating a message-passing op??"). Under the function
+view it's just the chain rule for one more op.
+
+**(c) The output is caller-allocated but conceptually the function's
+result.** `dist.all_to_all_single(output, input, ...)` looks like it
+takes two tensors, but semantically the `output` is a return value
+(pre-allocated because torch's newer collective API demands it — no
+implicit allocation). Think of it like `out=` in `torch.matmul(a, b,
+out=y)` — the caller allocates the destination but conceptually the
+op's producing it.
+
+### The naming translation table
+
+| MPI vocabulary | torch vocabulary | What it is |
+|---|---|---|
+| `sendbuf` | `input` tensor | The tensor this call sends out |
+| `recvbuf` | `output` tensor | The tensor this call receives into |
+| `sendcounts` | `input_split_sizes` | How many rows to each destination |
+| `recvcounts` | `output_split_sizes` | How many rows from each source |
+| `sendtype` / `recvtype` | (inferred from tensor.dtype) | — |
+| `comm` | `group` | Which process group |
+
+**Both are internally consistent under their own mental models.** MPI's
+is mechanism-forward (bytes moving between peers); torch's is
+interface-forward (function producing a result). For reading torch
+code, commit fully to the function view — don't translate through
+MPI's send/recv paradigm en route.
 
 ### Reference material worth revisiting
 
@@ -1527,4 +1600,211 @@ within a term; EP shards across terms; the sum is preserved.
 
 ---
 
-<!-- Add Ex06 summary below when done. -->
+## Ex06 — Expert Parallelism (only pure variant implemented)
+
+**Status: `ex06_ep_pure/` implemented and green. `ex06_ep/`
+(canonical and lean) kept as reference-only records of a design
+misstep — never implemented by me.** This exercise taught more than
+the original plan intended: I designed a variant, questioned the
+framing, discovered the design conflated TP-scope with EP-scope
+properties, rebuilt in `ex06_ep_pure/` under the correct framing,
+and left the mis-framed `ex06_ep/` as a documented record. The
+"replicated-input EP" pattern that motivated `ex06_ep/` isn't a
+natural pure-EP shape — it's what a TP layer produces upstream —
+and it belongs in Ex07's TP+EP hybrid, not here.
+
+The three files that exist under `ex06_ep/`:
+
+| Variant | Directory | Input pre-condition | Collectives per forward | Status |
+|---|---|---|---|---|
+| Canonical | `ex06_ep/reference.py` | Replicated across ep_group | 5 (splits + 2 dispatch + combine + all_gather) | Reference only — no solution written |
+| Lean | `ex06_ep/reference_lean.py` | Replicated across ep_group | 1 (all_reduce) | Reference only — no solution written |
+| **Pure** | **`ex06_ep_pure/`** | **Distinct per rank (DP-style)** | **4 (splits + 2 dispatch + combine)** | **Implemented, 8/8 green** |
+
+**Why `ex06_ep/` is reference-only**: its framing ("input replicated
+across ep_group") is unnatural for a pure EP exercise — it imports a
+TP-scope property (attention's row-parallel AR produces replicated
+hidden states) and disguises it as an EP-scope invariant. When the
+replicated-input question surfaces in `ex06_ep/`, the exercise
+becomes "why doesn't lean-style all_reduce just replace dispatch?"
+which is a valid question but a **TP+EP composition** question, not
+a pure-EP algorithm question. Ex07 will re-encounter the same
+question in its proper context — where TP is actually providing the
+replication and the design trade-off is meaningful.
+
+The `ex06_ep/` code and benchmarks are preserved as a record of the
+"nanovllm-jun-inherited redundant-dispatch pattern" for the paper's
+port-back discussion, but pedagogically **the pure-EP variant in
+`ex06_ep_pure/` is what teaches the EP algorithm.**
+
+### 1. The three input regimes and what they demand
+
+The exercise revealed a design conflation between **TP-scope** and
+**EP-scope** properties that I hadn't seen before:
+
+| Setup | Input across ep_group | Dispatch necessary? | Lean shortcut? |
+|---|---|---|---|
+| **Pure EP** (DP-partitioned, `ex06_ep_pure/`) | Distinct per rank | **Yes** | No — non-owners have no data |
+| **TP == EP == world** (`ex06_ep/`, nanovllm-jun's actual topology) | Replicated (from attn AR) | **No — redundant** | Yes — `all_reduce` alone suffices |
+| DP × TP × EP hybrid (Ex07 territory) | Replicated within TP subgroups | Partially — only for cross-DP-replica traffic | Only within TP scope |
+
+**Input replication is a TP-scope property.** It arises when attention's
+row-parallel all-reduce covers the same rank set as EP. Under that
+overlap, the dispatch/combine pipeline moves data that's already at the
+destination — redundant work inherited from training-scale MoE
+patterns where inputs ARE partitioned by DP and dispatch is
+load-bearing.
+
+**Pure EP** without TP subsumption (each rank has distinct data) is
+where dispatch actually earns its keep. `ex06_ep_pure/` teaches the
+algorithm in this natural form; the delta from `ex06_ep/` is just
+"remove the redundant input-slice and final all_gather wrapper."
+
+### 2. The dispatch/combine algorithm (canonical form)
+
+The core algorithm shared by all three variants (with different
+wrappers):
+
+```
+Phase 1: local router on local tokens                    → [local_N, top_k]
+Phase 2: argsort by expert_id, gather permuted x         → sorted_x [local_N·k, H]
+Phase 3: per-destination-rank splits via bincount        → input_split_sizes [ep_size]
+Phase 4: all_to_all_single on splits                     → output_split_sizes [ep_size]
+Phase 5: DISPATCH via all_to_all_variable × 2            → received_x, received_expert_ids
+Phase 6: local re-argsort by local expert_id             → contiguous per-expert slices
+Phase 7: local expert compute (loop over local experts)  → local_expert_out
+Phase 8: reverse the local sort                          → unsorted_received_out
+Phase 9: COMBINE via all_to_all_variable (SWAP splits!)  → returned_out
+Phase 10: weight multiply + local scatter_add            → local_y_flat
+Phase 11: [canonical only] all_gather to full replicated → y_flat [N, H]
+```
+
+The lean variant replaces phases 3-11 with a single `all_reduce` on a
+partial output tensor. Pure variant keeps phases 1-10 and skips
+phase 11 (no reason to reassemble globally when each rank owns its
+own share).
+
+### 3. The paper's insight: dispatch is a training-code inheritance
+
+Under `tp_size == ep_size == world_size` (vLLM / nanovllm-jun default
+for Qwen3-30B-A3B), the dispatch collective moves tokens across the
+network to ranks that ALREADY HAVE those tokens (from the TP-replicated
+attention output). Each rank could instead **filter its own copy** to
+just the tokens routing to its local experts and skip dispatch
+entirely.
+
+**Bandwidth accounting** (per rank per forward, Qwen3 config ep=8, top_k=8):
+
+| Approach | Non-body wire traffic | Total collectives |
+|---|---|---|
+| nanovllm-jun (striped dispatch + all_reduce) | ~3.75·N·H | 6 |
+| Canonical (`ex06_ep/reference.py`) | ~4·N·H | 5 |
+| **Lean (`ex06_ep/reference_lean.py`)** | **~1.75·N·H** | **1** |
+
+The lean variant is ~2× less bandwidth AND ~5× fewer collective
+launches than what nanovllm-jun ships.
+
+**Empirical measurements** on 8×A100 (single node, NVLink):
+
+| Regime | Speedup (dispatch → lean) |
+|---|---|
+| ep=8, uniform routing, N=512-16K | 1.09-1.26× |
+| ep=8, adversarial skew (all top-k on rank 0), N ≤ 4K | 1.10-1.25× |
+| ep=8, adversarial skew, N ≥ 8K | 0.95-0.97× (dispatch wins slightly — data-aware) |
+| **ep=16 cross-node RoCE**, uniform | **1.64-3.50×** |
+| **ep=16 cross-node RoCE**, adversarial skew | **2.18-4.07×** |
+
+**Cross-node is where lean dominates** — collective count savings
+(1 vs 4-6) matter far more when each collective has ~ms-scale startup
+on cross-node fabric. Measured cross-node bandwidth on our RoCE
+25 GbE cluster: 2.7 GB/s asymptotic; typical production IB HDR is
+~10× faster, which would narrow but not eliminate the lean advantage.
+
+**Why nobody has published this**: MoE inference stacks (vLLM, SGLang,
+nanovllm-jun) inherit dispatch from training-scale MoE (Shazeer 2017,
+GShard, Megatron-DeepSpeed) where `ep_size ≫ top_k` and inputs ARE
+DP-partitioned. Nobody re-examined the schedule for the specific
+inference regime `tp_size == ep_size == world_size` where dispatch
+becomes redundant. Historical inertia + code-uniformity between
+training and inference + fine-grained-EP trends (ep ≥ 32) explain the
+gap. The paper's contribution is naming this and quantifying the
+delta.
+
+### 4. Traps I hit in Ex06_ep_pure (2 bugs, both typos)
+
+- **`local_weights = top_k_experts_flat[sorted_experts_perm]`** — copy-paste
+  typo. Should be `top_k_weights_flat[sorted_experts_perm]`. The
+  variable is intended to hold sorted routing weights (fractional 0-1)
+  but was filled with sorted expert IDs (integers 0..num_experts-1).
+  Phase 10's `Y *= local_weights[:, None]` then multiplied expert
+  outputs by expert IDs, wrecking the output. Sneaky because the
+  shape is correct — `[Nk]` either way. Only assert_close catches it.
+- **Combine splits backwards**: called
+  `all_to_all_variable(Y_t, input_split_sizes=send_cnts_lst, output_split_sizes=recv_cnts_lst)`
+  when combine's send counts should be `recv_cnts_lst` and receive
+  counts should be `send_cnts_lst`. My mental model was right ("reverse
+  the dispatch") but I got trapped by naming — I read
+  `input_split_sizes` as "the previous call's input" instead of "THIS
+  call's send counts." Fixed by swapping the two args.
+
+Both bugs are pure typos in that the algorithm was correct;
+what tripped me up was **operation-local naming vs global-pipeline
+naming** — torch's collective API uses the former, and my mental
+carry-forward from dispatch used the latter.
+
+**Rule I'm codifying**: every collective is self-contained. When
+implementing "reverse-of-X," compute this call's send/recv counts
+from scratch (from this call's perspective) — don't reuse variable
+names from the forward direction.
+
+### 5. Naming translation trap — recorded in Ex00 §7
+
+The bug 2 confusion is documented in [../learning_summary.md#7-collectives-as-functions](learning_summary.md#7-collectives-as-functions)
+under Ex00 — the "collectives-as-functions vs collectives-as-message-passing"
+distinction. Reading torch's `input_split_sizes` / `output_split_sizes`
+as "MPI's sendcounts/recvcounts for THIS call" (not "the pipeline's
+original counts") avoids this trap in future exercises.
+
+### 6. Verification framing
+
+Ex06's four property classes for the paper's Verus/Dafny spec:
+
+- **Deadlock freedom**: fixed collective schedule per variant. Every
+  rank issues the same sequence (splits negotiation → dispatch × 2 →
+  compute → combine → [all_gather or nothing]) regardless of routing
+  distribution. Standard fixed-schedule proof.
+- **Data-race freedom**: `index_add_` on CUDA uses atomics
+  (non-deterministic reduction order), abstracted as an atomic
+  commutative sum event. `all_reduce`'s reduction order is similarly
+  abstracted.
+- **Functional correctness**: pure EP output matches single-GPU
+  `RefSparseMoE` up to fp reduction-order noise (~1e-4 fp32, ~5e-2
+  bf16). The abstract spec is the same Strang-4 sum
+  `Y = Σ_e R_{:,e} ⊙ f_e(X)`; each variant refines it via a different
+  collective schedule.
+- **Load-balance / progress**: under maximum routing skew (all top_k
+  experts on one rank), the fixed schedule doesn't deadlock; empty
+  local experts get `continue` (progress-preserving). All_reduce is
+  data-independent (identical bytes regardless of skew); dispatch is
+  data-aware (concentrates traffic where data is). Both are correct
+  under any skew; wall-clock differs.
+
+### 7. Empirical benchmarks worth citing in the paper
+
+Ran on `bootcamp/ex06_ep/microbenchmark.py`:
+
+- 8×A100 single node (NVLink): 1.09-1.26× lean speedup uniform, mixed under skew.
+- 16×A100 across 2 nodes (RoCE 25 GbE): **1.64-4.07×** lean speedup, monotone in N and independent of routing.
+- Measured cross-node bandwidth: 2.7 GB/s asymptotic (matches 25 Gbps Ethernet).
+
+Configs tested: `H=2048 I=768 E=128 top_k=8` (Qwen3-30B-A3B),
+`N ∈ [512, 16384]`, `dtype=bf16`, uniform and adversarial-skew routing.
+
+### Reference material worth revisiting
+
+- [nanovllm-jun `Qwen3SparseMoeBlock._forward_expert_parallel`](../nanovllm-jun/nanovllm/models/qwen3.py#L308) — the reference for what "canonical" EP inference looks like in production. Note the 3 all_to_all + 1 all_reduce structure; this is what our `reference.py` and `reference_lean.py` compare against.
+- vLLM's [`FusedMoE`](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/fused_moe) — production EP for large-scale serving; uses fused Triton kernels around the dispatch/combine layout.
+- Gale et al. 2022 [Megablocks](https://arxiv.org/abs/2211.15841) — alternative sparse-GEMM approach; sidesteps dispatch entirely via block-diagonal kernels.
+- Rajbhandari et al. 2022 [DeepSpeed-MoE](https://arxiv.org/abs/2201.05596) — the reference training-scale EP paper that established the dispatch/combine pattern nanovllm-jun inherits.
+
+<!-- Add Ex07 summary below when done. -->
