@@ -16,10 +16,10 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex06_ep | Expert Parallelism (replicated-input, canonical dispatch) | ⏸ reference-only | ref 8/8 green; **not implemented** | Framing conflates TP-scope with EP-scope — pattern belongs in Ex07 |
 | Ex06_ep_lean | EP with single all_reduce (replicated-input) | ⏸ reference-only | ref 8/8 green; **not implemented** | Same TP-scope conflation as Ex06_ep — pattern belongs in Ex07 |
 | Ex06_ep_pure | Pure EP with DP-partitioned inputs | ✅ done | 8/8 green | Dispatch structurally necessary — EP's natural form |
-| Ex07 | TP + EP hybrid | ⬜ pending | – | Composition theorem — will re-do the replicated-input EP question in its proper context |
-| Ex08 | Fused MoE Triton kernel | ⬜ pending | – | Port Ex05b to Triton |
+| Ex07 | TP + EP hybrid | ✅ done | 2/2 green (fp32 + bf16) | Case-3 canonical schedule — TP stripe + EP dispatch + TP all_gather |
+| Ex08 | Weiz hybrid schedule (intra-lean + inter-dispatch) | ⏸ tabled | ref 2/2 + fused 2/2 green; benchmarks done | Correct but roughly tied w/ Ex07 under contiguous-TP topology — [[project_ex08_topology_finding]] |
 
-**Bugs-caught count so far**: 18 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 26 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure + Ex07 — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -1807,4 +1807,294 @@ Configs tested: `H=2048 I=768 E=128 top_k=8` (Qwen3-30B-A3B),
 - Gale et al. 2022 [Megablocks](https://arxiv.org/abs/2211.15841) — alternative sparse-GEMM approach; sidesteps dispatch entirely via block-diagonal kernels.
 - Rajbhandari et al. 2022 [DeepSpeed-MoE](https://arxiv.org/abs/2201.05596) — the reference training-scale EP paper that established the dispatch/combine pattern nanovllm-jun inherits.
 
-<!-- Add Ex07 summary below when done. -->
+## Ex07 — TP + EP hybrid (case-3 canonical schedule)
+
+**Setup**: 8 GPUs, TP-4 × DP-2 × EP-8. Two TP groups {0,1,2,3} and {4,5,6,7};
+one EP group over all 8 ranks. Each TP group processes a distinct half of
+the batch (DP-2 outer); MoE dispatch crosses TP-group boundaries.
+
+Rank 0's per-block collective sequence, all in fixed order:
+
+  attn AR (tp_group_a)
+  → moe splits negotiation (ep_group)
+  → moe dispatch × 2 (ep_group)             — x records + expert_id records
+  → moe combine (ep_group)                   — reverse dispatch
+  → moe all_gather (tp_group_a)              — un-stripe within TP
+
+Every rank issues this exact same sequence with its own tp_group handle.
+The paper's composition theorem argument for this schedule: cross-cutting
+sub-groups (rank participates in both `tp_group` AND `ep_group`) do not
+deadlock under fixed-schedule + explicit-group discipline.
+
+### 1. The 11-phase pipeline
+
+The MoE forward under case-3 has strictly more machinery than Ex06_ep_pure
+because it must reconcile two parallelism dimensions:
+
+| Phase | Op | Scope |
+|---|---|---|
+| 0 | Stripe within TP: `local_x = x_flat[tp_rank * local_N : (tp_rank+1) * local_N]` | local |
+| 1 | Local router on `local_x` (gate + topk + softmax) | local |
+| 2 | Sort by global expert id | local |
+| 3 | Per-EP-dest-rank splits: `bincount(sorted_ids // experts_per_rank)` | local |
+| 4 | Negotiate output splits | **all_to_all_single (ep_group)** |
+| 5 | Dispatch `sorted_x` + `sorted_expert_ids` | **all_to_all_variable × 2 (ep_group)** |
+| 6 | Subtract `expert_start` + local re-sort by local expert id | local |
+| 7 | Loop over `experts_per_rank` — compute | local |
+| 8 | Un-sort into received-order buffer | local |
+| 9 | Combine (reverse dispatch with swapped splits) | **all_to_all_variable (ep_group)** |
+| 10 | Un-sort into original order + weight-multiply + `index_add_` into `[local_N, H]` | local |
+| 11 | Un-stripe: `all_gather local_y_flat → y_flat` | **all_gather_into_tensor (tp_group)** |
+
+**The critical scoping distinction from Ex06's variants**:
+- Phases 4, 5, 9 use `ep_group` (world-spanning).
+- Phase 11 uses `tp_group` (within-TP).
+- `ex06_ep/reference.py` had all collectives on `ep_group` — that mis-scoped
+  the gather, which structurally should be TP-local.
+
+### 2. Block-level invariant
+
+  { input replicated within tp_group }
+    → HybridBlock forward
+  { output replicated within tp_group }
+
+Two RMSNorms live between the sub-layers (pre-norm):
+
+  h = x + attn(rmsnorm(x))
+  y = h + moe(rmsnorm(h))
+
+RMSNorm's weight is replicated across TP (data-unaware, per-hidden-dim gain).
+Zero TP proof obligation — the primitive is trivially replicated. This is
+worth naming explicitly in the paper: some primitives get dispatched in one
+line of the correctness argument; others (Linear TP, MoE dispatch/combine)
+carry the actual proof budget.
+
+### 3. Design decisions worth citing
+
+**Why `tp_size × dp_size == ep_size == world_size` (not `× ep_size`)**:
+under our design where EP spans all ranks, `ep_size` isn't an independent
+factor — it IS `world_size`. So the constraint is a 2-way factorization
+`tp × dp = world`. Three canonical instances:
+
+| Case | tp | dp | ep | Best schedule |
+|---|---|---|---|---|
+| 1 | 8 | 1 | 8 | Ex06 lean (all_reduce) |
+| 2 | 1 | 8 | 8 | Ex06_ep_pure (pure EP dispatch) |
+| 3 | 4 | 2 | 8 | Ex07 canonical (stripe + dispatch + all_gather) |
+
+Ex07's code handles all three cases correctly. Cases 1 and 2 are handled
+sub-optimally by Ex07's schedule (case 1 wastes bytes with dispatch instead
+of all_reduce; case 2 wastes work with striping when tp=1), but the output
+is correct. Formally: only the case-3 schedule needs an independent
+correctness proof; cases 1 and 2 follow as degenerate instances.
+
+**Why generic parameterization matters for the paper**: Ex07's constructor
+takes `tp_size, tp_rank, tp_group, ep_size, ep_rank, ep_group` as generic
+args and only asserts `num_experts % ep_size == 0` and `N_tp % tp_size == 0`.
+The theorem is quantified over all `(tp, dp, ep)` satisfying the
+2-way factorization — not just the specific (4, 2, 8) instance.
+
+**"N independent replicas" scale-out**: everything above `world = tp × dp`
+is orchestration, not distributed compute. Load-balance requests across
+N (tp × dp)-sized replicas. Formal-verification-wise, the theorem verifies
+ONE unit; N replicas is trivial composition.
+
+### 4. Design cross-references
+
+- **`TPGQA` reused unchanged** for attention. No weight_loader on TPGQA
+  itself — it's a container module. `qkv_proj` and `o_proj` have their own
+  weight_loaders. In real Qwen3, `q_norm` and `k_norm` (per-head RMSNorm)
+  live at the attention level and WOULD need a facade weight_loader, but
+  the bootcamp version skips them.
+- **Gate is replicated within TP group.** Every TP peer runs identical
+  routing on identical input (input is replicated within TP). No divergence,
+  no split.
+- **`self.experts`** is `nn.ModuleList` of `experts_per_rank` MLPs — sharded
+  across EP.
+
+### 5. Traps I hit (8 bugs in one review pass)
+
+Wrote the whole HybridMoE.forward in one go, then reviewed against ref.
+Every bug came out at the review, no runtime debugging needed:
+
+**#1 — expert allocation size** (line 120 in first draft):
+```python
+self.experts = nn.ModuleList(RefSwiGLU_MLP(...) for _ in range(self.num_experts))
+```
+Should be `range(self.experts_per_rank)`. Test-scale invisible (weight_loader
+fills only the correct low indices, compute never touches the rest), but at
+Qwen3-30B-A3B this is an 8× memory blowup (1.2 GB extra per rank).
+
+**Fix**: `range(self.experts_per_rank)`.
+
+**#2 — token-of-record index formula, sort perm confusion**:
+```python
+top_k_expert_ids_perm_normalized = top_k_expert_ids_flat // self.top_k  # ← wrong tensor
+x_repeated_k = x_flat[top_k_expert_ids_perm_normalized]                 # ← wrong base
+```
+Divided the *expert ids* by top_k (meaningless — those values are in
+`[0, num_experts/top_k)`) instead of dividing the *sort perm* by top_k.
+Then indexed `x_flat` (full striped input) instead of `local_x` (this
+rank's stripe), so `tp_rank ≠ 0` grabbed rank 0's tokens.
+
+**Fix**: `sorted_token_ids = perm // top_k; sorted_x = local_x[sorted_token_ids]`.
+
+**Insight worth keeping**: `perm[i] // top_k` gives exactly the token id
+for the record at sorted position `i`. Because in the unsorted flat layout,
+positions `[j*top_k, (j+1)*top_k)` all belong to token `j`.
+
+**#3 — dest-rank formula divisor**:
+```python
+dest_ranks = sorted_expert_ids // self.ep_size    # wrong
+```
+Should be `// self.experts_per_rank`. For num_experts=128, ep_size=8,
+experts_per_rank=16: expert 15 lives on rank 0 (`15 // 16 = 0`), but
+`// 8` gave `15 // 8 = 1` — routes expert 15 to rank 1. At test scale
+(num_experts=8, ep_size=8, experts_per_rank=1), all `expert_id // 8 = 0`,
+so EVERY record went to rank 0. Rank 0 flooded, ranks 1-7 idle.
+
+**Fix**: `sorted_expert_ids // self.experts_per_rank`.
+
+**#4 — bincount over global expert ids**:
+```python
+cnts = torch.bincount(expert_ids_local_T_sorted, minlength=self.experts_per_rank)
+for idx, cnt in enumerate(cnts.tolist()):
+    self.experts[idx](...)
+```
+Received expert ids are **global** (e.g., in `[48, 64)` for rank 3), but
+`self.experts` is indexed by **local** slot in `[0, experts_per_rank)`.
+`torch.bincount` returns a tensor of size `max(minlength, max_value+1)`,
+so bincount over globals produces a size-`(max_global_id+1)` output; the
+enumerate index equals the bin position (= global id), not a local slot.
+Result: `self.experts[3]` on rank 3 is either a random-init expert (bug 1
+present) or IndexError (bug 1 fixed).
+
+**Root cause of misconception**: I assumed `torch.bincount` was
+offset-based (counted relative to `min_value`). It's not — it counts
+non-negative integers starting from 0. If you want offset counting, either
+subtract the offset first (idiomatic) or use `torch.unique(..., return_counts=True)`.
+
+**Fix**: `expert_ids_local_T -= self.expert_start` before the sort, so
+values become local `[0, experts_per_rank)`.
+
+**#5 — tuple unpacking on `.tolist()`**:
+```python
+for idx, cnt in (expert_ids_local_T_sorted_cnts.tolist()):
+```
+`.tolist()` on a 1D int tensor gives `[c0, c1, ...]`; iterating gives
+`int`, not `(idx, cnt)` tuples. Raises `TypeError: cannot unpack non-iterable int`.
+
+**Fix**: `for idx, cnt in enumerate(cnts.tolist()):`.
+
+**#6 — un-sort direction**:
+```python
+y_repeated_k = y_repeated_k[top_k_expert_ids_perm]   # wrong direction
+```
+If `sorted, perm = torch.sort(orig)`, then `sorted[i] == orig[perm[i]]`.
+Applying `y_sorted[perm]` again gives `orig[perm[perm[i]]]` — NOT recovery.
+
+**Correct un-sort** (scatter, not gather):
+```python
+y_unsorted = torch.empty_like(y_sorted)
+y_unsorted[perm] = y_sorted        # y_unsorted[perm[i]] = y_sorted[i]
+```
+
+This is the same pattern used correctly at Phase 8 (un-sort of received
+records after local expert compute). Missed applying it symmetrically at
+Phase 10 (un-sort of combined output before weight-multiply).
+
+**Fix**: two buffers — `y_repeated_k_sorted` (post-combine, sorted) and
+`y_repeated_k` (unsorted) — with `y_repeated_k[perm] = y_repeated_k_sorted`.
+
+**#7 — CPU tensor into CUDA index**:
+```python
+local_y.index_add_(0, torch.arange(local_N).repeat_interleave(self.top_k), y_repeated_k)
+```
+`torch.arange(local_N)` without `device=` creates a CPU tensor; using it
+as an index into a CUDA tensor errors.
+
+**Fix**: `torch.arange(local_N, device=x.device)`.
+
+**#8 — `norm_topk_prob=False` fancy indexing** (latent, test uses `True`):
+```python
+weights_top_k = F.softmax(router_logits)[top_k_expert_ids]
+```
+Indexing softmax output (shape `[local_N, num_experts]`) with `top_k_expert_ids`
+(shape `[local_N, top_k]`) fancy-indexes on dim 0 → shape `[local_N, top_k, num_experts]`. Wrong.
+
+**Fix**: `.gather(dim=-1, index=top_k_expert_ids)` — picks the k values at
+positions specified by `top_k_expert_ids` along the last dim.
+
+### 6. Meta-observations from the review pass
+
+- **Index arithmetic bugs cluster**. #2, #3, #4, #6 are all "wrong divisor
+  or wrong direction on a permutation." When implementing MoE from scratch,
+  writing down each perm/id/dispatch/local mapping with concrete example
+  numbers (like the `local_N=3, top_k=2, num_experts=4` trace I did later)
+  catches these faster than staring at variable names.
+- **Enumerate vs unique**. `torch.bincount` output positions are values,
+  not sequential rank. If your bincount input is in a different index
+  space than what you'll use to consume the output, you WILL trip. Subtract
+  offsets first.
+- **Naming discipline pays**. `top_k_expert_ids_perm_normalized` was a bad
+  name — I picked "normalized" to signal my *intent* (a permutation index
+  divided into token indices) but the actual value was `expert_ids // top_k`
+  (no permutation involved). Better name: `sorted_token_ids` — describes
+  what the values ARE, not what I wanted them to be.
+- **Latent bugs are still bugs**. Bug #8's `norm_topk_prob=False` branch
+  is never taken by the tests, but it's still broken code. Fix latent
+  branches during review; running tests will not surface them.
+
+### 7. Empirical benchmark (see [[project_ex08_topology_finding]])
+
+Ex07 canonical vs Ex08 weiz-schedule benchmarks run on 8 GPUs (NVLink) and
+16 GPUs (2 nodes across RoCE 25 GbE). Ex08 fused ends up roughly tied with
+Ex07 canonical under **contiguous TP within nodes** (the natural
+Qwen3-30B-A3B deployment), because the "avoid redundant intra-TP dispatch"
+saving is intra-node bytes only. Ex08 would win under **straddled TP**
+(TP > single-node GPU count), where intra-TP would otherwise ride
+cross-node. Tabled the empirical validation of that regime.
+
+### 8. Verification framing
+
+The composition theorem for Ex07 canonical:
+
+**Theorem (informal)**: For any `(tp_size, dp_size)` with `tp_size × dp_size == world_size`,
+any well-formed partition of world into disjoint tp_groups (of size tp_size)
+and disjoint dp_groups (of size dp_size), and `num_experts % ep_size == 0`
+with `ep_size == world_size`, the HybridBlock forward pass produces output
+equivalent to the single-GPU RefBlock forward (up to floating-point
+associativity on the top-k combine sum), on input replicated within tp_group.
+
+Broken into per-primitive lemmas:
+
+1. **RMSNorm TP-invariance** (trivial): weight replicated → output replicated.
+2. **TPGQA correctness** (Ex04 lemma): TP-sharded QKV + SDPA + RowParallel O
+   preserves single-GPU semantics.
+3. **HybridMoE correctness**: for each token `t` in `local_x`, and each
+   of its top-k experts `e ∈ E_t`, the correctly-weighted output
+   `experts[e](x_t) * w_{t,e}` is accumulated exactly once into `y_flat[t]`.
+   Proof structure: track a single token+expert record through phases 0-11,
+   show the record survives dispatch/combine + un-sort + all_gather to land
+   at position `t` in `y_flat` on every TP peer.
+4. **Residual composition**: `x + f(norm(x))` and `h + g(norm(h))` are
+   TP-invariant when `f` and `g` are (from 1-3).
+
+Proof-obligation cost: RMSNorm ~0 lines; TPGQA ~O(1) discharge from Ex04;
+HybridMoE ~the meat (the phase-tracking argument); residual composition
+~O(1). The formal verification track (Verus/Dafny/Z3) targets the HybridMoE
+argument as its main proof obligation.
+
+### Reference material worth revisiting
+
+- [`bootcamp/ex07_tp_ep_hybrid/reference.py`](ex07_tp_ep_hybrid/reference.py)
+  — the working canonical schedule; use as fresh-eyes read after solving.
+- [`nanovllm-jun/nanovllm/models/qwen3.py::Qwen3SparseMoeBlock._forward_expert_parallel`](../nanovllm-jun/nanovllm/models/qwen3.py#L308)
+  — production reference. Note the intern's version has TP and EP as
+  mutually exclusive (`assert tp == 1 or ep == 1`); Ex07 is the composition
+  they don't currently support.
+- vLLM's [`FusedMoE`](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/fused_moe)
+  — composes with vLLM's `ColumnParallelLinear` / `RowParallelLinear` on
+  the attention side, giving exactly this TP+EP hybrid pattern in
+  production.
+
