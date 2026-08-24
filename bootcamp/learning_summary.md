@@ -18,6 +18,7 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex06_ep_pure | Pure EP with DP-partitioned inputs | ✅ done | 8/8 green | Dispatch structurally necessary — EP's natural form |
 | Ex07 | TP + EP hybrid | ✅ done | 2/2 green (fp32 + bf16) | Case-3 canonical schedule — TP stripe + EP dispatch + TP all_gather |
 | Ex08 | Weiz hybrid schedule (intra-lean + inter-dispatch) | ⏸ tabled | ref 2/2 + fused 2/2 green; benchmarks done | Correct but roughly tied w/ Ex07 under contiguous-TP topology — [[project_ex08_topology_finding]] |
+| Ex09 | Fused MoE Triton kernel (grouped GEMM) | ⬜ pending | – | Ports Ex05b permuted MoE to Triton. Interview + paper artifact. |
 
 **Bugs-caught count so far**: 26 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure + Ex07 — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
@@ -1119,7 +1120,7 @@ does the per-child `_modules[i] = child` bookkeeping. Same trick
 layout. Tokens get **permuted into per-expert contiguous blocks** so
 each expert's compute is a contiguous-slice matmul instead of a
 fancy-index gather. Introduces the argsort/bincount/offsets vocabulary
-that every downstream MoE step (Ex06 EP, Ex08 fused kernel) rides on.
+that every downstream MoE step (Ex06 EP, Ex09 fused kernel) rides on.
 
 ### 1. The permutation vocabulary — 7 steps
 
@@ -1137,7 +1138,7 @@ Given routing output `top_k_experts: [N, top_k]` and `top_k_weights: [N, top_k]`
 
 Steps 3–5 are the "permutation dance." Steps 6–7 are the compute +
 combine. Ex06 will insert `all_to_all_variable` between steps 5 and 6
-(dispatch) and again between steps 6 and 7 (combine). Ex08 will
+(dispatch) and again between steps 6 and 7 (combine). Ex09 will
 replace step 6 with a single Triton kernel launch.
 
 ### 2. Naive vs argsort — same math, three implementation forms
@@ -1176,7 +1177,7 @@ count; it's **memory-access pattern + Ex06 readiness**:
 | Expert forward reads via | fancy-index gather (strided HBM) | contiguous slice view | contiguous slice view |
 | Materialized `[Nk, H]` input buffer | No | Yes (`x_flat_permuted`) | Yes + `expert_output` |
 | `all_to_all_variable` (Ex06) input | Needs added gather | Ready | Ready |
-| Ex08 fused-kernel input format | Needs restructuring | Compatible | Compatible |
+| Ex09 fused-kernel input format | Needs restructuring | Compatible | Compatible |
 | Loop body reads/writes | scattered | contiguous read, per-iter scatter | contiguous read, contiguous write |
 
 **Argsort + full-lift-out is preparation, not necessity.** Ex05b's job
@@ -1311,9 +1312,9 @@ The interesting NEW spec content in Ex05b, compared to Ex05a:
   bookkeeping** the paper will need to state precisely (tolerance is
   ~1e-2 in bf16 for 128-expert × top_k=8).
 
-### 8. Looking ahead — no atomics for Ex08 fused kernel
+### 8. Looking ahead — no atomics for Ex09 fused kernel
 
-The Triton kernel in Ex08 (grouped MoE GEMM) is **atomics-free** —
+The Triton kernel in Ex09 (grouped MoE GEMM) is **atomics-free** —
 structurally identical to FA2 forward. Each expert's block
 `[offsets[e]:offsets[e+1]]` is a disjoint tile of the output; no two
 kernel blocks write to the same output row. All reduction
@@ -1579,8 +1580,8 @@ $$
 
 Where $\oplus$ is the abstract "sum" collective (commutative,
 associative up to fp reduction-order tolerance). Every physical
-realization — Ex05a naive, Ex05b permuted, Ex06 EP, Ex07 TP+EP,
-Ex08 fused kernel — refines this spec by choosing:
+realization — Ex05a naive, Ex05b permuted, Ex06 EP, Ex07 TP+EP, Ex08 weiz-schedule,
+Ex09 fused kernel — refines this spec by choosing:
 
 1. **The order of the sum** (per-expert iteration order).
 2. **The physical layout** ($[N, H]$ vs $[Nk, H]$ intermediate).
