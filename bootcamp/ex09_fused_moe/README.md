@@ -251,23 +251,25 @@ After Scope S:
 
 ## Reference implementations available
 
-Two references sit alongside `solution.py`:
+One consolidated reference sits alongside `solution.py`:
 
-- **`reference.py`** — pure PyTorch. The correctness oracle used by the
-  test suite. Just Ex05b's per-expert loop, packaged as a function plus
-  input-prep and weight-packing helpers.
+- **`reference.py`** — three things in one file:
+  1. `fused_moe_reference` — pure-PyTorch per-expert loop, the
+     correctness oracle used by the test suite.
+  2. `prepare_sorted_input` / `pack_expert_weights` — test scaffolding
+     helpers that build `(sorted_x, offsets)` and pack weights into
+     `[E, I, H]` / `[E, H, I]`.
+  3. A WORKING Approach 2 (vLLM-style dispatch-table) Triton kernel:
+     `fused_moe_forward` + `grouped_matmul_kernel_v2`. All 8 tests
+     pass against this. Uses `input_precision="ieee"` on `tl.dot` (not
+     TF32) and applies SiLU × mul outside the kernel.
 
-- **`reference_triton.py`** — WORKING Option A Triton implementation. All 8
-  tests pass against this. Consult it when stuck. It uses the expert-first
-  grid layout (grid = `E × max_tiles_per_expert × N_tiles`), IEEE fp32
-  precision for `tl.dot` (not TF32), and applies SiLU × mul outside the
-  kernel.
-
-You're expected to write your own kernel in `solution.py`. `reference_triton.py`
-is a known-good target, not something to copy — a solution that copies it
-verbatim defeats the exercise. It's here so you can (a) verify the test
-suite works, (b) sanity-check design decisions (grid layout, mask handling,
-accumulator dtype) against a working baseline when you get stuck.
+You're expected to write your own kernel in `solution.py`. The Triton
+portion of `reference.py` is a known-good target, not something to
+copy — a solution that copies it verbatim defeats the exercise. It's
+here so you can (a) verify the test suite works, (b) sanity-check
+design decisions (grid layout, mask handling, accumulator dtype)
+against a working baseline when you get stuck.
 
 ## External reference material
 
@@ -289,8 +291,8 @@ If you want to confirm the test file works before writing anything:
 
 ```sh
 CUDA_VISIBLE_DEVICES=<n> uv run python -c "
-from bootcamp.ex09_fused_moe import reference_triton, solution
-solution.fused_moe_forward = reference_triton.fused_moe_forward
+from bootcamp.ex09_fused_moe import reference, solution
+solution.fused_moe_forward = reference.fused_moe_forward
 import pytest
 pytest.main(['-x', '-v', 'bootcamp/tests/test_ex09_fused_moe.py'])
 "

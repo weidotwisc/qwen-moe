@@ -2103,11 +2103,10 @@ argument as its main proof obligation.
 
 ## Ex09 — Fused MoE Triton kernel (grouped GEMM)
 
-**Status**: scaffolded with three references + stub + 8-test suite.
-`reference_triton.py` (Approach 1, padded uniform grid) and
-`reference_triton_vllm.py` (Approach 2, dispatch-table grid) both pass
-8/8 tests in fp32/bf16 across uniform/skewed routing at small +
-Qwen3-30B-A3B scales. Wei to fill in `solution.py`.
+**Status**: ✅ done. `solution.py` passes all 8 tests
+(fp32/bf16 × uniform/skewed × small/Qwen3-scale). Repo is
+consolidated to a single `reference.py` (PyTorch oracle + helpers +
+Approach 2 Triton kernel).
 
 The Ex09 kernel replaces Ex05b's per-expert Python loop with a
 single-launch grouped GEMM. **Grouped GEMM = tiled matmul with two
@@ -2249,12 +2248,12 @@ memory copy, no allocation.
 
 Two ways to launch grouped-GEMM programs:
 
-**Approach 1 (padded uniform grid)** — `reference_triton.py`:
+**Approach 1 (padded uniform grid)** — considered but not kept:
 - `grid = (E * max_tiles, cdiv(N, BLOCK_N))`.
 - Empty programs early-return.
 - Simple kernel; simple Python setup (~3 lines).
 
-**Approach 2 (dispatch table, vLLM-style)** — `reference_triton_vllm.py`:
+**Approach 2 (dispatch table, vLLM-style)** — the kept reference in `reference.py`:
 - `grid = (total_tiles, cdiv(N, BLOCK_N))`.
 - Python builds `tile_expert[i]` and `tile_row_start[i]` arrays.
 - No wasted program launches.
@@ -2296,13 +2295,12 @@ row-major queries and keys), not from any storage convention.
 
 ### 6. Practical file layout
 
-- `bootcamp/ex09_fused_moe/reference.py` — PyTorch oracle
-  (`fused_moe_reference`) + helpers (`prepare_sorted_input`,
-  `pack_expert_weights`).
-- `bootcamp/ex09_fused_moe/reference_triton.py` — Approach 1 working
-  Triton kernel.
-- `bootcamp/ex09_fused_moe/reference_triton_vllm.py` — Approach 2
-  vLLM-style Triton kernel with full pre/post condition docs.
+- `bootcamp/ex09_fused_moe/reference.py` — everything reference-side in
+  one file: PyTorch oracle (`fused_moe_reference`) + test helpers
+  (`prepare_sorted_input`, `pack_expert_weights`) + Approach 2
+  (vLLM-style dispatch-table) Triton kernel with full pre/post condition
+  docs. Approach 1 was written and passed 8/8 during exploration, then
+  dropped as pedagogically redundant with Approach 2.
 - `bootcamp/ex09_fused_moe/solution.py` — my implementation, Approach 2
   with block pointers. All 8 tests green.
 - `bootcamp/tests/test_ex09_fused_moe.py` — 8 tests.
