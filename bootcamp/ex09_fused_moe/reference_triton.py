@@ -163,8 +163,8 @@ def _grouped_matmul(
 
 
 def fused_moe_forward(
-    sorted_x: torch.Tensor,     # [Nk, H]
-    offsets: torch.Tensor,       # [E + 1] int64
+    sorted_x: torch.Tensor,     # [M, H]   — M = caller-determined record count
+    offsets: torch.Tensor,       # [E + 1] int64, with offsets[E] == M
     W_gate: torch.Tensor,        # [E, I, H]
     W_up: torch.Tensor,          # [E, I, H]
     W_down: torch.Tensor,        # [E, H, I]
@@ -174,11 +174,18 @@ def fused_moe_forward(
 ) -> torch.Tensor:
     """Option A: three grouped-GEMM launches + PyTorch elementwise silu×mul.
 
+    `M = sorted_x.shape[0]` is the number of records this kernel
+    processes. It equals `offsets[E]` by precondition. In the
+    standalone Ex09 test, `M = N × top_k`. In post-dispatch
+    integration (Ex06/Ex07), M is this rank's routing-dependent
+    received-record count and is unrelated to any single rank's
+    (N × top_k).
+
     Pipeline:
-        gate_out = grouped_matmul(sorted_x, W_gate, offsets)   # [Nk, I]
-        up_out   = grouped_matmul(sorted_x, W_up,   offsets)   # [Nk, I]
-        hid      = silu(gate_out) * up_out                      # [Nk, I]
-        out      = grouped_matmul(hid, W_down, offsets)         # [Nk, H]
+        gate_out = grouped_matmul(sorted_x, W_gate, offsets)   # [M, I]
+        up_out   = grouped_matmul(sorted_x, W_up,   offsets)   # [M, I]
+        hid      = silu(gate_out) * up_out                      # [M, I]
+        out      = grouped_matmul(hid, W_down, offsets)         # [M, H]
     """
     gate_out = _grouped_matmul(sorted_x, W_gate, offsets, BLOCK_M, BLOCK_N, BLOCK_K)
     up_out = _grouped_matmul(sorted_x, W_up, offsets, BLOCK_M, BLOCK_N, BLOCK_K)

@@ -18,9 +18,9 @@ Personal notes on what I picked up in each exercise. Grows as I finish more.
 | Ex06_ep_pure | Pure EP with DP-partitioned inputs | ✅ done | 8/8 green | Dispatch structurally necessary — EP's natural form |
 | Ex07 | TP + EP hybrid | ✅ done | 2/2 green (fp32 + bf16) | Case-3 canonical schedule — TP stripe + EP dispatch + TP all_gather |
 | Ex08 | Weiz hybrid schedule (intra-lean + inter-dispatch) | ⏸ tabled | ref 2/2 + fused 2/2 green; benchmarks done | Correct but roughly tied w/ Ex07 under contiguous-TP topology — [[project_ex08_topology_finding]] |
-| Ex09 | Fused MoE Triton kernel (grouped GEMM) | ⬜ pending | – | Ports Ex05b permuted MoE to Triton. Interview + paper artifact. |
+| Ex09 | Fused MoE Triton kernel (grouped GEMM) | ✅ done | 8/8 green (fp32/bf16 × uniform/skewed × small/Qwen3-scale) | Approach 2 (vLLM-style dispatch table) with block pointers |
 
-**Bugs-caught count so far**: 26 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure + Ex07 — see the "Traps I hit" sections in each entry for the failure mode and fix.
+**Bugs-caught count so far**: 36 distinct bugs across Ex01 + Ex02 + Ex03 + Ex04 + Ex05a + Ex05b + Ex06_ep_pure + Ex07 + Ex09 — see the "Traps I hit" sections in each entry for the failure mode and fix.
 
 ---
 
@@ -2099,3 +2099,332 @@ argument as its main proof obligation.
   the attention side, giving exactly this TP+EP hybrid pattern in
   production.
 
+
+
+## Ex09 — Fused MoE Triton kernel (grouped GEMM)
+
+**Status**: scaffolded with three references + stub + 8-test suite.
+`reference_triton.py` (Approach 1, padded uniform grid) and
+`reference_triton_vllm.py` (Approach 2, dispatch-table grid) both pass
+8/8 tests in fp32/bf16 across uniform/skewed routing at small +
+Qwen3-30B-A3B scales. Wei to fill in `solution.py`.
+
+The Ex09 kernel replaces Ex05b's per-expert Python loop with a
+single-launch grouped GEMM. **Grouped GEMM = tiled matmul with two
+additions**: (a) a dispatch table that says "which piece of C does
+this program compute," and (b) a per-expert base pointer for the
+weight tensor. The rest of the kernel body is standard tiled matmul.
+
+### 1. Insight: `tl.make_block_ptr` args split into "global" vs "local"
+
+For a `tl.make_block_ptr(base, shape, strides, offsets, block_shape, order)`
+call, the arguments partition by whether they depend on
+`tl.program_id(...)` — local (may depend), global (never depend), and
+`base` as a middle case (fixed once per program, may bake in a
+per-program offset, but constant within the kernel body):
+
+| Arg | Notes |
+|---|---|
+| **_Local (may depend on `tl.program_id`)_** | |
+| `shape` | Can be a runtime value per-program (e.g., `e_end` per-expert) |
+| `offsets` | The whole point of a block pointer — position per program, updated by `tl.advance` |
+| **_Global (shared across all program instances)_** | |
+| `strides` | Tensor memory layout doesn't change per program |
+| `block_shape` | Compile-time (`constexpr`); same for every program |
+| `order` | Compile-time (`constexpr`); describes contiguous axis |
+| **_Both (per-program static: set once at program entry)_** | |
+| `base` | Raw tensor pointer OR baked with per-program leading-dim offset (`b_ptr + e * stride_be`) |
+
+**Program-analysis rule of thumb**: any variable in the block-pointer
+arguments that transitively depends on `tl.program_id(...)` is
+per-program (local); anything that doesn't is shared (global).
+
+**Why base-baking dominates production kernels**: even though "base
+always global, offsets do all positioning" is a nicer principle,
+Triton's block-pointer API strongly favors baking the leading
+batch/head/expert offset into base because:
+- `tl.dot` is intrinsically 2D. Everything else follows.
+- `block_shape` must be `constexpr`. A degenerate `1` on a leading dim
+  is wasteful.
+- Base pointers naturally carry runtime offsets via C-style pointer
+  arithmetic.
+
+Every major Triton kernel (FA-2, vLLM `fused_moe.py`, xformers,
+Megablocks) uses this pattern. Confirmed by cross-referencing with my
+own CS336 FA-2 impl — even there, `Q_block_ptr` uses
+`base=Q_ptr + b * stride_qb + h * stride_qh`.
+
+### 2. Insight: FA-2 vs Grouped GEMM — uniform vs per-program shape
+
+**FA-2's block-pointer `shape` is uniform across programs.** In FA-2
+forward, `shape=(N_q, d)` is the same for every program of a given
+kernel launch (query sequence length and head dim, both known at
+launch time). Boundary-check is only for the tail — when `N_q` isn't
+a multiple of `BLOCK_M`, the last block has partial rows. That's a
+single degenerate case per launch.
+
+**Grouped GEMM's `shape` VARIES per program.** In our kernel,
+`shape=(e_end, K)` where `e_end` depends on which expert this
+program owns. Boundary-check runs on every tile that touches an
+expert boundary, not just the tail.
+
+**Why zero padding works for grouped GEMM specifically**: the operation
+being performed is a matmul, and 0 is the identity element of the
+matmul's reduction (sum). `x @ W` with x's OOB rows = 0 → those rows
+contribute 0 to the accumulator. Safe.
+
+**Padding must be the IDENTITY ELEMENT of the operation performed on the
+padded value**:
+
+| Op | Identity | Triton padding option |
+|---|---|---|
+| Sum / matmul accumulation | 0 | `padding_option="zero"` — supported |
+| Product | 1 | Not supported directly; needs manual mask |
+| Max reduction | −∞ | Not `"zero"`; use `other=float('-inf')` or manual mask |
+| Softmax (pre-max) | −∞ | Manual masking (FA-2 does this for causal + attention masks) |
+| Sum reduction | 0 | `padding_option="zero"` |
+
+**FA-2 combines both**: matmul-side zero padding for Q/K/V loads
+(identity 0), plus manual `-∞` masking for causal/attention mask
+positions before softmax. Grouped GEMM doesn't need the softmax
+step, so only the matmul-side zero padding is needed. That's why FA-2
+"felt more complex" than grouped GEMM despite being structurally
+similar at the tiling level.
+
+### 3. The bounding-box / boundary metaphor for `tl.make_block_ptr`
+
+The four arguments that control loads work as a set:
+
+- **`block_shape`** = the **bounding box** (the fixed rectangular tile
+  we're loading). Compile-time constant.
+- **`shape`** = the **boundary** (declared logical extent of the
+  tensor — "what Triton considers in-bounds"). Runtime.
+- **`offsets`** = **positioning** of the bounding-box inside the
+  boundary. Runtime.
+- **`boundary_check=(dim_a, dim_b, ...)`** = **which axes to check for
+  out-of-bounds**. A tuple of dimension indices.
+- **`padding_option="zero"`** = **fill value** when the bounding-box
+  extends past the boundary.
+
+Mental picture:
+
+```
+                    Physical tensor in HBM
+    ┌────────────────────────────────────────────┐
+    │ (raw memory extending further than shape)  │
+    │                                            │
+    ├──────────────────────┐                     │
+    │                      │                     │
+    │  shape = (e_end, K)  │  ← declared        │
+    │  ← what Triton       │    "boundary"       │
+    │    treats as valid   │                     │
+    │  ┌──────────────┐    │                     │
+    │  │ block_shape  │    │  ← "bounding box" │
+    │  │  = (BM, BK)  │    │                     │
+    │  │              │    │  ← positioned via  │
+    │  │              │    │    offsets         │
+    │  └──────────────┘    │                     │
+    │                      │                     │
+    ├──────────────────────┘                     │
+    │  (memory past `shape` — OOB; padded to 0)  │
+    │                                            │
+    └────────────────────────────────────────────┘
+```
+
+**`shape` is a CONTRACT with Triton, not a physical property.** The
+underlying HBM tensor might be larger than `shape` — Triton doesn't
+know, doesn't check. `shape` is the promise "only positions
+`[0, shape[0]) × [0, shape[1])` are valid; treat anything past that
+as OOB." This is the trick that lets us bound the block pointer to
+one expert's rows via `shape=(e_end, K)` even though the underlying
+`a_ptr` has M rows total.
+
+**Padding is register-level, not memory-level**: `padding_option="zero"`
+generates predicated loads at the SASS level. Out-of-bounds positions
+never touch HBM; the destination register is written with 0 by the
+load's `other` value. The physical tensor is completely unchanged. No
+memory copy, no allocation.
+
+### 4. Approach 1 vs Approach 2 (compact vs padded grid)
+
+Two ways to launch grouped-GEMM programs:
+
+**Approach 1 (padded uniform grid)** — `reference_triton.py`:
+- `grid = (E * max_tiles, cdiv(N, BLOCK_N))`.
+- Empty programs early-return.
+- Simple kernel; simple Python setup (~3 lines).
+
+**Approach 2 (dispatch table, vLLM-style)** — `reference_triton_vllm.py`:
+- `grid = (total_tiles, cdiv(N, BLOCK_N))`.
+- Python builds `tile_expert[i]` and `tile_row_start[i]` arrays.
+- No wasted program launches.
+- Kernel has no branches (just table lookups); Python setup is more
+  involved (~10 lines: `repeat_interleave` + `cumsum` + prefix trick).
+
+**Performance-wise, both approaches are nearly identical** at Qwen3
+scale because empty programs cost ~200 ns each. The MMA work per tile
+is the same in both approaches (masked-off rows still get computed as
+`0 · b = 0`; only the store predicate differs). The real difference
+is code shape (kernel simplicity) not compute.
+
+**vLLM's actual production `fused_moe.py`** uses Approach 2 PLUS
+physical padding of `sorted_token_ids` with `-1` sentinels — the third
+step past Approach 2. That's a further optimization (avoids boundary
+predicates entirely at the cost of extra output-buffer memory).
+
+### 5. Sub-lesson: PyTorch's `[out, in]` weight convention
+
+PyTorch stores `nn.Linear.weight` as `[out_features, in_features]`,
+requiring `x @ W.T` in the forward pass. Almost every other modern ML
+framework (JAX, Needle, NumPy) uses `[in, out]` — no transpose.
+
+In Triton, this means our grouped-GEMM does `tl.dot(a, tl.trans(b))`
+because `W_gate` is stored `[E, I, H]` (out, in). **Not a real
+performance issue** — modern tensor cores handle both `A @ B` and
+`A @ B.T` as native MMA variants; `tl.trans` is just a compile-time
+signal for which variant to emit. But the cognitive tax of always
+remembering "PyTorch weights need transposing" is real when writing
+many kernels.
+
+**Alternative I could take**: pre-transpose weights at pack time in
+`pack_expert_weights` — one-time cost. Kernel becomes cleaner. Skipped
+in Ex09 to keep the pedagogy simple; production stacks often do this.
+
+**Same observation applies to FA-2's `Q @ K^T`** — but there the
+transpose comes from the attention MATH (row-vs-row dot product on
+row-major queries and keys), not from any storage convention.
+
+### 6. Practical file layout
+
+- `bootcamp/ex09_fused_moe/reference.py` — PyTorch oracle
+  (`fused_moe_reference`) + helpers (`prepare_sorted_input`,
+  `pack_expert_weights`).
+- `bootcamp/ex09_fused_moe/reference_triton.py` — Approach 1 working
+  Triton kernel.
+- `bootcamp/ex09_fused_moe/reference_triton_vllm.py` — Approach 2
+  vLLM-style Triton kernel with full pre/post condition docs.
+- `bootcamp/ex09_fused_moe/solution.py` — my implementation, Approach 2
+  with block pointers. All 8 tests green.
+- `bootcamp/tests/test_ex09_fused_moe.py` — 8 tests.
+
+### 7. Traps I hit (10 bugs across kernel + wrapper + numerics)
+
+Wrote the kernel from a stub to 8/8 green in one focused session. Bugs
+found via 3-4 review rounds. Categorized by class:
+
+**Architectural — needed to be resolved before any code could compile**
+
+**#1 — One dispatch table isn't enough for Approach 2.** Initially
+built `_build_meta_data` returning only `mid_eid_mappings` (which
+expert each program owns). But under Approach 2, the kernel also
+needs to know WHICH TILE of that expert this program serves — otherwise
+all programs with the same `eid` process identical rows. Fix: add a
+second table `mid_inexpert_offset_mappings` giving each program's
+tile-index within its expert. Two-table dispatch = expert-id +
+tile-within-expert.
+
+**Element-vs-stride confusion in `tl.make_block_ptr` offsets**
+
+**#2 — `offsets = (local_mid * stride_xm, 0)` is doubly wrong.**
+Block-pointer offsets are in ELEMENT units on each axis, not byte
+units. Triton multiplies by strides internally when computing
+addresses. Passing `local_mid * stride_xm` makes the effective byte
+offset `local_mid * stride_xm * stride_xm` — a squared stride. Fix:
+`offsets = (local_mid * BLOCK_M, 0)`.
+
+**#3 — Missing N-axis offset on `Y_block_ptr`.** Under the correct
+element-units convention, the M-axis offset became
+`local_mid * BLOCK_M`. But I initially left the N-axis at 0, meaning
+every program with different `nid` wrote to the same N-slice of Y —
+clobbering each other. Fix: `offsets = (local_mid * BLOCK_M, nid * BLOCK_N)`.
+
+**#4 — `W_block_ptr` offsets all-zero.** Same class as #3 — every
+program with `nid=0, 1, 2, ...` should read a different N-slice of the
+weight, but I had `offsets=(0, 0)`. Fix: `offsets = (nid * BLOCK_N, 0)`.
+
+**Grid + wrapper bugs**
+
+**#5 — Grid divides `total_tiles` by `BLOCK_M`.** I wrote
+`grid = (triton.cdiv(total_tiles, BLOCK_M), triton.cdiv(N, BLOCK_N))`.
+But `total_tiles` is already the count of programs to launch — dividing
+by `BLOCK_M` is meaningless. Fix:
+`grid = (total_tiles, triton.cdiv(N, BLOCK_N))`.
+
+**#6 — `torch.ceil(int_a // int_b)` is a no-op.** `//` is integer
+floor-div; `torch.ceil` on an int tensor does nothing. So my
+`eid_numblocks_mappings = torch.ceil((counts) // BLOCK_M)` computed
+floor-div, not ceil-div. Wrong number of tiles per expert; would
+produce out-of-bounds tile counts for experts with `count < BLOCK_M`.
+Fix: `(counts + BLOCK_M - 1) // BLOCK_M`.
+
+**#7 — `torch.arange` defaults to CPU.** In `_build_meta_data`, both
+`torch.arange(expert_num)` and `torch.arange(total_tiles)` produce CPU
+tensors. When passed to `torch.repeat_interleave` with a GPU tensor as
+`repeats`, PyTorch errors on device mismatch. Even if it didn't, the
+returned dispatch tables would be on CPU and the Triton kernel would
+segfault reading from wrong-device pointers. Fix: add
+`device=offsets.device` to both.
+
+**Numerical / semantic bugs**
+
+**#8 — SwiGLU order wrong.** Wrote `z = F.silu(gated_x * up_x)` when
+the correct formula is `z = F.silu(gated_x) * up_x`. Same operators,
+different order — apply SiLU to the gate output first, THEN multiply
+by up. Would silently produce completely wrong output (tests fail on
+tolerance).
+
+**#9 — `input_precision="ieee"` missing on `tl.dot`.** Triton defaults
+to TF32 (10-bit mantissa) for fp32 inputs on Ampere/Hopper tensor
+cores. TF32's ~1e-3 accuracy fails our fp32 tests at tolerance ~1e-5.
+The `tl.zeros(..., dtype=tl.float32)` accumulator (which I had correct
+from the start) is a separate concern — that's about where the running
+sum lives, not about input precision. Fix:
+`tl.dot(..., acc=Y_tile, input_precision="ieee")`.
+Note: bf16 inputs are unaffected (bf16 IS the tensor-core precision;
+`input_precision` is a no-op there). This is why FA-2 (usually
+bf16-focused) rarely needs this flag.
+
+**Triton API surface**
+
+**#10 — `tl.trans(x, dims=(1, 0))` fails.** The Triton signature is
+`tl.trans(input, *dims, _semantic=None)` — `*dims` is a variadic
+positional collector, not a keyword-accessible parameter. Passing
+`dims=` yields "unexpected keyword argument." Valid forms:
+`tl.trans(x)` (2D auto-transpose), `tl.trans(x, 1, 0)` (variadic), or
+`tl.trans(x, (1, 0))` (tuple as one positional). Same rule as
+Python's `*args` — a name after `*` isn't a keyword slot.
+
+### Meta-observations from the debug rounds
+
+- **The element-vs-stride confusion (#2, #3, #4) cost the most time.**
+  Every kernel author hits this at least once — the block-pointer API
+  documentation says "offsets" but doesn't emphasize "in element
+  units" prominently. Once internalized: block-pointer offsets are
+  always logical row/col indices, never multiplied by strides.
+
+- **Bugs cluster by category.** #2 + #3 + #4 are the same "offsets
+  semantics" mistake in three places. When I fixed #2 in `X_block_ptr`,
+  I should have swept the same fix through `W_block_ptr` and
+  `Y_block_ptr` immediately rather than fixing one at a time.
+
+- **`torch.arange` device default is a stealth bug.** #7 is easy to
+  miss because CPU-side Python code doesn't obviously flag it. The
+  error only surfaces at kernel launch. Habit for future kernel-facing
+  code: always specify `device=...` on tensor constructors.
+
+- **The two-table dispatch (#1) is the load-bearing insight.**
+  Approach 2 minus one table isn't just "less optimal" — it's
+  structurally wrong. If I'd committed to Approach 1 (grid decode with
+  `//` and `%`) I could have avoided this class of bug entirely; the
+  Approach 2 flexibility comes with a hard prerequisite.
+
+- **API-surface bug (#10) is version-dependent.** Triton's docs show
+  `dims=` sometimes; the installed version doesn't accept it. Always
+  check `inspect.signature(tl.trans)` when in doubt.
+
+### Reference material worth revisiting
+
+- **Megablocks (Gale et al. 2022)** — [arXiv 2211.15841](https://arxiv.org/abs/2211.15841) — the paper that formalized MoE compute as grouped/block-sparse GEMM.
+- **vLLM `fused_moe.py`** — [github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/fused_moe](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/fused_moe) — the production reference kernel.
+- **CUTLASS Grouped GEMM** — [github.com/NVIDIA/cutlass](https://github.com/NVIDIA/cutlass), `include/cutlass/gemm/kernel/gemm_grouped.h` — the numerical-library ancestor.
+- **My CS336 FA-2** — [github.com/weidotwisc/cs336-assignment2-systems/blob/main/cs336_systems/flash_attention.py](https://github.com/weidotwisc/cs336-assignment2-systems/blob/main/cs336_systems/flash_attention.py) — same tiling patterns, plus softmax + causal masking on top.

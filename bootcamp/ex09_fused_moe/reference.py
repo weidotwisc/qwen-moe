@@ -20,7 +20,7 @@ from bootcamp.ref.mlp import RefSwiGLU_MLP
 
 
 def fused_moe_reference(
-    sorted_x: torch.Tensor,     # [Nk, H]
+    sorted_x: torch.Tensor,     # [M, H]   — M = caller-determined record count; equals offsets[E]
     offsets: torch.Tensor,       # [E + 1], int64
     W_gate: torch.Tensor,        # [E, I, H]
     W_up: torch.Tensor,          # [E, I, H]
@@ -48,7 +48,7 @@ def fused_moe_reference(
     Returns:
         sorted_out: same shape as sorted_x, per-expert SwiGLU applied.
     """
-    Nk, H = sorted_x.shape
+    M, H = sorted_x.shape
     E = W_gate.shape[0]
     assert offsets.shape == (E + 1,)
     assert offsets.dtype == torch.int64
