@@ -1,0 +1,107 @@
+Ex02 proof drafting — audit-cycle anecdote
+===========================================
+
+Date:       2026-08-31
+Component:  MergedColumnParallelLinear + TPSwiGLUMLP (bootcamp/ex02_mlp_tp/solution.py)
+Drafter:    Claude Opus 4.7 (this session)
+Auditor:    Wei Zhang (Jun to review later)
+Toolchain:  Verus 0.2025.07.12.0b6f3cb
+
+
+WHAT HAPPENED
+-------------
+1. Claude drafted PROPERTIES.md (six properties: M1-M3 for merged column,
+   T1-T3 for the SwiGLU composition) and mlp_tp.rs (Verus proof), following
+   the pattern established in bootcamp/ex01_linear_tp/verification/.
+
+2. On first Verus run:
+       verification results:: 12 verified, 2 errors
+
+3. Both errors were "precondition not satisfied" on calls to `axiom_m1(x,
+   ms0, ms1)` inside `m3_merged_forward_correctness_tp2`. Specifically,
+   Verus reported that the axiom's requires-clause — an existential
+   witness for a common `rowlen` between the two merged shards, plus
+   non-empty length — was not established at the call site.
+
+4. Diagnosis: Claude's proof body pattern-matched on Ex01's
+   `c4_forward_correctness_tp2` structure but omitted the ~30-line
+   scaffolding block that constructs the `rowlen` witness for the two
+   shards and their concatenation. Ex01's proof had this scaffolding
+   explicitly; Ex02's draft skipped it.
+
+5. Wei's audit question at this point:
+       "does it mean you have found a bug in my solution.py, or a bug in
+       your proof?"
+
+6. Answer: bug in Claude's proof, NOT in Wei's Python. The failure
+   surfaced *within the tool*, before any human audit was needed. Wei's
+   MergedColumnParallelLinear implementation is unchanged.
+
+7. Fix #1 applied: added ~50 lines of `assert ... by { ... }` scaffolding
+   (identical shape to Ex01's C4-tp2 pattern) that constructs the rowlen
+   witness for each of the four (shard-of-w0, shard-of-w1) combinations,
+   then extends it to the two concatenated merged_shards. See
+   `mlp_tp.rs` `m3_merged_forward_correctness_tp2` for the final form.
+
+8. Second Verus run: `13 verified, 1 error`. The remaining error was a
+   *different* class: my `assert ... by (nonlinear_arith)` block had a
+   `requires` clause that assumed the divmod identity as a given, which
+   Verus refused to accept without proof.
+
+9. Fix #2 applied: replaced the nonlinear_arith block with the standard
+   `lemma_fundamental_div_mod` + `calc!` pattern used in Ex01. That
+   library lemma discharges the `n == p*(n/p) + n%p` fact.
+
+10. Third Verus run: `verification results:: 13 verified, 0 errors`.
+
+11. Total iteration count: 2 (draft → reject → fix scaffolding → reject
+    → fix divmod → accept).
+12. Wall-clock time on the audit cycle: ~25 minutes.
+
+
+WHY THIS ANECDOTE MATTERS FOR THE PAPER
+---------------------------------------
+This is a concrete instance of Verus catching a real omission in an
+AI-drafted proof that would have required human effort to notice
+otherwise. The failure mode was:
+
+  - Semantically plausible: the proof's *structure* matched Ex01, so a
+    quick human read might have missed the missing scaffolding.
+  - Mechanically detected: Verus rejected the axiom application with an
+    exact error message pointing at the two unsatisfied preconditions.
+  - Cheaply corrected: the fix mirrors an existing pattern in Ex01;
+    once identified, the diff is ~50 lines of standard `assert ... by`
+    scaffolding.
+
+For the paper's Contribution 3 (agent-composition ablation), this anecdote
+supports the claim:
+
+  "Verus's mechanical check catches classes of proof-drafting error
+  that would otherwise require the auditor to re-derive well-formedness
+  arguments by hand. The audit cost is reduced from re-deriving to
+  verifying-that-the-fix-is-standard, which is substantially cheaper."
+
+Suggested location in paper: §Evaluation → subsection "Case study of an
+audit cycle" (or as a running example threaded through §Methodology).
+
+
+LESSONS FOR FUTURE DRAFTS
+-------------------------
+1. When invoking an axiom whose `requires` clause has an existential
+   quantifier (`exists|rowlen: nat| ...`), the CALLING proof must
+   explicitly construct the witness. Verus does not infer it.
+
+2. When shards or concatenations appear in an axiom's argument
+   position, well-formedness scaffolding is needed for each shard and
+   each concat, following the structural pattern:
+
+       let rowlen = choose|r: nat| well_formed(parent, parent.len(), r);
+       assert(well_formed(shard, shard.len(), rowlen)) by { /* index-by-index */ }
+       // Then for a + b: case-split on i < a.len().
+
+3. For future Ex02+ drafts, factor this scaffolding into a reusable
+   named lemma (e.g., `lemma_shard_preserves_rowlen`, `lemma_concat_preserves_rowlen`)
+   rather than inlining it at each axiom call site. Ex01's monolithic
+   inline style is readable for one proof but redundant across seven.
+   Following Jun's stated preference (decompose with named lemmas), the
+   next component's proof will introduce these helpers.

@@ -260,6 +260,22 @@ def pack_expert_weights(
 # =============================================================================
 
 
+@triton.autotune(
+    configs=[
+        # BLOCK_M stays fixed at whatever the Python-side dispatch table was built
+        # for (see _grouped_matmul_v2). Only BLOCK_N / BLOCK_K / warps / stages
+        # are autotuned. Configs picked from common A100 GEMM shapes and the
+        # working set (H=2048, I=768) of Qwen3-30B-A3B.
+        triton.Config({"BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_N": 256, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_N": 64,  "BLOCK_K": 64}, num_warps=4, num_stages=4),
+    ],
+    key=["N", "K"],  # gate/up (N=I=768, K=H=2048) and down (N=H=2048, K=I=768) tune independently
+)
 @triton.jit
 def grouped_matmul_kernel_v2(
     a_ptr,               # [M, K]
@@ -392,10 +408,14 @@ def _grouped_matmul_v2(
     b: torch.Tensor,         # [E, N, K]
     offsets: torch.Tensor,   # [E + 1] int64
     BLOCK_M: int = 64,
-    BLOCK_N: int = 64,
-    BLOCK_K: int = 32,
 ) -> torch.Tensor:
-    """Grouped-GEMM launch: c = grouped_matmul(a, b, offsets)."""
+    """Grouped-GEMM launch: c = grouped_matmul(a, b, offsets).
+
+    BLOCK_M stays fixed here (drives the Python-side dispatch table shape).
+    BLOCK_N / BLOCK_K / num_warps / num_stages are picked by triton.autotune
+    based on (N, K); the meta-grid below defers the N-axis tile count until
+    the autotuner has chosen BLOCK_N.
+    """
     M, K = a.shape
     E, N, K2 = b.shape
     assert K == K2, f"K mismatch: a.shape[1]={K}, b.shape[2]={K2}"
@@ -408,7 +428,7 @@ def _grouped_matmul_v2(
         return torch.zeros(M, N, dtype=a.dtype, device=a.device)
 
     c = torch.empty(M, N, dtype=a.dtype, device=a.device)
-    grid = (total_tiles, triton.cdiv(N, BLOCK_N))
+    grid = lambda META: (total_tiles, triton.cdiv(N, META["BLOCK_N"]))
 
     grouped_matmul_kernel_v2[grid](
         a, b, c,
@@ -419,8 +439,7 @@ def _grouped_matmul_v2(
         b.stride(0), b.stride(1), b.stride(2),
         c.stride(0), c.stride(1),
         BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        # BLOCK_N / BLOCK_K supplied by @triton.autotune
     )
     return c
 
@@ -432,8 +451,6 @@ def fused_moe_forward(
     W_up: torch.Tensor,           # [E, I, H]
     W_down: torch.Tensor,         # [E, H, I]
     BLOCK_M: int = 64,
-    BLOCK_N: int = 64,
-    BLOCK_K: int = 32,
 ) -> torch.Tensor:
     """Approach 2 (vLLM-style): three grouped-GEMM launches, each using a
     Python-built dispatch table.
@@ -447,8 +464,8 @@ def fused_moe_forward(
                     where gate/up/down are the linear layers from
                     W_gate[e], W_up[e], W_down[e].
     """
-    gate_out = _grouped_matmul_v2(sorted_x, W_gate, offsets, BLOCK_M, BLOCK_N, BLOCK_K)
-    up_out = _grouped_matmul_v2(sorted_x, W_up, offsets, BLOCK_M, BLOCK_N, BLOCK_K)
+    gate_out = _grouped_matmul_v2(sorted_x, W_gate, offsets, BLOCK_M)
+    up_out = _grouped_matmul_v2(sorted_x, W_up, offsets, BLOCK_M)
     hid = F.silu(gate_out) * up_out
-    out = _grouped_matmul_v2(hid, W_down, offsets, BLOCK_M, BLOCK_N, BLOCK_K)
+    out = _grouped_matmul_v2(hid, W_down, offsets, BLOCK_M)
     return out
