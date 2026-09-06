@@ -120,7 +120,7 @@ class TPMHA(nn.Module):
         # TODO(you):
         # 1. self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group)
         # 2. self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank, group=group)
-        self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group)
+        self.qkv_proj = QKVParallelLinear(hidden, head_dim, n_heads, n_heads, tp_size, tp_rank, group=group) # weiz: notice that n_heads == kv_heads in MHA case
         self.o_proj = RowParallelLinear(n_heads * head_dim, hidden, tp_size, tp_rank, group=group)
         
     # weiz 2026-08-11 the input x is B,T,Hidden (where Hidden=num_heads*head_dim). 

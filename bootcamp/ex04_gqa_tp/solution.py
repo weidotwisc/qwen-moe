@@ -219,7 +219,7 @@ class TPGQA(nn.Module):
 
         self.qkv_proj = QKVParallelLinearGQA(hidden=hidden, head_dim=head_dim, 
             num_heads = n_heads, num_kv_heads=n_kv_heads, tp_size=tp_size, tp_rank=tp_rank,
-            group=group)
+            group=group) # weiz: num_kv_heads is different from n_heads
         
         self.o_proj = RowParallelLinear(in_features = head_dim * n_heads, 
                                            out_features = hidden,tp_size=tp_size, tp_rank=tp_rank, group=group) # bug fix: the in_features is really a global view
