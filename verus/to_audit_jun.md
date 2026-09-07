@@ -126,14 +126,14 @@ INSTANCE of this meta-theorem — the paper's methodological point.
 | Naive ≡ Permuted (corollary) | `naive_equiv_fused_moe.rs` | `corollary_naive_equiv_permuted` |
 | Block-level 2×2 grid equivalence | `composition_theorem.rs` §6 | `corollary_block_variants_equivalent` |
 
-### Global safety properties (Contribution 2 §7)
+### Global safety goals (Contribution 2 §7) — the paper's four goals at block scope
 
-| Claim | Where | Lemma | Trusts per-component axioms |
+| Goal | Where | Lemma | Trusts per-component axioms |
 |-------|-------|-------|------------------------------|
-| S1 Token conservation, variant-independent | `composition_theorem.rs` §7.1 | `theorem_token_conservation` | Ex05 RT1 + Ex06 EP4 + Ex09 F1 |
-| S1 corollary: same record count across variants | `composition_theorem.rs` §7.1 | `corollary_records_variant_invariant` | (as above) |
-| S2 Deadlock-freedom, variant-independent | `composition_theorem.rs` §7.2 | `theorem_deadlock_free` | Ex06 EP6 + Ex07 H5 |
-| S3 Unique-writer invariant, variant-independent | `composition_theorem.rs` §7.3 | `theorem_unique_writer` | Ex06_ep/lean L3 + Ex05 RT4 + Ex09 F3 |
+| Work conservation (Completeness + Disjointness), variant-independent | `composition_theorem.rs` §7.1 | `theorem_token_conservation` | Ex05 RT1 + Ex06 EP4 + Ex09 F1 |
+| Work conservation corollary: same record count across variants | `composition_theorem.rs` §7.1 | `corollary_records_variant_invariant` | (as above) |
+| Deadlock freedom, variant-independent | `composition_theorem.rs` §7.2 (wrapper); `deadlock_free.rs` (substrate reduction) | `theorem_deadlock_free`; `lemma_data_independent_implies_matched` | Ex06 EP6 + Ex07 H5; NCCL substrate |
+| Data-race freedom (via unique-writer), variant-independent | `composition_theorem.rs` §7.3 | `theorem_data_race_free` | Ex06_ep/lean L3 + Ex05 RT4 + Ex09 F3 |
 
 ### Routing / partitioning invariants (per-component)
 
@@ -184,7 +184,7 @@ a well-known mathematical fact.
 | `axiom_fused_refines_spec` | `naive_equiv_fused_moe.rs`, `composition_theorem.rs` | Ex09 F4 — fused Triton kernel refines moe_spec_pointwise |
 | `axiom_variant_conserves_records` | `composition_theorem.rs` §7.1 | any variant preserves records_out == records_in * top_k |
 | `axiom_variant_schedule_terminates` | `composition_theorem.rs` §7.2 | any variant's collective schedule terminates deadlock-free |
-| `axiom_variant_unique_writer` | `composition_theorem.rs` §7.3 | any variant maintains the unique-writer invariant |
+| `axiom_variant_unique_writer` | `composition_theorem.rs` §7.3 | any variant maintains the unique-writer invariant (the mechanism for data-race freedom) |
 
 ### Per-component stubs (deferred proofs)
 
@@ -256,20 +256,26 @@ alongside
 This is the concrete example the paper's Contribution 3 uses. Confirm
 the anecdote accurately describes the two audit cycles.
 
-### Priority 4 — safety theorems (1 hour)
+### Priority 4 — safety goals (1 hour)
 
-Read `verus/composition_theorem.rs` §7 (S1-S3). Confirm the three
-safety-axioms match their per-component sources. In particular:
-- S1's `axiom_variant_conserves_records` should compose Ex05 RT1
-  (moe_baseline.rs), Ex06_ep_pure EP4 (ep_pure.rs), and Ex09 F1
-  (fused_moe.rs). Confirm each of those actually states what the
-  axiom claims.
-- S2's deadlock-freedom is a structural property; confirm the
-  per-component `ep6_deadlock_free_stub` and `h5_subgroup_deadlock_free_stub`
-  say what the paper claims.
-- S3's unique-writer is subtle — the claim is that atomic-free scatter
-  (index_add_ into per-rank buffers) is well-defined without race
-  conditions. Confirm this is faithful to Python semantics.
+Read `verus/composition_theorem.rs` §7 (the four goals at block scope)
+and `verus/deadlock_free.rs`. Confirm the safety-axioms match their
+per-component sources. In particular:
+- Work conservation: `axiom_variant_conserves_records` should compose
+  Ex05 RT1 (moe_baseline.rs), Ex06_ep_pure EP4 (ep_pure.rs), and Ex09 F1
+  (fused_moe.rs). Confirm each of those actually states what the axiom
+  claims.
+- Deadlock freedom: the real content is in `deadlock_free.rs` ---
+  `lemma_data_independent_implies_matched` is the proved reduction, and
+  `axiom_matched_implies_no_deadlock` is the trusted NCCL substrate. The
+  §7.2 wrapper in composition_theorem.rs just records the
+  variant-independent form. Confirm the data-independence model faithfully
+  captures "no collective guarded by a data-dependent branch."
+- Data-race freedom: `theorem_data_race_free` rests on the unique-writer
+  invariant — the claim is that atomic-free scatter (index_add_ into
+  per-rank buffers) plus the fused kernel's tile-disjointness is
+  well-defined without races. Confirm this is faithful to the Python /
+  Triton semantics.
 
 ### Priority 5 — per-component proofs (4-6 hours)
 
@@ -295,9 +301,9 @@ The paper's §Contribution 2 section refers to these lemmas by name:
   and `theorem_lean_equiv_hybrid` (composition_theorem.rs, simplified form)
 - Kernel swap: `theorem_permuted_equiv_fused` (naive_equiv_fused_moe.rs)
 - 2×2 block grid: `corollary_block_variants_equivalent` (composition_theorem.rs)
-- Token conservation: `theorem_token_conservation` (composition_theorem.rs)
-- Deadlock-freedom: `theorem_deadlock_free` (composition_theorem.rs)
-- Unique-writer: `theorem_unique_writer` (composition_theorem.rs)
+- Work conservation (Completeness + Disjointness): `theorem_token_conservation` (composition_theorem.rs)
+- Deadlock freedom: `theorem_deadlock_free` (deadlock_free.rs, substrate reduction; composition_theorem.rs, variant wrapper)
+- Data-race freedom (via unique-writer): `theorem_data_race_free` (composition_theorem.rs)
 
 The paper's §Methodology section refers to these files:
 - Per-component proof template: `bootcamp/ex01_linear_tp/verification/`

@@ -265,29 +265,31 @@ pub proof fn corollary_block_variants_equivalent(
 // §7 — GLOBAL SAFETY PROPERTIES.
 //
 // The functional-equivalence theorems (§3-§6) say "different variants
-// produce equivalent outputs". The safety properties below say the
-// SYSTEM's execution is well-formed regardless of which variant is
-// chosen. Three canonical properties for distributed MoE:
+// produce equivalent outputs". The theorems below say the SYSTEM's
+// execution is well-formed regardless of which variant is chosen. They
+// are the block-scope form of the paper's four goals (paper section
+// "What we prove per component"):
 //
-//   (S1) Token conservation:   every routed token is processed exactly
-//                              top_k times across all ranks.
-//   (S2) Deadlock-freedom:     for any variant, the collective schedule
-//                              on every rank is well-formed (all ranks
-//                              in a group agree on the sequence and
-//                              shapes of collective calls).
-//   (S3) Unique-writer:        for any output tensor position on any
-//                              rank, at most one source writes to it
-//                              per forward pass (no data race, no
-//                              double-write).
+//   Work conservation         every routed token is processed exactly
+//   (Completeness+Disjointness): top_k times across all ranks -- none
+//                              dropped, none double-counted.
+//   Deadlock freedom:          for any variant, the collective schedule
+//                              posts matched collectives in a fixed order
+//                              on every rank. The substrate-trust
+//                              reduction is proved in deadlock_free.rs;
+//                              here we state the variant-independent form.
+//   Data-race freedom:         for any output position on any rank, at
+//                              most one source writes it per forward (the
+//                              unique-writer mechanism), so there is no
+//                              race.
 //
-// Each of the three is stated as a variant-independent property: the
-// property holds regardless of which lean/hybrid × python/fused
-// configuration is running. This is precisely the "global safety"
-// claim Contribution 2 needs alongside the equivalence claim.
+// Each is stated as a variant-independent property: it holds regardless
+// of which lean/hybrid × python/fused configuration is running. This is
+// the "global safety" half of Contribution 2, alongside equivalence.
 // =====================================================================
 
 // ---------------------------------------------------------------------
-// §7.1 — Token conservation (S1).
+// §7.1 — Work conservation (Completeness + Disjointness).
 // ---------------------------------------------------------------------
 
 /// Total input records to the MoE forward on some rank.
@@ -319,7 +321,7 @@ pub proof fn axiom_variant_conserves_records(
          == total_records_in(x) * top_k(),
 {}
 
-/// THEOREM S1 (token conservation, variant-independent):
+/// THEOREM (work conservation = Completeness + Disjointness, variant-independent):
 /// For any variant configuration, records_out == records_in * top_k.
 /// Trivial once the axiom is available — the point is that the axiom
 /// holds for EVERY choice of `(use_lean, use_fused)`, not just one.
@@ -345,20 +347,25 @@ pub proof fn corollary_records_variant_invariant(
 }
 
 // ---------------------------------------------------------------------
-// §7.2 — Deadlock-freedom (S2).
+// §7.2 — Deadlock freedom.
+//
+// This is the variant-independent WRAPPER. The substantive treatment ---
+// trusting NCCL's collective-matching contract as a substrate and PROVING
+// that a data-independent schedule meets its matching precondition --- is
+// in deadlock_free.rs (theorem_deadlock_free via
+// lemma_data_independent_implies_matched). Here we only record that the
+// property holds for every variant.
 // ---------------------------------------------------------------------
 
 /// A predicate on a variant configuration: "the collective schedule
-/// this variant issues terminates on every rank without deadlock." This
-/// is a straight-line-schedule structural property, not an SMT-provable
-/// runtime property; captured as an uninterpreted predicate + axiom.
+/// this variant issues terminates on every rank without deadlock."
 pub uninterp spec fn schedule_terminates(use_lean: bool, use_fused: bool) -> bool;
 
-/// AXIOM (from per-component EP6 / H5): every variant's collective
-/// schedule is a straight-line sequence of collective calls with
-/// group-matched shapes on every rank. No data-dependent branches on
-/// any rank's private state can cause a rank to skip or reorder a
-/// collective. Therefore the schedule terminates deadlock-free.
+/// AXIOM: every variant's schedule is data-independent (fixed sequence of
+/// group-matched collectives on every rank), so under the NCCL substrate
+/// contract it is deadlock-free. The data-independence-implies-matched
+/// reduction is proved in deadlock_free.rs; the NCCL contract itself is
+/// trusted (see deadlock_free.rs::axiom_matched_implies_no_deadlock).
 ///
 /// Per-component sources:
 ///   Ex06_ep_pure EP6 (ep_pure.rs).
@@ -368,7 +375,7 @@ pub proof fn axiom_variant_schedule_terminates(use_lean: bool, use_fused: bool)
     ensures schedule_terminates(use_lean, use_fused),
 {}
 
-/// THEOREM S2 (deadlock-freedom, variant-independent):
+/// THEOREM (deadlock freedom, variant-independent):
 /// Every variant's collective schedule terminates deadlock-free.
 pub proof fn theorem_deadlock_free(use_lean: bool, use_fused: bool)
     ensures schedule_terminates(use_lean, use_fused),
@@ -377,14 +384,13 @@ pub proof fn theorem_deadlock_free(use_lean: bool, use_fused: bool)
 }
 
 // ---------------------------------------------------------------------
-// §7.3 — Unique-writer invariant (S3, our rename of data-race-freedom).
+// §7.3 — Data-race freedom (via the unique-writer invariant).
 //
 // In a distributed MoE with atomics-free scatter (each rank writes into
-// its OWN output buffer, no cross-rank shared memory), "data race" in
-// the shared-memory sense doesn't apply. The relevant property is:
-// each output-tensor position on each rank is written by at most one
-// source per forward — the "unique-writer" invariant that guarantees
-// index_add_ is well-defined without atomics.
+// its OWN output buffer, no cross-rank shared memory), the relevant
+// property is: each output-tensor position on each rank is written by at
+// most one source per forward — the "unique-writer" invariant, which is
+// the mechanism by which data-race freedom holds.
 // ---------------------------------------------------------------------
 
 pub uninterp spec fn unique_writer_invariant(
@@ -409,9 +415,10 @@ pub proof fn axiom_variant_unique_writer(
     ensures unique_writer_invariant(x, use_lean, use_fused),
 {}
 
-/// THEOREM S3 (unique-writer, variant-independent):
-/// Every variant maintains the unique-writer invariant.
-pub proof fn theorem_unique_writer(
+/// THEOREM (data-race freedom, variant-independent):
+/// Every variant maintains the unique-writer invariant, so no two sources
+/// write the same output position in a forward pass.
+pub proof fn theorem_data_race_free(
     x: Tensor, use_lean: bool, use_fused: bool,
 )
     ensures unique_writer_invariant(x, use_lean, use_fused),
@@ -473,10 +480,10 @@ pub proof fn smoke_safety_deadlock()
     theorem_deadlock_free(false, false);
 }
 
-pub proof fn smoke_safety_unique_writer(x: Tensor)
+pub proof fn smoke_safety_data_race_free(x: Tensor)
     ensures unique_writer_invariant(x, true, true),
 {
-    theorem_unique_writer(x, true, true);
+    theorem_data_race_free(x, true, true);
 }
 
 } // verus!
