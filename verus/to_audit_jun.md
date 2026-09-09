@@ -147,14 +147,74 @@ Tier 3: 33). Re-verified 2026-09-09.
 | Naive ≡ Permuted (corollary) | `naive_equiv_fused_moe.rs` | `corollary_naive_equiv_permuted` |
 | Block-level 2×2 grid equivalence | `composition_theorem.rs` §6 | `corollary_block_variants_equivalent` |
 
-### Global safety goals (Contribution 2 §7) — the paper's four goals at block scope
+### Global safety goals — the paper's four goals, and where each is PROVED
 
-| Goal | Where | Lemma | Trusts per-component axioms |
-|-------|-------|-------|------------------------------|
-| Work conservation (Completeness + Disjointness), variant-independent | `composition_theorem.rs` §7.1 | `theorem_token_conservation` | Ex05 RT1 + Ex06 EP4 + Ex09 F1 |
-| Work conservation corollary: same record count across variants | `composition_theorem.rs` §7.1 | `corollary_records_variant_invariant` | (as above) |
-| Deadlock freedom, variant-independent | `composition_theorem.rs` §7.2 (wrapper); `deadlock_free.rs` (substrate reduction) | `theorem_deadlock_free`; `lemma_data_independent_implies_matched` | Ex06 EP6 + Ex07 H5; NCCL substrate |
-| Data-race freedom (via unique-writer), variant-independent | `composition_theorem.rs` §7.3 | `theorem_data_race_free` | Ex06_ep/lean L3 + Ex05 RT4 + Ex09 F3 |
+Each goal has two layers Jun should audit **separately**:
+- **(a) block-scope** statement in `composition_theorem.rs` §7 (variant-independent);
+- **(b) per-component** lemmas that supply the actual proved substance.
+
+**IMPORTANT.** For three of the four goals the block-scope theorem is a
+*wrapper* that packages the per-component facts through an `external_body`
+axiom — i.e. the per-component → block LIFT is currently **assumed**, not
+mechanically composed. Only **deadlock freedom** has a substantive
+standalone reduction (`deadlock_free.rs`). So for goals 1–3, audit BOTH the
+per-component lemmas (proved — read them) AND the packaging axiom (trusted —
+confirm it faithfully summarizes those lemmas).
+
+**Goal 1 — Completeness** (every work item assigned + executed; $\bigcup_r W_r = W$)
+- Block scope: `theorem_token_conservation` (§7.1), via
+  `axiom_variant_conserves_records` (trusted packaging).
+- Proved per-component:
+  - Ex05 `rt1_token_conservation_from_assignment` (`moe_baseline.rs`) — offset
+    endpoint == token count, **unconditional** (the previously-assumed
+    sum premise is discharged by `lemma_bincount_sums_to_len`).
+  - Ex06_ep_pure `ep2_expert_coverage`; Ex06_ep/lean `l2_local_mask_covers`.
+  - Ex09 `f1_offsets_cover_range` (`fused_moe.rs`), `k1b_n_axis_covers`
+    (`fused_kernel_dsl.rs`).
+
+**Goal 2 — Disjointness** (no work item done twice; $W_r \cap W_s = \varnothing$)
+- Block scope: same `theorem_token_conservation` (§7.1) + packaging axiom.
+- Proved per-component:
+  - Ex05 `rt5_block_size_matches_count` (`moe_baseline.rs`) — each expert
+    block has exactly its true token count, so the blocks partition with no
+    overlap; `rt5_wrong_size_implies_wrong_offsets` is the corruption-detection
+    contrapositive (rejects the v8/v10 offset bugs).
+  - Ex06_ep_pure `ep1_expert_sharding_disjoint`; Ex06_ep/lean `l2_local_mask_disjoint`.
+  - Ex01 `c2_sharding_disjoint` (`column_parallel.rs`), `r2_sharding_disjoint_dim1` (`row_parallel.rs`).
+  - Ex09 `k1a_m_axis_disjoint`, `k1c_n_axis_disjoint` (fused tiles disjoint).
+
+**Goal 3 — Data-race freedom** (at most one writer per output position)
+- Block scope: `theorem_data_race_free` (§7.3), via
+  `axiom_variant_unique_writer` (trusted packaging).
+- Proved per-component:
+  - Ex05 `rt4_perm_injective` / `rt4_each_token_exactly_once` (`moe_baseline.rs`)
+    — the sort permutation is a bijection, so exactly one slot writes each
+    token (the unique-writer mechanism); rests on `axiom_argsort_is_inverse_pair`.
+  - Ex06_ep/lean `l3_partial_output_zero_outside` — each rank writes only its
+    own contributing positions.
+  - Ex09 `k1a`/`k1c` (tile disjointness), `f3_empty_expert_no_rows`.
+
+**Goal 4 — Deadlock freedom** (matched collectives ⇒ global progress)
+- Block scope: `theorem_deadlock_free` (§7.2 wrapper).
+- **Substantive reduction (the only standalone goal file), `deadlock_free.rs`:**
+  `lemma_data_independent_implies_matched` (PROVED — a fixed, data-independent
+  schedule posts matched collectives on every rank) +
+  `axiom_matched_implies_no_deadlock` (TRUSTED — NCCL's collective-matching
+  substrate contract).
+- Per-component structural facts: Ex06_ep_pure EP6, Ex07 H5.
+
+**Audit note (what changed 2026-09-09).** RT4 and RT5 are now *proved*
+lemmas (not trusted axioms): RT5 is fully proved; RT4 rests only on
+`axiom_argsort_is_inverse_pair`. RT1 is now *unconditional*
+(`..._from_assignment`). The three block-scope packaging axioms —
+`axiom_variant_conserves_records` (§7.1), `axiom_variant_unique_writer`
+(§7.3), `axiom_variant_schedule_terminates` (§7.2) — are the trust points
+for the per-component → block lift; audit them against the per-component
+lemmas above.
+
+| Corollary | Where | Lemma |
+|-----------|-------|-------|
+| Same record count across variants | `composition_theorem.rs` §7.1 | `corollary_records_variant_invariant` |
 
 ### Routing / partitioning invariants (per-component)
 
@@ -164,7 +224,9 @@ Tier 3: 33). Re-verified 2026-09-09.
 | Sharding disjointness | Ex01, Ex06_ep_pure, Ex06_ep/lean | `c2_sharding_disjoint`, `ep1_expert_sharding_disjoint`, `l2_local_mask_disjoint` |
 | Sharding coverage | Ex06_ep_pure, Ex06_ep/lean | `ep2_expert_coverage`, `l2_local_mask_covers` |
 | Offset monotonicity | Ex05 | `rt2_offset_monotonicity`, `lemma_cumsum_monotone` |
-| Token conservation via offsets | Ex05, Ex09 | `rt1_token_conservation`, `f1_offsets_cover_range` |
+| Token conservation via offsets | Ex05, Ex09 | `rt1_token_conservation`, **`rt1_token_conservation_from_assignment`** (unconditional, via `lemma_bincount_sums_to_len`), `f1_offsets_cover_range` |
+| Routing partition correctness (block size = true count; catches v8/v10) | Ex05 | `rt5_block_size_matches_count`, `rt5_wrong_size_implies_wrong_offsets` (+ `lemma_cumsum_increment`) |
+| Permutation bijection / unique writer (slot↔token) | Ex05 | `rt4_perm_surjective`, `rt4_perm_injective`, `rt4_each_token_exactly_once` (modulo `axiom_argsort_is_inverse_pair`) |
 | Top-k weight normalization | Ex05 | `rt3_topk_weight_normalization` |
 | KV replication invariant | Ex04 | `g2_kv_replication_invariant` |
 | Weight-loader postcondition (each variant) | Ex01, Ex02, Ex03, Ex04 | `c3_weight_loader_postcondition`, `m1_merged_weight_loader_postcondition`, `q1_qkv_weight_loader_postcondition`, `g4_gqa_weight_loader_postcondition` |
@@ -203,8 +265,11 @@ a well-known mathematical fact.
 | `axiom_naive_refines_spec` | `naive_equiv_fused_moe.rs` | Ex05 E1 — NaiveSparseMoE refines moe_spec_pointwise |
 | `axiom_permuted_refines_spec` | `naive_equiv_fused_moe.rs`, `composition_theorem.rs` | Ex05 E2 — PermutedSparseMoE refines moe_spec_pointwise |
 | `axiom_fused_refines_spec` | `naive_equiv_fused_moe.rs`, `composition_theorem.rs` | Ex09 F4 — fused Triton kernel refines moe_spec_pointwise |
-| `axiom_variant_conserves_records` | `composition_theorem.rs` §7.1 | any variant preserves records_out == records_in * top_k |
+| `axiom_variant_conserves_records` | `composition_theorem.rs` §7.1 | any variant preserves records_out == records_in * top_k (block-scope packaging of Completeness+Disjointness) |
+| `axiom_variant_unique_writer` | `composition_theorem.rs` §7.3 | any variant maintains the unique-writer invariant (block-scope packaging of data-race freedom) |
 | `axiom_variant_schedule_terminates` | `composition_theorem.rs` §7.2 | any variant's collective schedule terminates deadlock-free |
+| `axiom_matched_implies_no_deadlock` | `deadlock_free.rs` | matched collectives on every rank ⇒ no deadlock (NCCL substrate contract) |
+| `axiom_argsort_is_inverse_pair` | `moe_baseline.rs` (RT4) | argsort returns a permutation of [0,M) with a computable inverse (library-sort property) |
 | `axiom_variant_unique_writer` | `composition_theorem.rs` §7.3 | any variant maintains the unique-writer invariant (the mechanism for data-race freedom) |
 
 ### Per-component stubs (deferred proofs)
