@@ -24,6 +24,7 @@
 //   verus --crate-type=lib verus/naive_equiv_fused_moe.rs
 
 use vstd::prelude::*;
+use vstd::multiset::Multiset;
 
 verus! {
 
@@ -31,19 +32,31 @@ verus! {
 // §1 — Types.
 // =====================================================================
 
-pub struct Tensor {
-    pub content: Seq<int>,
-}
-
 pub type TokenId = nat;
 pub type ExpertId = nat;
 
+/// A MoE-layer output, modeled by the multiset of weighted per-expert
+/// contributions it aggregates (see composition_theorem.rs). `content`
+/// is kept only for shape; the equivalence relation compares `contribs`.
+pub struct Contribution {
+    pub token: TokenId,
+    pub expert: ExpertId,
+    pub weight: int,
+}
+
+pub struct Tensor {
+    pub content: Seq<int>,
+    pub contribs: Multiset<Contribution>,
+}
+
 // =====================================================================
-// §2 — approx_eq (shared with the other composition file).
+// §2 — approx_eq: equality of the contribution multiset (exact in the
+// abstract model; (atol, rtol) annotate the numerical interpretation and
+// are inert in the proof).
 // =====================================================================
 
 pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
-    x.content.len() == y.content.len()
+    x.contribs == y.contribs
 }
 
 pub proof fn lemma_approx_eq_refl(x: Tensor, atol: nat, rtol: nat)

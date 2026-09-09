@@ -64,6 +64,21 @@ by the definition of `bincount(sorted_expert_ids, minlength=num_experts)`
 and `cumsum`, the final offset equals the sum of counts, which equals the
 length of `sorted_expert_ids`, which equals `N * top_k`.
 
+**Unconditional form (`rt1_token_conservation_from_assignment`).** The base
+`rt1_token_conservation` *assumes* the sum-of-counts equals the total (a
+`requires`). That premise is itself the "nothing falls through the cracks"
+fact — every one of the `N·top_k` assignments is counted in exactly one bin.
+We now *prove* it: `lemma_bincount_sums_to_len` shows that for any assignment
+whose ids are all valid (`< num_experts`), the per-expert bincount sums to
+the number of assignments (each token contributes 1 to exactly one bin;
+proved by induction, via `lemma_seq_sum_pointwise_add` splitting the sum into
+an indicator for the head token — `lemma_indicator_sum`, sums to 1 — plus the
+tail). Wiring this into RT1 gives
+`offsets_of(assignment).last() == assignment.len()` with **no assumed
+premise**: model-level conservation now rests only on "expert ids are in
+range," not on an assumption that the counts already sum correctly. (The
+remaining slot→token gap is RT4, the sort bijection, still unmechanized.)
+
 ### RT2 — Offset monotonicity
 
 $$
@@ -95,9 +110,59 @@ $$
 \{\text{sort\_perm}[p] : p \in [0, N \cdot \text{top\_k})\} = [0, N \cdot \text{top\_k})
 $$
 
-**Proof**: any sort produces a permutation; the abstract model captures
-this by axiomatizing `argsort` to return a permutation. Formally, we prove
-via `Seq::to_multiset` equality.
+**Proof (mechanized).** We model the sort permutation `sort_perm` and its
+inverse `sort_inv` as a two-sided **inverse pair** (`is_inverse_pair`):
+`inv[perm[p]] == p` and `perm[inv[q]] == q`. That `argsort` returns such a
+pair is the one trusted axiom (`axiom_argsort_is_inverse_pair` — a property
+of the library sort, in the same spirit as matmul being uninterpreted). From
+the inverse equations we **prove** the bijection consequences:
+- `rt4_perm_surjective` — every token `q` is the image of slot `inv[q]`
+  (`perm[inv[q]] == q`), so scatter-back reaches every token: **none dropped**.
+- `rt4_perm_injective` — `perm[p1] == perm[p2] ⟹ p1 == p2`, so **no token is
+  written twice**.
+- `rt4_each_token_exactly_once` — combines them: each token has exactly one
+  slot mapping to it.
+
+Together with RT1/RT5 (which conserve and correctly size the *slots*), RT4 is
+the slot→token link: the gather/scatter round-trip processes and returns
+every routed token exactly once. This is the piece that was previously only
+described; it is now mechanized (modulo the argsort-is-a-permutation axiom).
+
+### RT5 — Routing partition correctness (block sizes match true counts)
+
+RT1 and RT2 constrain the offsets only *structurally* — they hold for any
+monotone array with the right endpoint, so they do not pin which tokens
+land in which expert's block. RT5 pins the block **sizes** to the true
+per-expert routing counts. Let `count_at(assignment, e)` be the number of
+tokens routed to expert `e`, and let the correctly-constructed offsets be
+`offsets_of(assignment, E) = cumsum([count_at(assignment, e)])`. Then for
+every expert `e`:
+
+$$
+\text{offsets\_of}[e{+}1] - \text{offsets\_of}[e] = \text{count\_at}(\text{assignment}, e)
+$$
+
+**Proof** (`rt5_block_size_matches_count`): from the cumsum increment lemma
+`cumsum(c)[i+1] == cumsum(c)[i] + c[i]` (`lemma_cumsum_increment`, by
+induction) applied to `counts_of`.
+
+**Why it matters — bug detection** (`rt5_wrong_size_implies_wrong_offsets`):
+the contrapositive says any offset array whose block `e` has the wrong size
+is *not* `offsets_of` — so a differential check of the runtime offsets
+against `cumsum(bincount(assignment))` at the dispatch seam rejects it.
+This is exactly what catches the two structural routing bugs that pass both
+the end-to-end benchmark and RT1/RT2:
+
+- **v8** (off-by-one at the last expert, `offsets[-2] += 1`): block `E-2`
+  gains a row and block `E-1` loses one — both sizes diverge from their
+  true counts. Rejected.
+- **v10** (collapsed last block, `offsets[-2] = offsets[-1]`): block `E-1`
+  becomes empty and `E-2` absorbs its rows — both sizes wrong. Rejected.
+
+Both preserve RT1 (`offsets.last()` unchanged) and RT2 (still monotone), so
+neither RT1/RT2 nor an accuracy benchmark flags them; RT5 is the invariant
+that does. RT5 catches the block-**size** class (boundary corruption); the
+complementary sort-content bijection is RT4.
 
 ## Properties to verify — equivalence to abstract spec
 

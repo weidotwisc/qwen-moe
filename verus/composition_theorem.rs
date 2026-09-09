@@ -32,23 +32,52 @@
 //   verus --crate-type=lib verus/composition_theorem.rs
 
 use vstd::prelude::*;
+use vstd::multiset::Multiset;
 
 verus! {
 
 // =====================================================================
 // §1 — Types (abstract, shared with all Tier-3 composition files).
+//
+// A MoE-layer output is modeled by the MULTISET of weighted per-expert
+// contributions it aggregates. A single contribution says "token `token`
+// receives expert `expert`'s output scaled by (integer-encoded) weight
+// `weight`". Because summation over a multiset is order-independent, two
+// outputs built from the SAME multiset of contributions are equal in
+// exact arithmetic --- they can differ only in the floating-point order
+// of summation and in bf16 rounding, which is the tested tolerance and
+// is NOT modeled here (see the paper's §"Functional equivalence" and the
+// numerics-aware-verification future-work item).
 // =====================================================================
+
+pub struct Contribution {
+    pub token: nat,
+    pub expert: nat,
+    pub weight: int,
+}
 
 pub struct Tensor {
     pub content: Seq<int>,
+    /// The multiset of weighted per-expert contributions aggregated into
+    /// this output. This is the semantic content the equivalence relation
+    /// compares; `content` is kept only for shape.
+    pub contribs: Multiset<Contribution>,
 }
 
 // =====================================================================
-// §2 — approx_eq (shared vocabulary).
+// §2 — approx_eq: equality of the contribution multiset.
+//
+// `approx_eq(x, y, atol, rtol)` holds iff x and y aggregate the SAME
+// multiset of weighted contributions. This is EXACT (tolerance-free) in
+// the abstract model: the (atol, rtol) parameters are carried only to
+// annotate the numerical interpretation --- the reduction-order / bf16
+// gap that separates "same multiset" from "same float bits" --- and are
+// deliberately inert in the proof, that gap being validated empirically
+// by the test suite rather than proved here.
 // =====================================================================
 
 pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
-    x.content.len() == y.content.len()
+    x.contribs == y.contribs
 }
 
 pub proof fn lemma_approx_eq_refl(x: Tensor, atol: nat, rtol: nat)

@@ -29,6 +29,7 @@
 //   verus --crate-type=lib verus/lean_equiv_hybrid_dp1.rs
 
 use vstd::prelude::*;
+use vstd::multiset::Multiset;
 
 verus! {
 
@@ -40,19 +41,29 @@ pub type Rank = nat;
 pub type ExpertId = nat;
 pub type Group = Set<Rank>;
 
-/// Semantic content of a tensor at abstract-model level. We use `int` for
-/// content (as everywhere else in the per-component proofs); numerical
-/// content is deliberately opaque.
+/// A MoE-layer output, modeled by the multiset of weighted per-expert
+/// contributions it aggregates (see composition_theorem.rs for the full
+/// note). `content` is kept only for shape; the equivalence relation
+/// compares `contribs`.
+pub struct Contribution {
+    pub token: nat,
+    pub expert: nat,
+    pub weight: int,
+}
+
 pub struct Tensor {
     pub content: Seq<int>,
+    pub contribs: Multiset<Contribution>,
 }
 
 // =====================================================================
-// §2 — approx_eq (shared with verus/axiom_base.rs).
+// §2 — approx_eq: equality of the contribution multiset (exact in the
+// abstract model; the (atol, rtol) parameters annotate the numerical
+// interpretation and are inert in the proof).
 // =====================================================================
 
 pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
-    x.content.len() == y.content.len()
+    x.contribs == y.contribs
 }
 
 /// Reflexivity: any tensor is approx_eq to itself.

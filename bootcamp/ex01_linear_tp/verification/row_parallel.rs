@@ -28,7 +28,6 @@
 // the semi-formal spec these lemmas realize.
 
 use vstd::prelude::*;
-use vstd::calc;
 use vstd::arithmetic::div_mod::lemma_fundamental_div_mod;
 
 verus! {

@@ -4,8 +4,12 @@
 efficiently. Written by Claude (AI drafter). Wei has read this and
 signed off on the structure; Jun is the auditor of record.
 
-**Status at time of writing** (2026-09-01):
-- **143 verified lemmas, 0 errors** across **15 Verus files**.
+**Status** (updated 2026-09-09):
+- **156 verified lemmas, 0 errors** across **16 Verus files**.
+  (Was 143/15 on 2026-09-01; +2 = `deadlock_free.rs`; +3 = C5 RT5
+  routing-partition-correctness; +5 = C5 unconditional conservation
+  (`lemma_bincount_sums_to_len` + helpers); +3 = C5 RT4 permutation
+  bijection (`rt4_*`), all 2026-09-09.)
 - All files typecheck against Verus 0.2025.07.12.0b6f3cb.
 - Every proof has been drafted by Claude in this session; Jun's audit
   is the human-verification step of the paper's methodology contribution.
@@ -48,13 +52,13 @@ math. Read `PROPERTIES.md` first, then the `.rs`.
 | Ex02 mlp_tp | `mlp_tp.rs` | 13 | M1-M3 merged column + T1-T3 SwiGLU composition | AXIOM_M1, AXIOM_M2, AXIOM_S1 |
 | Ex03 mha_tp | `mha_tp.rs` | 13 | Q1-Q4 QKV column + A1-A2 attention composition | AXIOM_M1, AXIOM_ATTN_HEAD_LOCAL |
 | Ex04 gqa_tp | `gqa_tp.rs` | 11 | G1-G4 GQA + R1 KV-replication invariants | AXIOM_RI1 (repeat_interleave) |
-| Ex05 moe_baseline | `moe_baseline.rs` | 13 | RT1-RT3 routing invariants + E1/E2 stubs | AXIOM_SOFTMAX_SUM |
+| Ex05 moe_baseline | `moe_baseline.rs` | 24 | RT1-RT3 routing invariants + RT5 partition-size correctness (catches v8/v10) + unconditional conservation (`lemma_bincount_sums_to_len` discharges RT1's assumed sum premise) + RT4 permutation bijection (slot->token, modulo argsort-is-permutation axiom) + E1/E2 stubs | AXIOM_SOFTMAX_SUM, AXIOM_ARGSORT_INVERSE |
 | Ex06_ep_pure | `ep_pure.rs` | 8 | EP1-EP4 expert-partition + dispatch symmetry | AXIOM_A2A_COUNT_SYMMETRIC |
 | Ex06_ep (lean) | `lean.rs` | 7 | L2 disjointness + L2-covers + L3/L5 | AXIOM_ALLREDUCE_SUM_REPLICATED |
 | Ex07 tp_ep_hybrid | `hybrid.rs` | 3 | H2 striping determinism (rest stubbed) | tensor_on opaque |
 | Ex09 fused_moe (contract) | `fused_moe.rs` | 2 | F1 offset coverage + F3 empty-expert | expert_apply opaque |
 | Ex09 fused_moe (DSL) | `fused_kernel_dsl.rs` | 13 | K1a/K1b/K1c tile coverage + K3 derived correctness | AXIOM_MATMUL_SPLITS_OVER_K |
-| **Subtotal** | | **108** | | |
+| **Subtotal** | | **119** | | |
 
 **Ex01 detail** — the paper's exemplar per-component proof. Read
 [`bootcamp/ex01_linear_tp/verification/PROPERTIES.md`](../bootcamp/ex01_linear_tp/verification/PROPERTIES.md)
@@ -77,22 +81,38 @@ Contribution 3.
 approx_eq predicate and its three lemmas (refl / sym / trans); trusted
 axioms for `broadcast` and `all_reduce`.
 
-**Audit question**: is `approx_eq` defined too weakly? At present it's
-shape+dtype-only. Downstream contracts treat it as opaque and never
-unfold its definition, so this is fine for the meta-theorem — but the
-paper's threats-to-validity section should note that a fully-numerical
-`approx_eq` would strengthen the claim.
+**`approx_eq` (the equivalence relation).** `approx_eq(x, y, atol, rtol)`
+is defined as `x.contribs == y.contribs`: equality of the *multiset of
+weighted per-expert contributions* `{(token, expert, weight)}` the two
+tensors aggregate. This is the same definition in all four base/composition
+files (`axiom_base.rs`, `composition_theorem.rs`, `lean_equiv_hybrid_dp1.rs`,
+`naive_equiv_fused_moe.rs`). It is deliberately EXACT: because summation
+over a multiset is order-independent, equal contribution multisets imply
+equality in exact arithmetic. The `(atol, rtol)` parameters are inert —
+they annotate the reduction-order / bf16-rounding gap between "same
+multiset" and "same float bits", which is validated by the test suite,
+not proved (see `future_work.tex`, "Numerics-aware verification").
+
+**Audit question**: the relation is exact-arithmetic, not numerical.
+Confirm that (a) the multiset relation is the right semantic content for
+the equivalence claim (two schedules/kernels that build the same
+contribution multiset), and (b) that treating the fp tolerance as inert —
+tested rather than proved — is stated honestly wherever the paper says
+"functionally equivalent" (see micro\_benchmark.tex §"Functional
+equivalence"). NOTE: this replaces an earlier shape+dtype-only definition;
+the git history shows the strengthening.
 
 ### 2.3 Composition + safety theorems (Tier 3)
 
-Three files at the repo-level `verus/` directory.
+Four files at the repo-level `verus/` directory.
 
 | File | Verified | What it proves |
 |------|---------:|----------------|
 | `lean_equiv_hybrid_dp1.rs` | 5 | Ex06_ep/lean ≡ Ex07 hybrid, under DP=1 |
 | `naive_equiv_fused_moe.rs` | 8 | Ex05 (naive & permuted) ≡ Ex09 fused |
 | `composition_theorem.rs` | 18 | Meta-theorem + 2 instances + 2×2 block corollary + 3 safety theorems |
-| **Subtotal** | **31** | |
+| `deadlock_free.rs` | 2 | Deadlock-freedom substrate reduction (proved) + NCCL-match axiom (trusted) |
+| **Subtotal** | **33** | |
 
 **The meta-theorem** (`composition_theorem.rs` §3,
 `theorem_shared_spec_implies_equiv`) is the paper's Contribution 2
@@ -102,7 +122,8 @@ INSTANCE of this meta-theorem — the paper's methodological point.
 
 ## 3. Grand total
 
-**130 verified lemmas, 0 errors, 14 files**.
+**156 verified lemmas, 0 errors, 16 files** (Tier 1: 119, Tier 2: 4,
+Tier 3: 33). Re-verified 2026-09-09.
 
 ## 4. Property matrix — what's actually proved
 
@@ -313,9 +334,17 @@ The paper's §Methodology section refers to these files:
 
 ## 8. Known limitations Jun should be aware of
 
-1. **`approx_eq` is shape-only at the Verus level.** Its actual numerical
-   content is not modeled; downstream lemmas treat it opaquely.
-   Strengthening to a fully-numerical predicate is future work.
+1. **`approx_eq` is exact-arithmetic, not numerical.** It is defined as
+   equality of the weighted-contribution multiset
+   (`x.contribs == y.contribs`), which implies equality in *exact*
+   arithmetic (multiset summation is order-independent). What it does NOT
+   model is the floating-point gap between "same multiset" and "same float
+   bits" — the schedule-dependent reduction order and bf16 rounding. The
+   `(atol, rtol)` parameters annotate that gap but are inert in the proof;
+   the concrete bounds (fp32 1e-5, bf16 5e-2) are pinned by the test suite,
+   not proved. Discharging them formally (e.g. FloVer/Gappa) is future work.
+   (This replaces the earlier shape+dtype-only definition — see git history
+   and micro\_benchmark.tex §"Functional equivalence".)
 2. **Every per-component "block correctness" (T3/A2/R3/H6/EP7/L6) is stubbed.**
    The Tier 3 composition theorems invoke these as axioms. Full
    mechanization is future work.

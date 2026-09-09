@@ -26,6 +26,7 @@
 // Verus version this was drafted against: 0.2025.07.12.0b6f3cb
 
 use vstd::prelude::*;
+use vstd::multiset::Multiset;
 
 verus! {
 
@@ -54,6 +55,22 @@ pub struct Tensor {
     pub shape: Seq<nat>,
     pub content: Seq<int>,
     pub dtype: DType,
+    /// The multiset of weighted per-expert contributions this tensor
+    /// aggregates, when it is a MoE-layer output. For tensors that are not
+    /// MoE outputs (weights, activations) this is the empty multiset; the
+    /// semantic equivalence relation `approx_eq` below compares it, so those
+    /// non-output tensors are related exactly when their (empty) multisets
+    /// agree. See composition_theorem.rs for the full note on why a shared
+    /// contribution multiset means equality in exact arithmetic.
+    pub contribs: Multiset<Contribution>,
+}
+
+/// A single weighted per-expert contribution: "token `token` receives
+/// expert `expert`'s output scaled by (integer-encoded) `weight`."
+pub struct Contribution {
+    pub token: nat,
+    pub expert: nat,
+    pub weight: int,
 }
 
 pub enum DType {
@@ -82,18 +99,26 @@ pub open spec fn well_formed(t: Tensor) -> bool {
 }
 
 // =========================================================================
-// (C) Approximate equality — the fp-tolerance predicate, TREATED AS AXIOM.
+// (C) Approximate equality — equality of the weighted-contribution multiset.
 //
-// We deliberately keep `approx_eq` opaque at this layer. Downstream contracts
-// compose it via named lemmas below; nobody unfolds its internal definition.
+// `approx_eq(x, y, atol, rtol)` holds iff x and y aggregate the SAME multiset
+// of weighted per-expert contributions. This is EXACT (tolerance-free) in the
+// abstract model: two outputs built from the same multiset of contributions
+// are equal in exact arithmetic, differing only in the floating-point order
+// of summation and bf16 rounding. That reduction-order / rounding gap is what
+// the (atol, rtol) parameters annotate — they are deliberately inert in the
+// proof and are validated empirically by the test suite (see the paper's
+// "Functional equivalence" section and the numerics-aware-verification
+// future-work item). Downstream contracts compose it via the named lemmas
+// below (refl / trans / sym); the definition is identical to the one used in
+// the composition files (composition_theorem.rs, lean_equiv_hybrid_dp1.rs,
+// naive_equiv_fused_moe.rs).
 // =========================================================================
 
-/// Approximate equality of two tensors under (atol, rtol) tolerance.
-/// Opaque: downstream contracts use the lemmas below rather than the definition.
+/// Approximate equality of two tensors: equality of their weighted-
+/// contribution multisets. Downstream contracts use the lemmas below.
 pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
-    &&& x.shape == y.shape
-    &&& x.dtype == y.dtype
-    &&& x.content.len() == y.content.len()
+    x.contribs == y.contribs
 }
 
 /// Reflexivity: every well-formed tensor is approx_eq to itself.
