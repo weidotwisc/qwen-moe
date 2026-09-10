@@ -5,9 +5,8 @@
 // instantiations for the compositions the paper cares about.
 //
 // The meta-theorem says: for any two implementations A and B that both
-// refine a shared semantic spec S up to declared floating-point
-// tolerance, A and B produce approx_eq outputs to each other. This is a
-// direct application of approx_eq transitivity.
+// refine a shared semantic spec S, A and B produce semantically equal
+// outputs. This is a direct application of semantic_eq transitivity.
 //
 // Every specific composition theorem in the paper's artifact is an
 // INSTANCE of this meta-theorem:
@@ -26,7 +25,7 @@
 //
 // A block-level corollary states that a Qwen3-MoE-block assembled from
 // any certified choice of subcomponent variants produces output
-// approx_eq to the single-GPU reference block.
+// semantically equal to the single-GPU reference block.
 //
 // Run with:
 //   verus --crate-type=lib verus/composition_theorem.rs
@@ -43,11 +42,8 @@ verus! {
 // contributions it aggregates. A single contribution says "token `token`
 // receives expert `expert`'s output scaled by (integer-encoded) weight
 // `weight`". Because summation over a multiset is order-independent, two
-// outputs built from the SAME multiset of contributions are equal in
-// exact arithmetic --- they can differ only in the floating-point order
-// of summation and in bf16 rounding, which is the tested tolerance and
-// is NOT modeled here (see the paper's §"Functional equivalence" and the
-// numerics-aware-verification future-work item).
+// outputs built from the SAME multiset of contributions have the same
+// semantics.
 // =====================================================================
 
 pub struct Contribution {
@@ -65,48 +61,34 @@ pub struct Tensor {
 }
 
 // =====================================================================
-// §2 — approx_eq: equality of the contribution multiset.
-//
-// `approx_eq(x, y, atol, rtol)` holds iff x and y aggregate the SAME
-// multiset of weighted contributions. This is EXACT (tolerance-free) in
-// the abstract model: the (atol, rtol) parameters are carried only to
-// annotate the numerical interpretation --- the reduction-order / bf16
-// gap that separates "same multiset" from "same float bits" --- and are
-// deliberately inert in the proof, that gap being validated empirically
-// by the test suite rather than proved here.
+// §2 — Semantic equality: equality of the contribution multiset.
 // =====================================================================
 
-pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
+pub open spec fn semantic_eq(x: Tensor, y: Tensor) -> bool {
     x.contribs == y.contribs
 }
 
-pub proof fn lemma_approx_eq_refl(x: Tensor, atol: nat, rtol: nat)
-    ensures approx_eq(x, x, atol, rtol),
+pub proof fn lemma_semantic_eq_refl(x: Tensor)
+    ensures semantic_eq(x, x),
 {}
 
-pub proof fn lemma_approx_eq_sym(x: Tensor, y: Tensor, atol: nat, rtol: nat)
-    requires approx_eq(x, y, atol, rtol),
-    ensures approx_eq(y, x, atol, rtol),
+pub proof fn lemma_semantic_eq_sym(x: Tensor, y: Tensor)
+    requires semantic_eq(x, y),
+    ensures semantic_eq(y, x),
 {}
 
-pub proof fn lemma_approx_eq_trans(
-    x: Tensor, y: Tensor, z: Tensor,
-    a1: nat, r1: nat, a2: nat, r2: nat,
-)
+pub proof fn lemma_semantic_eq_trans(x: Tensor, y: Tensor, z: Tensor)
     requires
-        approx_eq(x, y, a1, r1),
-        approx_eq(y, z, a2, r2),
-    ensures approx_eq(x, z, a1 + a2, r1 + r2),
+        semantic_eq(x, y),
+        semantic_eq(y, z),
+    ensures semantic_eq(x, z),
 {}
 
 // =====================================================================
 // §3 — THE META-THEOREM.
 //
 // Given ANY two implementations A_out and B_out that refine a shared
-// spec S_out up to declared floating-point tolerances (atol_A, rtol_A)
-// and (atol_B, rtol_B) respectively, A_out and B_out produce approx_eq
-// outputs to each other with widened tolerance (atol_A + atol_B, rtol_A
-// + rtol_B).
+// spec S_out, A_out and B_out produce semantically equal outputs.
 //
 // This is the entire content of the paper's Contribution 2. Every
 // specific composition theorem in the paper's artifact is an INSTANCE
@@ -117,21 +99,15 @@ pub proof fn theorem_shared_spec_implies_equiv(
     a_out: Tensor,
     b_out: Tensor,
     s_out: Tensor,
-    atol_a: nat, rtol_a: nat,
-    atol_b: nat, rtol_b: nat,
 )
     requires
-        approx_eq(a_out, s_out, atol_a, rtol_a),
-        approx_eq(b_out, s_out, atol_b, rtol_b),
+        semantic_eq(a_out, s_out),
+        semantic_eq(b_out, s_out),
     ensures
-        approx_eq(a_out, b_out, atol_a + atol_b, rtol_a + rtol_b),
+        semantic_eq(a_out, b_out),
 {
-    lemma_approx_eq_sym(b_out, s_out, atol_b, rtol_b);
-    lemma_approx_eq_trans(
-        a_out, s_out, b_out,
-        atol_a, rtol_a,
-        atol_b, rtol_b,
-    );
+    lemma_semantic_eq_sym(b_out, s_out);
+    lemma_semantic_eq_trans(a_out, s_out, b_out);
 }
 
 // =====================================================================
@@ -146,37 +122,25 @@ pub proof fn theorem_shared_spec_implies_equiv(
 pub uninterp spec fn moe_forward_spec(x: Tensor) -> Tensor;
 pub uninterp spec fn lean_forward(x: Tensor) -> Tensor;
 pub uninterp spec fn hybrid_forward(x: Tensor) -> Tensor;
-pub uninterp spec fn atol_lean() -> nat;
-pub uninterp spec fn rtol_lean() -> nat;
-pub uninterp spec fn atol_hybrid() -> nat;
-pub uninterp spec fn rtol_hybrid() -> nat;
 
 #[verifier::external_body]
 pub proof fn axiom_lean_refines_spec(x: Tensor)
-    ensures approx_eq(lean_forward(x), moe_forward_spec(x),
-                      atol_lean(), rtol_lean()),
+    ensures semantic_eq(lean_forward(x), moe_forward_spec(x)),
 {}
 
 #[verifier::external_body]
 pub proof fn axiom_hybrid_refines_spec(x: Tensor)
-    ensures approx_eq(hybrid_forward(x), moe_forward_spec(x),
-                      atol_hybrid(), rtol_hybrid()),
+    ensures semantic_eq(hybrid_forward(x), moe_forward_spec(x)),
 {}
 
 /// Instance 1 of the meta-theorem.
 pub proof fn theorem_lean_equiv_hybrid(x: Tensor)
-    ensures approx_eq(
-        lean_forward(x), hybrid_forward(x),
-        atol_lean() + atol_hybrid(),
-        rtol_lean() + rtol_hybrid(),
-    ),
+    ensures semantic_eq(lean_forward(x), hybrid_forward(x)),
 {
     axiom_lean_refines_spec(x);
     axiom_hybrid_refines_spec(x);
     theorem_shared_spec_implies_equiv(
         lean_forward(x), hybrid_forward(x), moe_forward_spec(x),
-        atol_lean(), rtol_lean(),
-        atol_hybrid(), rtol_hybrid(),
     );
 }
 
@@ -186,37 +150,25 @@ pub proof fn theorem_lean_equiv_hybrid(x: Tensor)
 
 pub uninterp spec fn permuted_forward(x: Tensor) -> Tensor;
 pub uninterp spec fn fused_forward(x: Tensor) -> Tensor;
-pub uninterp spec fn atol_permuted() -> nat;
-pub uninterp spec fn rtol_permuted() -> nat;
-pub uninterp spec fn atol_fused() -> nat;
-pub uninterp spec fn rtol_fused() -> nat;
 
 #[verifier::external_body]
 pub proof fn axiom_permuted_refines_spec(x: Tensor)
-    ensures approx_eq(permuted_forward(x), moe_forward_spec(x),
-                      atol_permuted(), rtol_permuted()),
+    ensures semantic_eq(permuted_forward(x), moe_forward_spec(x)),
 {}
 
 #[verifier::external_body]
 pub proof fn axiom_fused_refines_spec(x: Tensor)
-    ensures approx_eq(fused_forward(x), moe_forward_spec(x),
-                      atol_fused(), rtol_fused()),
+    ensures semantic_eq(fused_forward(x), moe_forward_spec(x)),
 {}
 
 /// Instance 2 of the meta-theorem.
 pub proof fn theorem_permuted_equiv_fused(x: Tensor)
-    ensures approx_eq(
-        permuted_forward(x), fused_forward(x),
-        atol_permuted() + atol_fused(),
-        rtol_permuted() + rtol_fused(),
-    ),
+    ensures semantic_eq(permuted_forward(x), fused_forward(x)),
 {
     axiom_permuted_refines_spec(x);
     axiom_fused_refines_spec(x);
     theorem_shared_spec_implies_equiv(
         permuted_forward(x), fused_forward(x), moe_forward_spec(x),
-        atol_permuted(), rtol_permuted(),
-        atol_fused(), rtol_fused(),
     );
 }
 
@@ -230,11 +182,7 @@ pub proof fn theorem_permuted_equiv_fused(x: Tensor)
 //   out      = attn_out + moe_out             [residual]
 //
 // The block-level claim: any certified choice of MoE_variant produces
-// the same block-level output up to accumulated approx_eq tolerance.
-//
-// This is a direct chain of two meta-theorem applications: one for the
-// schedule choice, one for the kernel choice. Total tolerance
-// accumulates additively.
+// the same semantic block-level output.
 // =====================================================================
 
 /// The block-level forward output, parameterized by the two variant choices.
@@ -247,8 +195,6 @@ pub uninterp spec fn block_forward(
 /// Two block-level variants that both refine a single "block spec".
 /// Their equivalence follows from the two instance theorems above.
 pub uninterp spec fn block_spec(x: Tensor) -> Tensor;
-pub uninterp spec fn atol_block() -> nat;
-pub uninterp spec fn rtol_block() -> nat;
 
 /// AXIOM: each of the four block-variant configurations refines the
 /// same block_spec. Follows from composing the per-schedule and
@@ -258,25 +204,22 @@ pub uninterp spec fn rtol_block() -> nat;
 pub proof fn axiom_block_variant_refines_spec(
     x: Tensor, use_lean: bool, use_fused: bool,
 )
-    ensures approx_eq(
+    ensures semantic_eq(
         block_forward(x, use_lean, use_fused),
         block_spec(x),
-        atol_block(), rtol_block(),
     ),
 {}
 
 /// BLOCK-LEVEL COROLLARY: any two block-variant configurations produce
-/// approx_eq outputs.
+/// semantically equal outputs.
 pub proof fn corollary_block_variants_equivalent(
     x: Tensor,
     use_lean_a: bool, use_fused_a: bool,
     use_lean_b: bool, use_fused_b: bool,
 )
-    ensures approx_eq(
+    ensures semantic_eq(
         block_forward(x, use_lean_a, use_fused_a),
         block_forward(x, use_lean_b, use_fused_b),
-        atol_block() + atol_block(),
-        rtol_block() + rtol_block(),
     ),
 {
     axiom_block_variant_refines_spec(x, use_lean_a, use_fused_a);
@@ -285,8 +228,6 @@ pub proof fn corollary_block_variants_equivalent(
         block_forward(x, use_lean_a, use_fused_a),
         block_forward(x, use_lean_b, use_fused_b),
         block_spec(x),
-        atol_block(), rtol_block(),
-        atol_block(), rtol_block(),
     );
 }
 
@@ -461,35 +402,29 @@ pub proof fn theorem_data_race_free(
 
 pub proof fn smoke_meta_theorem(a: Tensor, b: Tensor, s: Tensor)
     requires
-        approx_eq(a, s, 1nat, 1nat),
-        approx_eq(b, s, 1nat, 1nat),
-    ensures approx_eq(a, b, 2nat, 2nat),
+        semantic_eq(a, s),
+        semantic_eq(b, s),
+    ensures semantic_eq(a, b),
 {
-    theorem_shared_spec_implies_equiv(a, b, s, 1nat, 1nat, 1nat, 1nat);
+    theorem_shared_spec_implies_equiv(a, b, s);
 }
 
 pub proof fn smoke_instance_1(x: Tensor)
-    ensures approx_eq(lean_forward(x), hybrid_forward(x),
-                      atol_lean() + atol_hybrid(),
-                      rtol_lean() + rtol_hybrid()),
+    ensures semantic_eq(lean_forward(x), hybrid_forward(x)),
 {
     theorem_lean_equiv_hybrid(x);
 }
 
 pub proof fn smoke_instance_2(x: Tensor)
-    ensures approx_eq(permuted_forward(x), fused_forward(x),
-                      atol_permuted() + atol_fused(),
-                      rtol_permuted() + rtol_fused()),
+    ensures semantic_eq(permuted_forward(x), fused_forward(x)),
 {
     theorem_permuted_equiv_fused(x);
 }
 
 pub proof fn smoke_block(x: Tensor)
-    ensures approx_eq(
+    ensures semantic_eq(
         block_forward(x, true, true),   // lean + fused
         block_forward(x, false, false), // hybrid + python-loop
-        atol_block() + atol_block(),
-        rtol_block() + rtol_block(),
     ),
 {
     corollary_block_variants_equivalent(x, true, true, false, false);
