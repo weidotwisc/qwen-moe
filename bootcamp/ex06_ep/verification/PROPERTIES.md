@@ -120,19 +120,18 @@ axiom base).
 
 ### L6 — Refinement to MoE_spec
 
-For every token index `i` on any rank:
+For every token index `i` on any rank, in the shared exact model:
 
 $$
-\text{output}[i] \approx_{\text{atol,rtol}} \text{MoE\_spec}(x, W, g, k)[i]
+\text{output}[i] = \text{MoE\_spec}(x, W, g, k)[i]
 $$
 
 **Proof composition**: L4 (sum equals MoE_spec RHS pointwise) + L5
-(all_reduce sum is replicated on every rank). Up to `approx_eq`
-tolerance because the summation order in `all_reduce` may differ from
-the reference oracle's natural order.
-
-Stated as a stub — full mechanization requires the composition machinery
-also used by Ex06_ep_pure's EP7.
+(all_reduce sum is replicated on every rank). L4 and L6 are mechanized in
+`verus/schedule_refinement.rs` as
+`theorem_rank_local_partials_sum_to_moe_spec` and
+`l6_all_reduce_refines_spec`. Floating-point runtime correspondence is outside
+this exact integer model.
 
 ## What each tool proves — this exercise
 
@@ -155,16 +154,17 @@ Same three-tool pattern as Ex01-07/Ex09. Verus proof shipped first.
 
 ## The paper's composition-theorem claim (sketch)
 
-Combining Ex06_ep_pure's EP7 (dispatch-based routing correctness) with
-this file's L6 (lean-based routing correctness), the paper's composition
+Combining the shared EP7 dispatch/compute/combine refinement with the shared
+L6 all-reduce refinement, the paper's composition
 theorem states:
 
 > **Under the precondition `Replicated(x, ep_group)`, the lean variant
-> and the dispatch variant produce outputs that are `approx_eq` to each
-> other. Both refine the same `MoE_spec` up to tolerance.**
+> and the dispatch variant produce equal outputs in the exact model.
+> Both refine the same `MoE_spec`.**
 
 This is the equivalence claim the paper's Contribution 2 rests on. Its
-full mechanization composes L1-L6 (this file) with EP1-EP7 (Ex06_ep_pure).
+mechanization lives in `verus/schedule_refinement.rs`; correspondence of the
+collective APIs to the shared model remains an audited boundary.
 
 ## Correctness of the abstraction
 

@@ -6,9 +6,11 @@
 //   EP2 (expert coverage)
 //   EP3 (dispatch symmetry via axiom on all_to_all_single count negotiation)
 //   EP4 (token conservation across dispatch)
-//   EP5 stubbed (dispatch-and-combine round-trip)
+//   EP5 (dispatch-and-combine round-trip) is proved over the shared record
+//       model in verus/schedule_refinement.rs.
 //   EP6 stubbed (deadlock-freedom structural property)
-//   EP7 stubbed (routing correctness, composition of RT1-RT3 + EP1-EP5)
+//   EP7's exact routing refinement is proved over the shared work-item model
+//       in verus/schedule_refinement.rs.
 //
 // Focus: expert partitioning + all_to_all count-symmetry invariants.
 //
@@ -177,15 +179,6 @@ pub proof fn ep4_token_conservation_pairwise(ep_size: nat, i: Rank, j: Rank)
 }
 
 // =====================================================================
-// §8 — Property EP5: dispatch-and-combine round-trip (external stub).
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn ep5_round_trip_stub()
-    ensures true,
-{}
-
-// =====================================================================
 // §9 — Property EP6: deadlock-freedom (external, structural).
 //
 // The schedule is a straight-line sequence of collective calls, identical
@@ -195,20 +188,6 @@ pub proof fn ep5_round_trip_stub()
 
 #[verifier::external_body]
 pub proof fn ep6_deadlock_free_stub()
-    ensures true,
-{}
-
-// =====================================================================
-// §10 — Property EP7: routing correctness (external stub).
-//
-// The full EPSparseMoE.forward output matches MoE_spec on the per-rank
-// token slice, up to approx_eq tolerance. Composes RT1-RT3 (Ex05) with
-// EP1-EP5. Requires modeling the abstract post-condition of
-// all_to_all_variable; deferred to future work.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn ep7_routing_correctness_stub()
     ensures true,
 {}
 

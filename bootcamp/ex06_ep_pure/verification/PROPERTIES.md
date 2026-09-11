@@ -84,7 +84,12 @@ Each rank r sends `sum(send_sizes(r))` records in dispatch and receives
 `sum(send_sizes(r))` records in combine (the reverse dispatch). Combined,
 the round-trip preserves every original `(token, expert)` pair.
 
-**Proof**: EP3 + EP4 + the reverse-dispatch swap that `combine` performs.
+**Proof**: mechanized in
+`verus/schedule_refinement.rs::theorem_all_to_all_dispatch_compute_combine_round_trip`.
+The global record model proves that dispatch moves each record to its expert
+owner, local compute preserves its identity, and combine returns the same
+record and value to its token source.  Count symmetry and the collective's
+record-transfer semantics are the audited Python/API boundary.
 
 ### EP6 — Deadlock-freedom
 
@@ -102,16 +107,15 @@ as a structural property of the abstract program.
 ### EP7 — Routing correctness (inherited from Ex05)
 
 The output of `EPSparseMoE.forward(local_x)` on rank `r` equals the
-per-rank slice of `MoE_spec(x_full, W, g, k)`, up to `approx_eq` tolerance
-— provided the dispatch-then-compute-then-combine schedule preserves
-token conservation (EP4) and per-rank expert-set disjointness (EP1, EP2).
+per-rank slice of the exact shared `MoE_spec(x_full, W, g, k)` — provided
+the dispatch-then-compute-then-combine schedule preserves token conservation
+(EP4) and per-rank expert-set disjointness (EP1, EP2).
 
-**Proof**: composition of EP1-EP5 with Ex05's E1 (per-expert local
-compute correctness) and RT1-RT3 (routing invariants).
-
-Stated as a stub — the full mechanization requires modeling the abstract
-data-content post-condition of `all_to_all_variable`, which is a
-substantial addition to the axiom base.
+**Proof**: the shared model composes the explicit EP5 record round trip with
+the routing permutation and exact per-record expert value, then proves the
+resulting scatter-add equals `MoE_spec`.  The implementation correspondence
+of `all_to_all_variable` remains an audited API boundary rather than a Verus
+proof of PyTorch/NCCL itself.
 
 ## What each tool proves — this exercise
 

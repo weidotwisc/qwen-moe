@@ -5,13 +5,15 @@ efficiently. Written by Claude (AI drafter). Wei has read this and
 signed off on the structure; Jun is the auditor of record.
 
 **Status** (updated 2026-09-11):
-- **150 unique verified proof functions, 0 errors** across **17 Verus source
+- **192 unique verified proof functions, 0 errors** across **20 Verus source
   files**. This counts shared modules once. Standalone command totals must not
-  be added together because `composition_core.rs` and `deadlock_free.rs` are
-  re-verified when imported by another crate root.
-- The Tier-3 composition files contain no `#[verifier::external_body]`.
-  Missing component refinements are explicit theorem preconditions rather
-  than hidden axioms. They remain open proof obligations.
+  be added together because the core, kernel, schedule, and deadlock modules
+  are re-verified when imported by another crate root.
+- The Tier-3 bridge files contain no new `#[verifier::external_body]`.
+  The public block theorem now imports and invokes Ex01, Ex05, Ex06, and Ex09
+  contracts to establish replication, routing, ownership, and fused-row
+  obligations. The imported component files retain their documented low-level
+  model-to-source axioms.
 - All files typecheck against Verus 0.2025.07.12.0b6f3cb.
 - Every proof has been drafted by Claude in this session; Jun's audit
   is the human-verification step of the paper's methodology contribution.
@@ -59,13 +61,17 @@ math. Read `PROPERTIES.md` first, then the `.rs`.
 | Ex02 mlp_tp | `mlp_tp.rs` | 13 | M1-M3 merged column + T1-T3 SwiGLU composition | AXIOM_M1, AXIOM_M2, AXIOM_S1 |
 | Ex03 mha_tp | `mha_tp.rs` | 13 | Q1-Q4 QKV column + A1-A2 attention composition | AXIOM_M1, AXIOM_ATTN_HEAD_LOCAL |
 | Ex04 gqa_tp | `gqa_tp.rs` | 11 | G1-G4 GQA + R1 KV-replication invariants | AXIOM_RI1 (repeat_interleave) |
-| Ex05 moe_baseline | `moe_baseline.rs` | 24 | RT1-RT3 routing invariants + RT5 partition-size correctness (catches v8/v10) + unconditional conservation (`lemma_bincount_sums_to_len` discharges RT1's assumed sum premise) + RT4 permutation bijection over flattened routing records (modulo argsort-is-permutation axiom) + E1/E2 stubs | AXIOM_SOFTMAX_SUM, AXIOM_ARGSORT_INVERSE |
+| Ex05 moe_baseline | `moe_baseline.rs` | 24 | RT1-RT3 routing invariants + RT5 partition-size correctness (catches v8/v10) + unconditional conservation + RT4 permutation bijection; exact E1/E2 live in the shared Tier-3 model | AXIOM_SOFTMAX_SUM, AXIOM_ARGSORT_INVERSE |
 | Ex06_ep_pure | `ep_pure.rs` | 8 | EP1-EP4 expert-partition + dispatch symmetry | AXIOM_A2A_COUNT_SYMMETRIC |
-| Ex06_ep (lean) | `lean.rs` | 7 | L2 disjointness + L2-covers + L3/L5 | AXIOM_ALLREDUCE_SUM_REPLICATED |
-| Ex07 tp_ep_hybrid | `hybrid.rs` | 3 | H2 striping determinism (rest stubbed) | tensor_on opaque |
-| Ex09 fused_moe (contract) | `fused_moe.rs` | 2 | F1 offset coverage + F3 empty-expert | expert_apply opaque |
+| Ex06_ep (lean) | `lean.rs` | 7 | L2 disjointness + L2-covers + L3/L5; exact L4 lives in the shared Tier-3 model | AXIOM_ALLREDUCE_SUM_REPLICATED |
+| Ex07 tp_ep_hybrid | `hybrid.rs` | 3 | H2 striping determinism; exact H6 lives in the shared Tier-3 model | tensor_on opaque |
+| Ex09 fused_moe (contract) | `fused_moe.rs` | 2 | F1 offset coverage + F3 empty-expert; exact F4 lives in the shared Tier-3 model | expert_apply opaque |
 | Ex09 fused_moe (DSL) | `fused_kernel_dsl.rs` | 13 | K1a/K1b/K1c tile coverage; K2/K3 remain external | AXIOM_MATMUL_SPLITS_OVER_K, zero-padding axiom |
 | **Subtotal** | | **119** | | |
+
+The Ex01 row file has 13 unique local verification items; its standalone
+command now reports 29 because it imports the 16-item shared composition model
+to use the same distributed tensor observation as Tier 3.
 
 **Ex01 detail** — the paper's exemplar per-component proof. Read
 [`bootcamp/ex01_linear_tp/verification/PROPERTIES.md`](../bootcamp/ex01_linear_tp/verification/PROPERTIES.md)
@@ -86,40 +92,46 @@ Contribution 3.
 There are now two distinct shared layers:
 
 - `verus/axiom_base.rs` (4 verified lemmas) is the legacy distributed-state
-  framework used by older component files. It still contains the old inert
-  `approx_eq(atol, rtol)` model and must not be described as the relation used
-  by current Tier-3 composition.
-- `verus/composition_core.rs` (4 verified lemmas) is the Tier-3 source of
-  truth. `Tensor` contains exact abstract values and `semantic_eq(x, y)` is
-  full `Tensor` equality. It defines reflexivity, symmetry, transitivity, and
-  `theorem_shared_spec_implies_equiv`.
+  framework used by older component files. Its equality relation is exact;
+  current Tier-3 composition uses the separate shared model below.
+- `verus/composition_core.rs` (16 verified proofs) is the Tier-3 source of
+  truth. In addition to exact `Tensor` equality and the meta-theorem, it
+  defines the shared `(token, top-k slot)` work model, exact expert
+  contributions, routing-permutation semantics, fused row contract, and the
+  permutation/work-conservation proofs.
 
-The Tier-3 model deliberately proves exact mathematical equivalence, not a
-floating-point error bound. Numerical tolerance belongs to runtime tests and
-is outside this proof.
+The Tier-3 model proves exact equality.
 
 ### 2.3 Composition + safety theorems (Tier 3)
 
-Five files at the repo-level `verus/` directory.
+Eight files at the repo-level `verus/` directory. The two small crate-root
+files re-export shared proof modules so they can also be checked standalone.
 
 | File | Command output | Unique local proofs | What it proves |
 |------|---------------:|--------------------:|----------------|
-| `composition_core.rs` | 4 | 4 | Exact semantic equality + shared meta-theorem |
-| `lean_equiv_hybrid_dp1.rs` | 5 | 1 | Conditional Lean ≡ Hybrid theorem under explicit DP=1, replication, and refinement contracts |
-| `naive_equiv_fused_moe.rs` | 7 | 3 | Conditional Naive/Permuted/Fused pairwise equivalence under routing and refinement contracts |
-| `composition_theorem.rs` | 23 | 7 | 2×2 block composition + work, deadlock, and atomic-scatter safety; imports the 4 core and 12 deadlock proofs |
-| `deadlock_free.rs` | 12 | 12 | Transition-system deadlock proof + concrete Lean and Hybrid schedules |
-| **Unique subtotal** | | **27** | Shared modules counted once |
+| `composition_core.rs` | 16 | 16 | Exact equality, work semantics, permutation invariance, fused-row refinement, and work conservation |
+| `kernel_refinement.rs` | imported | 6 | E1, E2, F4 and Naive/Permuted/Fused equivalences |
+| `schedule_refinement.rs` | imported | 18 | Expert ownership, rank-local partial outputs, elementwise all-reduce SUM, explicit all-to-all dispatch/compute/combine round trip, schedule swap, and per-schedule kernel swap |
+| `component_integration.rs` | imported | 7 | Bridges Ex01 replication, Ex05 argsort, Ex06 expert partition, and Ex09 row contracts into the shared Tier-3 predicates |
+| `lean_equiv_hybrid_dp1.rs` | 40 | 0 | Standalone crate root importing core + kernel + schedule modules (historical filename) |
+| `naive_equiv_fused_moe.rs` | 22 | 0 | Standalone crate root importing core + kernel modules |
+| `composition_theorem.rs` | 131 | 10 | Component-connected block composition + work, deadlock, and atomic-scatter safety; imports shared modules and relevant Tier-1 proofs |
+| `deadlock_free.rs` | 12 | 12 | Transition-system deadlock proof + concrete DP=1 all-reduce and all-to-all schedules |
+| **Unique subtotal** | | **69** | Shared modules counted once; imported Tier-1 proofs remain counted in the Tier-1 subtotal |
 
-**The meta-theorem** is defined in `composition_core.rs` and re-exported by
-`composition_theorem.rs`. The two specific theorem files call that same
-function directly. Their refinement facts are explicit preconditions, not
-`external_body` axioms.
+**The meta-theorem** is defined in `composition_core.rs`. E1/E2/F4 prove the
+kernel refinements from canonical work, routing permutation, and the row-level
+fused contract. L6/H6 then prove the schedule refinements. The block theorem
+invokes those results directly; it does not assume refinement or swap facts.
+The public block theorem first invokes `component_integration.rs` to derive the
+shared invariants from Tier-1 contracts. It requires `valid_dp1_topology`,
+whose definition includes `dp_size == 1`; it makes no equivalence claim for
+the other `(dp,tp)` points.
 
 ## 3. Grand total
 
-**150 unique verified proof functions, 0 errors, 17 source files**
-(per-component: 119; `axiom_base.rs`: 4; current composition cluster: 27).
+**192 unique verified proof functions, 0 errors, 20 source files**
+(per-component: 119; `axiom_base.rs`: 4; current composition cluster: 69).
 Re-verified 2026-09-11. Shared imports are counted once.
 
 ## 4. Property matrix — what's actually proved
@@ -134,26 +146,31 @@ Re-verified 2026-09-11. Shared imports are counted once.
 | Merged column-parallel = unsharded merged matmul | Ex02 | `m3_merged_forward_correctness_tp2` |
 | QKV three-way split matches per-projection matmul | Ex03 | `q3_qkv_forward_correctness_tp2` |
 | GQA weight_loader post-condition | Ex04 | `g4_gqa_weight_loader_postcondition` |
-| Naive MoE refines MoE_spec | Ex05 | **Open**: `e1_naive_refines_spec_stub` currently ensures only `true` |
-| Permuted MoE refines MoE_spec | Ex05 | **Open**: `e2_permuted_refines_naive_stub` currently ensures only `true` |
-| Fused Triton refines MoE_spec | Ex09 | **Open**: `f4_fused_matches_python_loop_stub` currently ensures only `true` |
+| Ex05 argsort establishes shared routing consistency | `component_integration.rs` | `ex05_establishes_routing_consistent` |
+| Ex06 contiguous partition establishes shared expert ownership | `component_integration.rs` | `ex06_establishes_expert_partitioned` |
+| Ex01 row-parallel replication establishes shared replicated input | `component_integration.rs` | `ex01_establishes_replicated_input` |
+| Ex09 row postcondition establishes shared fused-row correctness | `component_integration.rs` | `ex09_establishes_fused_rows_correct` |
+| Naive MoE refines MoE_spec | `kernel_refinement.rs` | `e1_naive_refines_spec` |
+| Permuted MoE refines MoE_spec | `kernel_refinement.rs` | `e2_permuted_refines_spec`, from `RoutingConsistent` |
+| Fused rows refine MoE_spec | `kernel_refinement.rs` | `f4_fused_refines_spec`, from routing + pointwise `fused_rows_correct` |
 | **META**: A = S ∧ B = S ⟹ A = B | `composition_core.rs` | `theorem_shared_spec_implies_equiv` |
-| Lean ≡ Hybrid under DP=1 | `lean_equiv_hybrid_dp1.rs` | Conditional on `ReplicatedInput`, `lean_refines_spec`, and `hybrid_refines_spec` |
-| Permuted ≡ Fused Triton | `naive_equiv_fused_moe.rs` | Conditional on `RoutingConsistent` and both refinement contracts |
-| Naive ≡ Fused Triton | `naive_equiv_fused_moe.rs` | Conditional on `RoutingConsistent` and both refinement contracts |
-| Naive ≡ Permuted | `naive_equiv_fused_moe.rs` | Conditional on `RoutingConsistent` and both refinement contracts |
-| Block-level 2×2 grid equivalence | `composition_theorem.rs` §1 | Conditional on schedule-swap and kernel-swap contracts for both axes |
+| All-to-all dispatch/compute/combine round trip | `schedule_refinement.rs` | `theorem_all_to_all_dispatch_compute_combine_round_trip`; records move to their expert owner, retain identity/value through compute, and return to their token source without loss or duplication |
+| All-to-all ≡ all-reduce under DP=1 | `schedule_refinement.rs` | `theorem_all_to_all_equiv_all_reduce_dp1`; `theorem_rank_local_partials_sum_to_moe_spec` proves the replicated-EP partial-sum identity, while the explicit round-trip theorem supplies H6 |
+| Permuted ≡ Fused Triton | `kernel_refinement.rs` | `theorem_permuted_equiv_fused` |
+| Naive ≡ Fused Triton | `kernel_refinement.rs` | `theorem_naive_equiv_fused` |
+| Naive ≡ Permuted | `kernel_refinement.rs` | `corollary_naive_equiv_permuted` |
+| Block-level 2×2 grid equivalence | `composition_theorem.rs` §1 | `corollary_block_variants_from_components`; invokes Ex01/Ex05/Ex06/Ex09 bridges before the concrete refinements |
 
 ### Global safety goals — the paper's four goals, and where each is PROVED
 
 The block-scope theorems in `composition_theorem.rs` §2 contain no
-`external_body`. Work and atomic-scatter safety are conditional on explicit
-contracts. Deadlock freedom imports and applies the concrete transition-system
-proof from `deadlock_free.rs`.
+`external_body`. Work conservation is derived from routing permutation;
+atomic-scatter safety follows from the modeled `AtomicIndexAdd` primitive;
+deadlock freedom imports the concrete transition-system proof.
 
 **Goal 1 — Completeness** (every work item assigned + executed; $\bigcup_r W_r = W$)
-- Block scope: `theorem_token_conservation` (§2.1), conditional on
-  `exact_work_execution`.
+- Block scope: `theorem_token_conservation_from_components` (§2), which calls
+  Ex05's argsort proof to establish the routing permutation.
 - A work item is `(token, top_k_slot)`. The theorem proves every required item
   has execution multiplicity exactly one.
 - Proved per-component:
@@ -178,8 +195,8 @@ proof from `deadlock_free.rs`.
   - Ex09 `k1a_m_axis_disjoint`, `k1c_n_axis_disjoint` (fused tiles disjoint).
 
 **Goal 3 — Data-race freedom** (conflicting scatter writes are atomic)
-- Block scope: `theorem_data_race_free` (§2.3), conditional on the runtime
-  `atomic_scatter_contract`.
+- Block scope: `theorem_data_race_free` (§2), with the abstract scatter
+  primitive explicitly defined as `AtomicIndexAdd`.
 - Different top-k slots intentionally write the same `(token, feature)`.
   `ScatterWrite.occurrence` also represents accidental duplicate execution.
   The theorem proves every pair of conflicting active writes is atomic; it
@@ -190,23 +207,25 @@ proof from `deadlock_free.rs`.
 **Goal 4 — Deadlock freedom** (every reachable non-final state can progress)
 - `deadlock_free.rs` models per-rank collective traces, program counters,
   enabled transitions, frontier closure, and reachability.
-- `lemma_lean_schedule_well_formed` proves the concrete two-phase Lean trace.
-- `lemma_hybrid_schedule_well_formed` proves the concrete six-phase Hybrid
-  trace.
+- `lemma_all_reduce_dp1_schedule_well_formed` proves the concrete two-phase
+  all-reduce trace.
+- `lemma_all_to_all_dp1_schedule_well_formed` proves the concrete four-phase
+  attention + count/dispatch/combine all-to-all trace.
 - `composition_theorem.rs::theorem_deadlock_free` selects the schedule and
-  invokes `theorem_{lean,hybrid}_execution_deadlock_free`.
+  invokes the corresponding DP=1 execution theorem.
 - This is source-level absence of a deadlocked reachable state, not an
   unconditional runtime termination theorem. Failure-free NCCL completion and
   fair scheduling remain environmental assumptions.
 
 **Audit note (changed 2026-09-10).** The former block-scope packaging axioms
 `axiom_variant_conserves_records`, `axiom_variant_unique_writer`, and
-`axiom_variant_schedule_terminates` were removed. Their replacements either
-state an explicit caller obligation or invoke a concrete proved schedule.
+`axiom_variant_schedule_terminates` were removed. As of 2026-09-11, work is
+derived from routing permutation, race freedom from the explicit atomic
+primitive model, and deadlock freedom from concrete proved schedules.
 
 | Corollary | Where | Lemma |
 |-----------|-------|-------|
-| Same execution multiplicity for every work item | `composition_theorem.rs` §2.1 | `corollary_work_variant_invariant` |
+| Same execution multiplicity for every work item | `composition_theorem.rs` §2.1 | `corollary_work_variant_invariant_from_components` |
 
 ### Routing / partitioning invariants (per-component)
 
@@ -255,17 +274,21 @@ a well-known mathematical fact.
 | `axiom_all_to_all_count_symmetric` | Ex06_ep_pure | send/recv counts negotiated by pre-dispatch all_to_all_single are symmetric |
 | `axiom_argsort_is_inverse_pair` | `moe_baseline.rs` (RT4) | argsort returns a permutation of [0,M) with a computable inverse (library-sort property) |
 
-There are no Python-correspondence axioms in the current Tier-3 files. Their
-unproved boundaries are instead visible as theorem preconditions:
+There are no new `external_body` axioms in the Tier-3 bridge files.
+`composition_theorem.rs` now imports the relevant Tier-1 modules, so their
+documented library/collective axioms are part of its verification dependency
+closure. High-level refinement/swap propositions are not theorem premises.
+The remaining model-to-source boundaries are:
 
-| Required contract | Consumer | Required upstream evidence |
-|-------------------|----------|----------------------------|
-| `ReplicatedInput` | schedule swap | TP stage's replication postcondition tied to the same `x` |
-| `lean_refines_spec`, `hybrid_refines_spec` | schedule swap | Ex06 L6 and Ex07 H6 with meaningful postconditions |
-| `RoutingConsistent` + three refinement contracts | kernel swap | Ex05 E1/E2 and Ex09 F4 |
-| `schedule_swap_equiv`, `kernel_swap_equiv` | 2×2 block theorem | both swap theorems lifted through the block context |
-| `exact_work_execution` | work conservation | per-item coverage and uniqueness across ranks |
-| `atomic_scatter_contract` | data-race freedom | runtime guarantee for active `index_add_` writes |
+| Boundary | Formal role | Audit evidence required |
+|----------|-------------|-------------------------|
+| Ex01 representative tensor identity | connects the replicated all-reduce result to the attention output consumed by MoE | tensor identity at one participating rank; Ex01 proves equality for all other ranks |
+| Ex05 argsort contract | produces the concrete routed order | `axiom_argsort_is_inverse_pair`; the bridge proves this implies `RoutingConsistent` |
+| Ex09 pointwise kernel postcondition + layout relation | connects grouped-GEMM rows to routed `(token,slot)` values | audited kernel contract and vector-to-scalar abstraction; the bridge proves `fused_rows_correct` |
+| `expert_apply` | common exact expert semantic primitive | Python and Triton operations implement this abstraction |
+| `scatter_primitive = AtomicIndexAdd` | models conflicting output accumulation as atomic | inspect the actual `index_add_`/kernel implementation |
+| all-to-all record-transfer semantics | moves each record to its requested destination and, with swapped split sizes, returns it to its source | audit `all_to_all_variable` and the split-size construction against the global record model |
+| concrete `Schedule` values | deadlock transition system's source trace | compare group, operation, call site, and order to Python |
 
 ### Per-component stubs (deferred proofs)
 
@@ -282,48 +305,42 @@ proof structure is documented inline.
 | `a2_block_correctness_stub` | Ex03 | Full MHA-TP block correctness |
 | `r2_replica_siblings_identical_kv_stub` | Ex04 | Replica-sibling attention equality |
 | `r3_block_correctness_stub` | Ex04 | Full GQA-TP block correctness |
-| `e1_naive_refines_spec_stub` | Ex05 | Naive MoE per-token refinement |
-| `e2_permuted_refines_naive_stub` | Ex05 | Permuted-vs-naive equivalence |
-| `ep5_round_trip_stub` | Ex06_ep_pure | Dispatch-combine round-trip |
 | `ep6_deadlock_free_stub` | Ex06_ep_pure | Deadlock-freedom (structural) |
-| `ep7_routing_correctness_stub` | Ex06_ep_pure | Full dispatch-based routing correctness |
 | `l3_partial_output_zero_outside` | Ex06_ep/lean | Zero-outside-contributing (index_add_ postcondition) |
-| `l4_sum_of_partials_stub` | Ex06_ep/lean | Sum-of-partials-equals-MoE_spec |
-| `l6_refines_moe_spec_stub` | Ex06_ep/lean | Full lean forward refinement |
-| `lean_equiv_dispatch_composition_stub` | Ex06_ep/lean | Redundant — subsumed by verus/lean_equiv_hybrid_dp1.rs |
 | `h1_attn_output_tp_replicated_stub` | Ex07 | Inherited from Ex04 R4 |
 | `h3_ep_dispatch_symmetric_stub` | Ex07 | Inherited from Ex06 EP3 |
 | `h4_moe_out_tp_replicated_stub` | Ex07 | All-gather postcondition |
 | `h5_subgroup_deadlock_free_stub` | Ex07 | Sub-group deadlock-freedom (structural) |
-| `h6_block_correctness_stub` | Ex07 | Full block correctness |
-| `f2_postcondition_determines_output_stub` | Ex09 | Fused kernel determinism up to approx_eq |
-| `f4_fused_matches_python_loop_stub` | Ex09 | Full fused-vs-Python-loop equivalence |
+| `f2_postcondition_determines_output_stub` | Ex09 | Exact fused-kernel postcondition determinism |
 | `k2_k_reduce_correctness` | Ex09 DSL | K-reduction correctness |
 | `k3_derives_f4_full_kernel_correctness` | Ex09 DSL | Full kernel correctness from K1/K2 |
 
-**Note on stubs:** several load-bearing component stubs still say only
-`ensures true`. Tier 3 no longer silently upgrades them into stronger axioms;
-instead, it exposes the missing refinements as explicit preconditions. Until
-the component stubs acquire meaningful postconditions and discharge those
-contracts, the implementation-equivalence results remain conditional.
+**Note on stubs:** the former E1/E2/F4/L4/L6/H6, EP5/EP7, and local
+composition stubs were removed. Their shared exact proofs now live in
+`kernel_refinement.rs` and `schedule_refinement.rs`. Other component-local
+stubs remain outside the Tier-3 derivation and must not be cited as proved
+properties.
 
 ## 6. Audit priority order (Jun should read in this sequence)
 
 For maximum paper-impact-per-hour of audit time:
 
-### Priority 1 — shared equality and composition core (20 min)
+### Priority 1 — shared exact execution model (45 min)
 
-Read `verus/composition_core.rs`. Confirm that exact `Tensor` equality is the
-intended mathematical abstraction and that symmetry + transitivity establish
-`theorem_shared_spec_implies_equiv`.
+Read `verus/composition_core.rs`. Confirm the canonical flat work index really
+represents `(token, top-k slot)`, `RoutingConsistent` means exact permutation,
+the commutative-fold proof is valid for mathematical integers, and
+`fused_rows_correct` is only a row-level kernel boundary.
 
-### Priority 2 — undischarged refinement contracts (2 hours)
+### Priority 2 — refinement chain and source correspondence (2 hours)
 
-Read the `requires` clauses in `lean_equiv_hybrid_dp1.rs`,
-`naive_equiv_fused_moe.rs`, and `composition_theorem.rs`. For every contract,
-locate the intended component lemma and record whether it actually proves the
-required proposition. At present, E1/E2/F4/L6/H6 do not: their component stubs
-only ensure `true`. This is the highest-priority remaining proof gap.
+Read `kernel_refinement.rs`, `schedule_refinement.rs`,
+`component_integration.rs`, and `composition_theorem.rs`. Check that the
+public block theorem calls Ex01/Ex05/Ex06/Ex09 bridges before E1/E2/F4 and
+L6/H6, and that no final refinement/swap statement appears in a `requires`
+clause. Then audit the remaining low-level boundaries against Python: the
+representative tensor identity, Ex05 argsort contract, Ex09 row postcondition
+and layout relation, and the mapping from schedule choice to execution order.
 
 ### Priority 3 — the anecdote-driven proof (30 min)
 
@@ -338,10 +355,10 @@ the anecdote accurately describes the two audit cycles.
 
 Read `verus/composition_theorem.rs` §2 and `verus/deadlock_free.rs`.
 
-- Work conservation: audit whether the component routing lemmas can establish
-  `exact_work_execution` for `(token, top_k_slot)` items. A total-count theorem
-  is insufficient.
-- Deadlock freedom: compare the two-phase Lean and six-phase Hybrid traces to
+- Work conservation: audit the proof from `RoutingConsistent` multiset equality
+  through canonical-work uniqueness to exact per-item multiplicity. A
+  total-count theorem alone would still be insufficient.
+- Deadlock freedom: compare the two-phase all-reduce and four-phase all-to-all traces to
   the actual Python collective call sites. Check group membership, operation,
   call-site identity, and ordering. The proof establishes absence of a stuck
   reachable frontier in the abstract machine.
@@ -370,40 +387,38 @@ algorithmic contract.
 The paper's §Contribution 2 section refers to these lemmas by name:
 
 - Meta-theorem: `theorem_shared_spec_implies_equiv` (`composition_core.rs`, re-exported by `composition_theorem.rs`)
-- Schedule swap: `theorem_lean_equiv_hybrid_dp1` (lean_equiv_hybrid_dp1.rs)
-- Kernel swap: `theorem_permuted_equiv_fused` (naive_equiv_fused_moe.rs)
-- 2×2 block grid: `corollary_block_variants_equivalent` (composition_theorem.rs)
-- Work conservation (Completeness + Disjointness): `theorem_token_conservation` (composition_theorem.rs)
-- Deadlock freedom: `theorem_{lean,hybrid}_execution_deadlock_free` (`deadlock_free.rs`) and the schedule-selecting `theorem_deadlock_free` (`composition_theorem.rs`)
+- Schedule swap: `theorem_all_to_all_equiv_all_reduce_dp1` (`schedule_refinement.rs`, re-exported by `lean_equiv_hybrid_dp1.rs`)
+- Kernel swap: `theorem_permuted_equiv_fused` (`kernel_refinement.rs`, re-exported by `naive_equiv_fused_moe.rs`)
+- Component-connected 2×2 block grid: `corollary_block_variants_from_components` (`composition_theorem.rs`)
+- Work conservation (Completeness + Disjointness): `theorem_token_conservation_from_components` (`composition_theorem.rs`)
+- Deadlock freedom: `theorem_{all_reduce_dp1,all_to_all_dp1}_execution_deadlock_free` (`deadlock_free.rs`) and the schedule-selecting `theorem_deadlock_free` (`composition_theorem.rs`)
 - Data-race freedom (via atomic conflicting writes): `theorem_data_race_free` (composition_theorem.rs)
 
 The paper's §Methodology section refers to these files:
 - Per-component proof template: `bootcamp/ex01_linear_tp/verification/`
 - Audit-cycle anecdote: `bootcamp/ex02_mlp_tp/verification/anecdote.txt`
-- Shared framework: `verus/axiom_base.rs` (legacy components) and `verus/composition_core.rs` (Tier 3)
+- Shared framework: `verus/axiom_base.rs` (legacy components) and `verus/{composition_core,kernel_refinement,schedule_refinement,component_integration}.rs` (Tier 3)
 - Composition-theorem home: `verus/composition_theorem.rs`
 
 ## 8. Known limitations Jun should be aware of
 
-1. **Tier 3 is exact semantics, not floating-point verification.**
-   `composition_core.rs::semantic_eq` is full equality of an abstract tensor
-   whose values are mathematical integers. It does not establish a numerical
-   error bound for fp32/bf16 execution. Older component files and
-   `axiom_base.rs` still contain the inert `approx_eq(atol, rtol)` abstraction;
-   that legacy model is not used by current Tier 3 and should be migrated or
-   clearly separated in the paper.
-2. **Every per-component "block correctness" (T3/A2/R3/H6/EP7/L6) is stubbed.**
-   Tier 3 exposes the corresponding refinement propositions as preconditions,
-   but current component stubs do not discharge them. Full mechanization is
-   future work.
+1. **Tier 3 uses exact equality.**
+   `composition_core.rs::semantic_eq` is full equality of an abstract tensor.
+2. **Tier 3 proves the shared abstract execution model, not Python source
+   semantics.** E1/E2/F4/L6/H6 and the block theorem are mechanically linked.
+   `RoutingConsistent`, `ExpertPartitioned`, `ReplicatedInput`, and
+   `fused_rows_correct` are now derived by `component_integration.rs`; the
+   lower-level argsort/collective/kernel contracts, tensor identity, atomic
+   primitive choice, and schedule-to-Python correspondence remain auditable
+   boundaries.
 3. **The Triton kernel's DSL semantics is modeled and structurally verified
    (`fused_kernel_dsl.rs`, K1a/K1b/K1c), but PTX/SASS compilation and A100
    hardware execution are trusted below the DSL level.** The kernel's
    correspondence to its Verus DSL model is established empirically via
    `bootcamp/tests/test_ex09_fused_moe.py` (8 tests: fp32/bf16 × uniform/skewed × small/Qwen3-scale).
-   F4 remains an open obligation: `f4_fused_matches_python_loop_stub` currently
-   ensures only `true`. K1/K2 structural work does not yet discharge the Tier-3
-   `fused_refines_spec` contract.
+   F4 is now proved from the pointwise `fused_rows_correct` boundary. K2/K3
+   remain the work needed to establish that boundary from the Triton DSL rather
+   than runtime/source correspondence evidence.
 4. **Every per-component `c4_forward_correctness_general` / `r4_forward_correctness_general` is stubbed.**
    The parameterized-over-tp_size versions. Concrete tp_size=2 versions
    are proved.
@@ -443,10 +458,10 @@ verus --crate-type=lib verus/naive_equiv_fused_moe.rs
 verus --crate-type=lib verus/composition_theorem.rs
 ```
 
-Expected top-level outputs are 4 (`axiom_base`), 4 (`composition_core`),
-12 (`deadlock_free`), 5 (schedule swap), 7 (kernel swap), and 23
+Expected top-level outputs are 4 (`axiom_base`), 16 (`composition_core`),
+12 (`deadlock_free`), 40 (schedule crate), 22 (kernel crate), and 131
 (`composition_theorem`), all with 0 errors. These numbers overlap because
-imported modules are re-verified; use the 150 unique count above for the
+imported modules are re-verified; use the 192 unique count above for the
 artifact total.
 
 Total wall-clock time: ~2 minutes on the shared pod.

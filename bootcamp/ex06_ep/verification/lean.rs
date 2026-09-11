@@ -7,9 +7,11 @@
 //   L1 (precondition: input Replicated on ep_group — captured as predicate)
 //   L2 (local_mask disjointness: each (i, e) considered "local" on exactly one rank)
 //   L3 (partial output zero at non-routed positions — via index-set spec)
-//   L4 stubbed (sum of partials equals MoE_spec RHS)
+//   L4 (sum of rank-local partials equals the exact MoE specification) is
+//      proved over the shared model in verus/schedule_refinement.rs.
 //   L5 (post-all_reduce Replicated — via axiom_all_reduce_sum_replicated)
-//   L6 stubbed (refines MoE_spec)
+//   L6 is proved over the shared exact model in
+//   verus/schedule_refinement.rs.
 //
 // Run with:
 //   verus lean.rs
@@ -151,25 +153,6 @@ pub proof fn l3_partial_output_zero_outside(rank: Rank, i: TokenId)
 {}
 
 // =====================================================================
-// §7 — Property L4: sum of partials equals MoE_spec RHS (external stub).
-// =====================================================================
-
-pub uninterp spec fn moe_spec_at(x: Seq<int>, i: TokenId) -> int;
-
-/// L4 (stub): sum over ranks of partial_output(r, i) equals moe_spec_at(x, i).
-/// Proof composition:
-///   1. By L2 (disjointness) + L2-covers, each (i, e) contributes to
-///      exactly one rank's partial_output(r, i).
-///   2. Rank r's partial_output(r, i) = sum over e in [expert_start(r),
-///      expert_end(r)) of w[i, e] * expert_apply(e, x[i]) for e in top_k(i).
-///   3. Summing over r: sum over all e in top_k(i) of w * expert_apply,
-///      which is moe_spec_at(x, i).
-#[verifier::external_body]
-pub proof fn l4_sum_of_partials_stub()
-    ensures true,
-{}
-
-// =====================================================================
 // §8 — Property L5: post-all_reduce output is Replicated.
 // =====================================================================
 
@@ -185,32 +168,9 @@ pub proof fn l5_output_replicated(out_id: nat, g: Group)
     axiom_all_reduce_sum_replicated(out_id, g);
 }
 
-// =====================================================================
-// §9 — Property L6: refinement to MoE_spec (external stub).
-//
-// Composes L4 (sum equals MoE_spec) with L5 (Replicated output).
-// Deferred to the paper's composition theorem.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn l6_refines_moe_spec_stub()
-    ensures true,
-{}
-
-// =====================================================================
-// §10 — Composition claim: lean equiv dispatch (external stub).
-//
-// The paper's Contribution 2 headline. Under `Replicated(x, ep_group)`
-// precondition, this file's L6 (lean refines MoE_spec) plus
-// Ex06_ep_pure's EP7 (dispatch refines MoE_spec) give:
-//   lean(x) approx_eq dispatch(x)
-// by shared-spec refinement + transitivity of approx_eq.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn lean_equiv_dispatch_composition_stub()
-    ensures true,
-{}
+// L6 and Lean-versus-Hybrid composition are intentionally not restated as
+// local axioms.  See `verus/schedule_refinement.rs`, which proves them over
+// the same exact MoE model used by the block theorem.
 
 } // verus!
 

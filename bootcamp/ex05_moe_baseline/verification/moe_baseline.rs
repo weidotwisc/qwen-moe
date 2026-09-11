@@ -5,8 +5,8 @@
 //   RT1 (token conservation via offsets)
 //   RT2 (offset monotonicity)
 //   RT3 (top-k weight normalization via axiom)
-//   E1 stubbed (NaiveSparseMoE refines MoE_spec)
-//   E2 stubbed (PermutedSparseMoE refines NaiveSparseMoE up to approx_eq)
+//   E1/E2 are proved over the shared exact model in
+//   verus/kernel_refinement.rs.
 //
 // Focus: routing correctness (token conservation, monotonic offsets, top-k
 // normalization). These are the load-bearing invariants for every downstream
@@ -585,38 +585,9 @@ pub uninterp spec fn moe_spec_output(
     token_i: nat,
 ) -> Seq<Weight>;
 
-// =====================================================================
-// §7 — Property E1: NaiveSparseMoE refines MoE_spec (external stub).
-//
-// Proof composition: the per-expert loop in `NaiveSparseMoE.forward`
-// computes, for each token i, the sum over j in [0, top_k) of
-// w[i, j] * expert_apply(ids[i][j], x[i]). This IS MoE_spec[i] by
-// definition. The `approx_eq` tolerance absorbs summation-order differences.
-// Left as external because it's the whole-forward equivalence, which
-// requires a lot of scaffolding (loop invariant + tolerance composition).
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn e1_naive_refines_spec_stub()
-    ensures true,
-{}
-
-// =====================================================================
-// §8 — Property E2: PermutedSparseMoE refines NaiveSparseMoE (external stub).
-//
-// Requires proving that the permutation-then-group-then-scatter is
-// extensionally equal (up to reordering of a commutative sum) to the
-// naive per-token per-expert loop. RT1+RT2 give the necessary structural
-// properties of `offsets` and `sorted_*` sequences; RT4 (permutation
-// bijection) gives that no data is dropped. The final numerical step
-// (weight-and-scatter) is a commutative sum; equivalence is up to
-// `approx_eq` tolerance.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn e2_permuted_refines_naive_stub()
-    ensures true,
-{}
+// E1 and E2 are intentionally not restated as local axioms.  Their exact
+// proofs share the canonical `(token, top-k slot)` work model with the Tier-3
+// composition theorem; see `verus/kernel_refinement.rs`.
 
 } // verus!
 

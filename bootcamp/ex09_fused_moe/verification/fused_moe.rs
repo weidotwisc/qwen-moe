@@ -9,8 +9,8 @@
 //   F1 (precondition consistency: monotone offsets partition [0, M))
 //   F2 stubbed (postcondition determinism up to approx_eq)
 //   F3 (empty-expert handling: rows outside any block unaffected)
-//   F4 stubbed (composition with Ex06/Ex07: fused kernel refines
-//              Python per-expert loop up to approx_eq)
+//   F4 is proved from a row-level fused-kernel postcondition in
+//   verus/kernel_refinement.rs.
 //
 // Downstream (Ex10 fused hybrid) refines this contract in composition
 // with Ex07's HybridBlock.
@@ -110,8 +110,7 @@ pub uninterp spec fn expert_apply(e: ExpertId, x_token: Seq<Element>) -> Seq<Ele
 
 /// The kernel's postcondition on (out, sorted_x, offsets, ...):
 /// for every row i in [0, M), letting e be the unique expert with
-/// offsets[e] <= i < offsets[e+1], out[i] equals expert_apply(e, sorted_x[i])
-/// up to tolerance.
+/// offsets[e] <= i < offsets[e+1], out[i] equals expert_apply(e, sorted_x[i]).
 pub open spec fn fused_moe_postcondition_holds(
     out: Seq<Seq<Element>>,
     sorted_x: Seq<Seq<Element>>,
@@ -138,18 +137,9 @@ pub proof fn f2_postcondition_determines_output_stub()
     ensures true,
 {}
 
-// =====================================================================
-// §8 — Property F4: composition with Ex06/Ex07 (external stub).
-//
-// If Ex06's dispatch step produces (sorted_x, offsets) satisfying F1,
-// then fused_moe_forward and the Python per-expert loop produce
-// approx_eq outputs. Deferred to the fused-hybrid composition theorem.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn f4_fused_matches_python_loop_stub()
-    ensures true,
-{}
+// F4 is intentionally not restated as a whole-output axiom.  The shared
+// exact proof in `verus/kernel_refinement.rs` derives it from the pointwise
+// `fused_rows_correct` kernel boundary.
 
 } // verus!
 

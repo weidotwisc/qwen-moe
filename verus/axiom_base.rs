@@ -3,7 +3,7 @@
 // Shared cross-component primitives for the paper's Verus track.
 //
 // This file provides DISTRIBUTED / MULTI-RANK predicates (Replicated,
-// ExpertPartition, approx_eq, MoE_forward_spec, routing_conserved_local)
+// ExpertPartition, semantic_eq, MoE_forward_spec, routing_conserved_local)
 // used by Ex06+ verifications where components have pre/postconditions
 // about distributed state.
 //
@@ -44,11 +44,7 @@ pub type Group = Set<Rank>;
 // =========================================================================
 // (B) Tensor as a shape + content record.
 //
-// `content` is flat row-major. Real numbers modeled via `int` here so this
-// axiom base compiles without depending on Verus's `real` extension. Every
-// place we would say "up to fp tolerance" refers to `approx_eq` below, which
-// treats the tolerance as opaque; downstream contracts never actually reason
-// about the numeric values, only about shapes and approx_eq relationships.
+// `content` is flat row-major and equality is exact.
 // =========================================================================
 
 pub struct Tensor {
@@ -58,10 +54,8 @@ pub struct Tensor {
     /// The multiset of weighted per-expert contributions this tensor
     /// aggregates, when it is a MoE-layer output. For tensors that are not
     /// MoE outputs (weights, activations) this is the empty multiset; the
-    /// semantic equivalence relation `approx_eq` below compares it, so those
-    /// non-output tensors are related exactly when their (empty) multisets
-    /// agree. See composition_theorem.rs for the full note on why a shared
-    /// contribution multiset means equality in exact arithmetic.
+    /// exact semantic model can track it. See composition_theorem.rs for the
+    /// current block-level equality theorem.
     pub contribs: Multiset<Contribution>,
 }
 
@@ -99,53 +93,29 @@ pub open spec fn well_formed(t: Tensor) -> bool {
 }
 
 // =========================================================================
-// (C) Approximate equality — equality of the weighted-contribution multiset.
-//
-// `approx_eq(x, y, atol, rtol)` holds iff x and y aggregate the SAME multiset
-// of weighted per-expert contributions. This is EXACT (tolerance-free) in the
-// abstract model: two outputs built from the same multiset of contributions
-// are equal in exact arithmetic, differing only in the floating-point order
-// of summation and bf16 rounding. That reduction-order / rounding gap is what
-// the (atol, rtol) parameters annotate — they are deliberately inert in the
-// proof and are validated empirically by the test suite (see the paper's
-// "Functional equivalence" section and the numerics-aware-verification
-// future-work item). Downstream contracts compose it via the named lemmas
-// below (refl / trans / sym); the definition is identical to the one used in
-// the composition files (composition_theorem.rs, lean_equiv_hybrid_dp1.rs,
-// naive_equiv_fused_moe.rs).
+// (C) Exact semantic equality.
 // =========================================================================
 
-/// Approximate equality of two tensors: equality of their weighted-
-/// contribution multisets. Downstream contracts use the lemmas below.
-pub open spec fn approx_eq(x: Tensor, y: Tensor, atol: nat, rtol: nat) -> bool {
-    x.contribs == y.contribs
+pub open spec fn semantic_eq(x: Tensor, y: Tensor) -> bool {
+    x == y
 }
 
-/// Reflexivity: every well-formed tensor is approx_eq to itself.
-pub proof fn lemma_approx_eq_refl(x: Tensor, atol: nat, rtol: nat)
-    ensures approx_eq(x, x, atol, rtol)
+pub proof fn lemma_semantic_eq_refl(x: Tensor)
+    ensures semantic_eq(x, x)
 {
 }
 
-/// Transitivity with tolerance widening: if x ~ y (a1, r1) and y ~ z (a2, r2)
-/// then x ~ z (a1 + a2, r1 + r2). Simpler bound than the multiplicative rule;
-/// good enough for the number of composition hops in a Qwen3-MoE block.
-pub proof fn lemma_approx_eq_trans(
-    x: Tensor, y: Tensor, z: Tensor,
-    a1: nat, r1: nat, a2: nat, r2: nat,
-)
+pub proof fn lemma_semantic_eq_trans(x: Tensor, y: Tensor, z: Tensor)
     requires
-        approx_eq(x, y, a1, r1),
-        approx_eq(y, z, a2, r2),
-    ensures
-        approx_eq(x, z, a1 + a2, r1 + r2)
+        semantic_eq(x, y),
+        semantic_eq(y, z),
+    ensures semantic_eq(x, z)
 {
 }
 
-/// Symmetry: approx_eq is symmetric in its two arguments (at the same tolerance).
-pub proof fn lemma_approx_eq_sym(x: Tensor, y: Tensor, atol: nat, rtol: nat)
-    requires approx_eq(x, y, atol, rtol)
-    ensures approx_eq(y, x, atol, rtol)
+pub proof fn lemma_semantic_eq_sym(x: Tensor, y: Tensor)
+    requires semantic_eq(x, y)
+    ensures semantic_eq(y, x)
 {
 }
 
@@ -229,10 +199,8 @@ pub open spec fn routing_conserved_local(
 // =========================================================================
 // (H) The MoE semantic spec — the SINGLE function every schedule refines.
 //
-// Kept opaque here. Each schedule variant's contract asserts
-//     approx_eq(schedule_output, MoE_forward_spec(x, ...), atol, rtol)
-// with declared (atol, rtol). Equivalence of two schedules then follows by
-// approx_eq transitivity (lemma_approx_eq_trans above).
+// Kept opaque here. A schedule contract may assert exact semantic equality
+// with this shared specification.
 // =========================================================================
 
 pub struct ExpertWeights {

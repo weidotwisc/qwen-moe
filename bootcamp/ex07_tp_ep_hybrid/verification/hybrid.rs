@@ -7,7 +7,8 @@
 //   H3 stubbed (EP dispatch symmetry, cited from Ex06)
 //   H4 stubbed (all-gather post-condition on tp_group)
 //   H5 stubbed (sub-group deadlock-freedom, structural)
-//   H6 stubbed (block correctness, the paper's composition theorem)
+//   H6 is proved over the shared exact model in
+//   verus/schedule_refinement.rs.
 //
 // Focus: predicates that express replication and striping in a fixed
 // TP/EP layout. The full proof is a composition of Ex04 + Ex06 theorems,
@@ -138,14 +139,9 @@ pub proof fn h5_subgroup_deadlock_free_stub()
     ensures true,
 {}
 
-/// H6: block correctness. Full composition theorem — Ex04 attention
-/// correctness + Ex06 MoE correctness + H2 striping + H4 all-gather
-/// give block-level equivalence to the single-GPU reference. The full
-/// proof is the paper's composition-theorem section and is deferred.
-#[verifier::external_body]
-pub proof fn h6_block_correctness_stub()
-    ensures true,
-{}
+// H6 is intentionally not restated as a local axiom.  The exact Hybrid
+// refinement and its DP=1 schedule composition live in
+// `verus/schedule_refinement.rs`.
 
 } // verus!
 

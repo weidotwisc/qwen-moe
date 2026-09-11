@@ -30,6 +30,10 @@
 use vstd::prelude::*;
 use vstd::arithmetic::div_mod::lemma_fundamental_div_mod;
 
+#[path = "../../../verus/composition_core.rs"]
+mod composition_core;
+use crate::composition_core::tensor_on;
+
 verus! {
 
 // =====================================================================
@@ -321,8 +325,6 @@ pub proof fn r4_forward_correctness_tp2(
 
 /// "Replicated" is a distributed-state property; we express it here as
 /// an opaque predicate on a tensor identity + group.
-pub uninterp spec fn tensor_on(tensor_id: nat, rank: nat) -> Tensor;
-
 pub open spec fn Replicated(tensor_id: nat, group: Set<nat>) -> bool {
     forall|r1: nat, r2: nat|
         group.contains(r1) && group.contains(r2)
