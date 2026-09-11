@@ -11,8 +11,8 @@ mod ex05_routing;
 #[path = "../bootcamp/ex06_ep/verification/lean.rs"]
 mod ex06_lean;
 
-#[path = "../bootcamp/ex01_linear_tp/verification/row_parallel.rs"]
-mod ex01_row_parallel;
+#[path = "../bootcamp/ex04_gqa_tp/verification/gqa_tp.rs"]
+mod ex04_gqa;
 
 #[path = "../bootcamp/ex09_fused_moe/verification/fused_moe.rs"]
 mod ex09_fused_moe;
@@ -36,7 +36,8 @@ pub struct ComponentMoeData {
 }
 
 /// Static/router fields of the MoE sublayer.  The token values are supplied
-/// by the preceding attention component rather than independently assumed.
+/// by the preceding post-attention normalization rather than independently
+/// assumed.
 pub struct ComponentMoeConfig {
     pub expert_ids: Seq<Seq<ExpertId>>,
     pub weights: Seq<Seq<int>>,
@@ -46,12 +47,12 @@ pub struct ComponentMoeConfig {
     pub expert_parallel_size: nat,
 }
 
-pub open spec fn component_data_after_attention(
-    attention_output: Tensor,
+pub open spec fn component_data_from_moe_input(
+    moe_input_tensor: Tensor,
     config: ComponentMoeConfig,
 ) -> ComponentMoeData {
     ComponentMoeData {
-        token_values: attention_output.content,
+        token_values: moe_input_tensor.content,
         expert_ids: config.expert_ids,
         weights: config.weights,
         top_k: config.top_k,
@@ -59,6 +60,41 @@ pub open spec fn component_data_after_attention(
         experts_per_rank: config.experts_per_rank,
         expert_parallel_size: config.expert_parallel_size,
     }
+}
+
+/// Exact deterministic operations between GQA's output projection and MoE.
+/// Their numerical definitions are intentionally abstract here; composition
+/// only needs the fact that equal inputs produce equal outputs.
+pub uninterp spec fn residual_add(
+    residual: Tensor,
+    update: Tensor,
+) -> Tensor;
+
+pub uninterp spec fn rms_norm(input: Tensor) -> Tensor;
+
+pub open spec fn post_gqa_residual(
+    residual: Tensor,
+    gqa_output: Tensor,
+) -> Tensor {
+    residual_add(residual, gqa_output)
+}
+
+pub open spec fn post_attention_norm(
+    residual: Tensor,
+    gqa_output: Tensor,
+) -> Tensor {
+    rms_norm(post_gqa_residual(residual, gqa_output))
+}
+
+/// The concrete per-rank tensor presented to MoE after residual-add and
+/// post-attention RMSNorm.
+pub open spec fn post_attention_view(
+    residual: Tensor,
+    gqa_output_id: nat,
+) -> RankTensorView {
+    |rank: Rank| post_attention_norm(
+        residual, tensor_on(gqa_output_id, rank),
+    )
 }
 
 pub open spec fn component_work_count(data: ComponentMoeData) -> nat {
@@ -299,32 +335,49 @@ pub proof fn ex06_establishes_expert_partitioned(
     }
 }
 
-/// Ex01's row-parallel all-reduce establishes pairwise replication.  Naming
-/// one participating rank's concrete value connects that component state to
-/// the exact `MoeInput` consumed by Tier 3.
-pub proof fn ex01_establishes_replicated_input(
-    input: MoeInput,
-    tensor_id: nat,
+/// Ex04's row-parallel output projection makes the GQA result replicated.
+/// Applying the same residual-add and RMSNorm on every rank preserves that
+/// equality and establishes the exact input expected by the MoE theorem.
+pub proof fn ex04_establishes_replicated_post_attention_input(
+    residual: Tensor,
+    gqa_output_id: nat,
     group: Group,
     representative: Rank,
+    config: ComponentMoeConfig,
+    fused_values: Seq<int>,
 )
-    requires
-        group.contains(representative),
-        tensor_on(tensor_id, representative)
-            == (Tensor { content: input.token_values }),
-    ensures ReplicatedInput(input, tensor_id, group),
+    requires group.contains(representative),
+    ensures ReplicatedInput(
+        component_moe_input(
+            component_data_from_moe_input(
+                post_attention_view(residual, gqa_output_id)(representative),
+                config,
+            ),
+            fused_values,
+        ),
+        post_attention_view(residual, gqa_output_id),
+        group,
+    ),
 {
-    ex01_row_parallel::r4b_output_replicated_after_all_reduce(
-        tensor_id, group,
+    let input_view = post_attention_view(residual, gqa_output_id);
+    let data = component_data_from_moe_input(
+        input_view(representative), config,
+    );
+    let input = component_moe_input(data, fused_values);
+
+    ex04_gqa::g5_gqa_output_replicated_after_output_projection(
+        gqa_output_id, group,
     );
     assert(exists|rank: Rank| group.contains(rank)) by {
         assert(group.contains(representative));
     }
     assert forall|rank: Rank| group.contains(rank) implies
-        tensor_on(tensor_id, rank)
-            == Tensor { content: input.token_values } by {
-        assert(tensor_on(tensor_id, rank)
-            == tensor_on(tensor_id, representative));
+        input_view(rank) == Tensor { content: input.token_values } by {
+        assert(tensor_on(gqa_output_id, rank)
+            == tensor_on(gqa_output_id, representative));
+        assert(input_view(rank) == input_view(representative));
+        assert(input_view(representative)
+            == Tensor { content: input.token_values });
     }
 }
 

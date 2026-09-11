@@ -7,7 +7,7 @@
 //   Q3 (merged QKV forward correctness, tp=2, via axiom_m1)
 //   Q4 (three-way split matches per-projection shards, tp=2)
 //   A1 (attention commutes with head-gather, via axiom_attn_head_local)
-//   A2 stubbed (block correctness, composes Q3+A1+M2)
+//   A2 (exact tp=2 block correctness, composes Q3+Q4+A1+M2)
 //
 // Run with:
 //   verus mha_tp.rs
@@ -192,17 +192,138 @@ pub proof fn q2_v_gather_roundtrip(w_v: Tensor, tp_size: nat)
 pub uninterp spec fn matmul(x: Tensor, w_t: Tensor) -> Tensor;
 pub uninterp spec fn transpose(t: Tensor) -> Tensor;
 pub uninterp spec fn attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor;
+pub uninterp spec fn tensor_sum(a: Tensor, b: Tensor) -> Tensor;
 
 pub open spec fn concat_cols(a: Tensor, b: Tensor) -> Tensor
     recommends a.len() == b.len(),
-    decreases a.len(),
 {
-    if a.len() == 0 {
-        Seq::<Row>::empty()
-    } else {
-        seq![a[0] + b[0]] + concat_cols(a.subrange(1, a.len() as int),
-                                        b.subrange(1, b.len() as int))
+    Seq::new(a.len(), |i: int| a[i] + b[i])
+}
+
+pub open spec fn shard_dim1(
+    w: Tensor,
+    rank: nat,
+    tp_size: nat,
+) -> Tensor
+    recommends
+        tp_size >= 1,
+        w.len() >= 1,
+        w[0].len() % tp_size == 0,
+        rank < tp_size,
+{
+    let shard_size = (w[0].len() / tp_size) as int;
+    Seq::new(w.len(), |i: int|
+        w[i].subrange(
+            (rank as int) * shard_size,
+            (rank as int + 1) * shard_size,
+        )
+    )
+}
+
+proof fn lemma_dim0_shards_reconstruct_tp2(w: Tensor)
+    requires w.len() % 2 == 0,
+    ensures shard(w, 0, 2) + shard(w, 1, 2) == w,
+{
+    let n = w.len() as int;
+    let s = (w.len() / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+    assert(shard(w, 0, 2) == w.subrange(0, s));
+    assert(shard(w, 1, 2) == w.subrange(s, n));
+    assert(w.subrange(0, s) + w.subrange(s, n) =~= w);
+}
+
+proof fn lemma_dim0_shards_well_formed_tp2(
+    w: Tensor,
+    cols: nat,
+)
+    requires
+        w.len() >= 2,
+        w.len() % 2 == 0,
+        well_formed(w, w.len(), cols),
+    ensures
+        well_formed(shard(w, 0, 2), w.len() / 2, cols),
+        well_formed(shard(w, 1, 2), w.len() / 2, cols),
+{
+    let n = w.len() as int;
+    let s = (w.len() / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+    let w0 = shard(w, 0, 2);
+    let w1 = shard(w, 1, 2);
+    assert(w0 == w.subrange(0, s));
+    assert(w1 == w.subrange(s, n));
+    assert(w0.len() == w.len() / 2);
+    assert(w1.len() == w.len() / 2);
+    assert forall|i: int| 0 <= i < w0.len() implies
+        #[trigger] w0[i].len() == cols by {
+        assert(w0[i] == w[i]);
     }
+    assert forall|i: int| 0 <= i < w1.len() implies
+        #[trigger] w1[i].len() == cols by {
+        assert(w1[i] == w[s + i]);
+        assert(0 <= s + i < w.len());
+    }
+}
+
+proof fn lemma_well_formed_row_concat(
+    a: Tensor,
+    b: Tensor,
+    cols: nat,
+)
+    requires
+        well_formed(a, a.len(), cols),
+        well_formed(b, b.len(), cols),
+    ensures well_formed(a + b, a.len() + b.len(), cols),
+{
+    assert forall|i: int| 0 <= i < (a + b).len() implies
+        #[trigger] (a + b)[i].len() == cols by {
+        if i < a.len() {
+            assert((a + b)[i] == a[i]);
+        } else {
+            assert((a + b)[i] == b[i - a.len() as int]);
+        }
+    }
+}
+
+proof fn lemma_dim1_shards_reconstruct_tp2(
+    w: Tensor,
+    rows: nat,
+    cols: nat,
+)
+    requires
+        w.len() >= 1,
+        well_formed(w, rows, cols),
+        cols % 2 == 0,
+    ensures concat_cols(
+        shard_dim1(w, 0, 2),
+        shard_dim1(w, 1, 2),
+    ) == w,
+{
+    let n = cols as int;
+    let s = (cols / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+    let w0 = shard_dim1(w, 0, 2);
+    let w1 = shard_dim1(w, 1, 2);
+    assert(w[0].len() == cols);
+    assert(w0.len() == w.len());
+    assert(w1.len() == w.len());
+    assert(concat_cols(w0, w1).len() == w.len());
+    assert forall|i: int| 0 <= i < w.len() implies
+        concat_cols(w0, w1)[i] == w[i] by {
+        assert(w[i].len() == cols);
+        assert(w0[i] == w[i].subrange(0, s));
+        assert(w1[i] == w[i].subrange(s, n));
+        assert(w[i].subrange(0, s) + w[i].subrange(s, n) =~= w[i]);
+    }
+    assert(concat_cols(w0, w1) =~= w);
 }
 
 /// Axiom AXIOM_M1: matmul splits over the out-dim of the weight.
@@ -219,8 +340,32 @@ pub proof fn axiom_m1(x: Tensor, w0: Tensor, w1: Tensor)
         == concat_cols(matmul(x, transpose(w0)), matmul(x, transpose(w1))),
 {}
 
-/// Axiom AXIOM_A1: attention commutes with head-shard (concat on dim 0 in
-/// our Tensor model, where each row corresponds to one head's flattened data).
+/// Axiom AXIOM_M2: the two row-parallel partial matmuls sum to the full
+/// matmul, provided both the activation and weight are the exact dim-1
+/// concatenations of their shards.
+#[verifier::external_body]
+pub proof fn axiom_m2(
+    x: Tensor,
+    w: Tensor,
+    x0: Tensor,
+    x1: Tensor,
+    w0: Tensor,
+    w1: Tensor,
+)
+    requires
+        x0.len() == x1.len(),
+        w0.len() > 0,
+        w0.len() == w1.len(),
+        x == concat_cols(x0, x1),
+        w == concat_cols(w0, w1),
+    ensures tensor_sum(
+        matmul(x0, transpose(w0)),
+        matmul(x1, transpose(w1)),
+    ) == matmul(x, transpose(w)),
+{}
+
+/// Axiom AXIOM_A1: attention commutes with concatenating disjoint head ranges
+/// in the flattened feature dimension of each token row.
 #[verifier::external_body]
 pub proof fn axiom_attn_head_local(
     q0: Tensor, q1: Tensor,
@@ -232,16 +377,25 @@ pub proof fn axiom_attn_head_local(
         q0.len() == v0.len(),
         q1.len() == k1.len(),
         q1.len() == v1.len(),
+        q0.len() == q1.len(),
     ensures
-        attention(q0 + q1, k0 + k1, v0 + v1)
-        == attention(q0, k0, v0) + attention(q1, k1, v1),
+        attention(
+            concat_cols(q0, q1),
+            concat_cols(k0, k1),
+            concat_cols(v0, v1),
+        ) == concat_cols(
+            attention(q0, k0, v0),
+            attention(q1, k1, v1),
+        ),
+        attention(q0, k0, v0).len() == q0.len(),
+        attention(q1, k1, v1).len() == q1.len(),
 {}
 
 // =====================================================================
-// §7 — Property Q3: merged QKV forward correctness (tp=2).
+// §7 — Property Q3: Q/K/V projection reconstruction (tp=2).
 //
-// The concat of per-rank QKV outputs equals the unsharded matmul against
-// the full merged qkv weight.
+// Each projection's two rank-local output shards reconstruct its unsharded
+// output.  An auxiliary lemma below also records the rank-packed layout.
 // =====================================================================
 
 pub open spec fn qkv_forward_output(
@@ -257,7 +411,9 @@ pub open spec fn qkv_forward_output(
     matmul(x, transpose(qkv_shard(w_q, w_k, w_v, rank, tp_size)))
 }
 
-/// Q3 for tp_size == 2: concat of QKV forward outputs equals unsharded matmul.
+/// Auxiliary fact about concatenating the two rank-packed QKV outputs.  The
+/// resulting weight order is `[q0,k0,v0,q1,k1,v1]`, not `qkv_full`; Q3 below
+/// performs the semantically relevant per-projection reconstruction.
 ///
 /// Note: qkv_shard = shard(w_q,r) + shard(w_k,r) + shard(w_v,r), and Seq
 /// addition is left-associative in Verus. So combining rank-0 and rank-1
@@ -265,7 +421,7 @@ pub open spec fn qkv_forward_output(
 /// [q||k] halves per rank, then the v halves; alternatively, one clean
 /// application if we let axiom_m1 handle the whole (qkv_shard_0, qkv_shard_1)
 /// pair directly. We take the second route.
-pub proof fn q3_qkv_forward_correctness_tp2(
+proof fn lemma_rank_packed_qkv_forward_tp2(
     x: Tensor, w_q: Tensor, w_k: Tensor, w_v: Tensor,
 )
     requires
@@ -380,6 +536,59 @@ pub proof fn q3_qkv_forward_correctness_tp2(
     axiom_m1(x, s0, s1);
 }
 
+pub proof fn q3_qkv_forward_correctness_tp2(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+)
+    requires
+        w_q.len() >= 2,
+        w_k.len() >= 2,
+        w_v.len() >= 2,
+        w_q.len() % 2 == 0,
+        w_k.len() % 2 == 0,
+        w_v.len() % 2 == 0,
+        exists|projection_cols: nat|
+            #[trigger] well_formed(
+                w_q, w_q.len(), projection_cols,
+            ) && well_formed(w_k, w_k.len(), projection_cols)
+                && well_formed(w_v, w_v.len(), projection_cols),
+        matmul(x, transpose(shard(w_q, 0, 2))).len()
+            == matmul(x, transpose(shard(w_q, 1, 2))).len(),
+        matmul(x, transpose(shard(w_k, 0, 2))).len()
+            == matmul(x, transpose(shard(w_k, 1, 2))).len(),
+        matmul(x, transpose(shard(w_v, 0, 2))).len()
+            == matmul(x, transpose(shard(w_v, 1, 2))).len(),
+    ensures
+        concat_cols(
+            matmul(x, transpose(shard(w_q, 0, 2))),
+            matmul(x, transpose(shard(w_q, 1, 2))),
+        ) == matmul(x, transpose(w_q)),
+        concat_cols(
+            matmul(x, transpose(shard(w_k, 0, 2))),
+            matmul(x, transpose(shard(w_k, 1, 2))),
+        ) == matmul(x, transpose(w_k)),
+        concat_cols(
+            matmul(x, transpose(shard(w_v, 0, 2))),
+            matmul(x, transpose(shard(w_v, 1, 2))),
+        ) == matmul(x, transpose(w_v)),
+{
+    let projection_cols = choose|projection_cols: nat|
+        well_formed(w_q, w_q.len(), projection_cols)
+            && well_formed(w_k, w_k.len(), projection_cols)
+            && well_formed(w_v, w_v.len(), projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_q, projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_k, projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_v, projection_cols);
+    lemma_dim0_shards_reconstruct_tp2(w_q);
+    lemma_dim0_shards_reconstruct_tp2(w_k);
+    lemma_dim0_shards_reconstruct_tp2(w_v);
+    axiom_m1(x, shard(w_q, 0, 2), shard(w_q, 1, 2));
+    axiom_m1(x, shard(w_k, 0, 2), shard(w_k, 1, 2));
+    axiom_m1(x, shard(w_v, 0, 2), shard(w_v, 1, 2));
+}
+
 // =====================================================================
 // §8 — Property Q4: three-way split matches per-projection shards.
 //
@@ -388,15 +597,67 @@ pub proof fn q3_qkv_forward_correctness_tp2(
 // matching each projection's per-shard forward.
 // =====================================================================
 
-/// Q4 (declared, stubbed): the three-way split of qkv_out_r matches
-/// the per-projection matmul outputs. Proof pattern: two applications of
-/// axiom_m1 (nested binary split), plus the same well-formedness
-/// scaffolding as Q3. Left as external_body for brevity — pattern is
-/// identical to Q3 with an extra decomposition step.
-#[verifier::external_body]
-pub proof fn q4_three_way_split_stub()
-    ensures true,
-{}
+/// Q4: the rank-local packed projection is exactly `[q_r | k_r | v_r]`.
+/// Therefore the source `torch.split` returns the three individual shard
+/// projections used by the attention proof.
+pub proof fn q4_three_way_split(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    rank: nat,
+    tp_size: nat,
+)
+    requires
+        tp_size >= 1,
+        rank < tp_size,
+        w_q.len() % tp_size == 0,
+        w_k.len() % tp_size == 0,
+        w_v.len() % tp_size == 0,
+        shard(w_q, rank, tp_size).len() > 0,
+        shard(w_k, rank, tp_size).len() > 0,
+        shard(w_v, rank, tp_size).len() > 0,
+        exists|projection_cols: nat|
+            #[trigger] well_formed(
+                shard(w_q, rank, tp_size),
+                shard(w_q, rank, tp_size).len(),
+                projection_cols,
+            ) && well_formed(
+                shard(w_k, rank, tp_size),
+                shard(w_k, rank, tp_size).len(),
+                projection_cols,
+            ) && well_formed(
+                shard(w_v, rank, tp_size),
+                shard(w_v, rank, tp_size).len(),
+                projection_cols,
+            ),
+        matmul(x, transpose(shard(w_q, rank, tp_size))).len()
+            == matmul(x, transpose(shard(w_k, rank, tp_size))).len(),
+        matmul(x, transpose(shard(w_q, rank, tp_size))).len()
+            == matmul(x, transpose(shard(w_v, rank, tp_size))).len(),
+    ensures qkv_forward_output(
+        x, w_q, w_k, w_v, rank, tp_size,
+    ) == concat_cols(
+        concat_cols(
+            matmul(x, transpose(shard(w_q, rank, tp_size))),
+            matmul(x, transpose(shard(w_k, rank, tp_size))),
+        ),
+        matmul(x, transpose(shard(w_v, rank, tp_size))),
+    ),
+{
+    let q = shard(w_q, rank, tp_size);
+    let k = shard(w_k, rank, tp_size);
+    let v = shard(w_v, rank, tp_size);
+    let projection_cols = choose|projection_cols: nat|
+        well_formed(q, q.len(), projection_cols)
+            && well_formed(k, k.len(), projection_cols)
+            && well_formed(v, v.len(), projection_cols);
+    axiom_m1(x, q, k);
+    lemma_well_formed_row_concat(q, k, projection_cols);
+    assert(matmul(x, transpose(q + k)).len()
+        == matmul(x, transpose(v)).len());
+    axiom_m1(x, q + k, v);
+}
 
 // =====================================================================
 // §9 — Property A1: attention commutes with head-gather (tp=2).
@@ -410,34 +671,191 @@ pub proof fn a1_attention_head_gather_tp2(
         q0.len() == v0.len(),
         q1.len() == k1.len(),
         q1.len() == v1.len(),
+        q0.len() == q1.len(),
     ensures
-        attention(q0, k0, v0) + attention(q1, k1, v1)
-        == attention(q0 + q1, k0 + k1, v0 + v1),
+        concat_cols(
+            attention(q0, k0, v0),
+            attention(q1, k1, v1),
+        ) == attention(
+            concat_cols(q0, q1),
+            concat_cols(k0, k1),
+            concat_cols(v0, v1),
+        ),
+        attention(q0, k0, v0).len() == q0.len(),
+        attention(q1, k1, v1).len() == q1.len(),
 {
     axiom_attn_head_local(q0, q1, k0, k1, v0, v1);
 }
 
 // =====================================================================
-// §10 — Property A2: block correctness (external stub).
+// §10 — Property A2: block correctness (tp_size == 2).
 //
-// The full MHA block output equals the unsharded MHA output. Composes
-// Q3, A1, and (row-parallel) axiom M2. Structural mirror of Ex02's T3.
+// The full MHA block output equals the unsharded MHA output.  This composes
+// Q3, Q4, A1, dim-1 output-weight reconstruction, and AXIOM_M2.
 // =====================================================================
 
-/// A2 (block correctness, external stub): compose Q3 + A1 + axiom M2.
-///
-/// Proof sketch (documented, not machine-checked here):
-///   1. By Q3 (via axiom M1), gathered qkv outputs equal unsharded matmul.
-///   2. By Q4 (three-way split), each rank's qkv_out splits into (q_r, k_r, v_r).
-///   3. By A1 (axiom attention head-local), gathered attention outputs
-///      equal attention on gathered (q, k, v).
-///   4. By axiom M2 (RowParallelLinear all-reduce), sum-over-ranks of
-///      matmul(a_r, W_o_shard_r) equals matmul(a, W_o).
-///   5. Composition of 1-4 gives A2.
-#[verifier::external_body]
-pub proof fn a2_block_correctness_stub()
-    ensures true,
-{}
+pub open spec fn local_projection_tp2(
+    x: Tensor,
+    w: Tensor,
+    rank: nat,
+) -> Tensor
+    recommends rank < 2, w.len() % 2 == 0,
+{
+    matmul(x, transpose(shard(w, rank, 2)))
+}
+
+pub open spec fn local_attention_tp2(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    rank: nat,
+) -> Tensor
+    recommends
+        rank < 2,
+        w_q.len() % 2 == 0,
+        w_k.len() % 2 == 0,
+        w_v.len() % 2 == 0,
+{
+    attention(
+        local_projection_tp2(x, w_q, rank),
+        local_projection_tp2(x, w_k, rank),
+        local_projection_tp2(x, w_v, rank),
+    )
+}
+
+pub open spec fn tp2_projection_shapes_match(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+) -> bool {
+    let q0 = local_projection_tp2(x, w_q, 0);
+    let q1 = local_projection_tp2(x, w_q, 1);
+    let k0 = local_projection_tp2(x, w_k, 0);
+    let k1 = local_projection_tp2(x, w_k, 1);
+    let v0 = local_projection_tp2(x, w_v, 0);
+    let v1 = local_projection_tp2(x, w_v, 1);
+    &&& q0.len() == q1.len()
+    &&& q0.len() == k0.len()
+    &&& q0.len() == k1.len()
+    &&& q0.len() == v0.len()
+    &&& q0.len() == v1.len()
+}
+
+/// Exact two-rank TP execution after expanding the packed projection with Q4.
+pub open spec fn tp_mha_forward_tp2(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    w_o: Tensor,
+) -> Tensor
+    recommends
+        w_q.len() % 2 == 0,
+        w_k.len() % 2 == 0,
+        w_v.len() % 2 == 0,
+        w_o.len() >= 1,
+        w_o[0].len() % 2 == 0,
+{
+    tensor_sum(
+        matmul(
+            local_attention_tp2(x, w_q, w_k, w_v, 0),
+            transpose(shard_dim1(w_o, 0, 2)),
+        ),
+        matmul(
+            local_attention_tp2(x, w_q, w_k, w_v, 1),
+            transpose(shard_dim1(w_o, 1, 2)),
+        ),
+    )
+}
+
+pub open spec fn unsharded_mha_forward(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    w_o: Tensor,
+) -> Tensor {
+    matmul(
+        attention(
+            matmul(x, transpose(w_q)),
+            matmul(x, transpose(w_k)),
+            matmul(x, transpose(w_v)),
+        ),
+        transpose(w_o),
+    )
+}
+
+/// A2: exact tp=2 QKV projection, head-local attention, output projection,
+/// and all-reduce equal the unsharded MHA block.
+pub proof fn a2_block_correctness_tp2(
+    x: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    w_v: Tensor,
+    w_o: Tensor,
+)
+    requires
+        w_q.len() >= 2,
+        w_k.len() >= 2,
+        w_v.len() >= 2,
+        w_q.len() % 2 == 0,
+        w_k.len() % 2 == 0,
+        w_v.len() % 2 == 0,
+        exists|projection_cols: nat|
+            #[trigger] well_formed(
+                w_q, w_q.len(), projection_cols,
+            ) && well_formed(w_k, w_k.len(), projection_cols)
+                && well_formed(w_v, w_v.len(), projection_cols),
+        tp2_projection_shapes_match(x, w_q, w_k, w_v),
+        w_o.len() >= 1,
+        well_formed(w_o, w_o.len(), w_o[0].len()),
+        w_o[0].len() % 2 == 0,
+    ensures tp_mha_forward_tp2(x, w_q, w_k, w_v, w_o)
+        == unsharded_mha_forward(x, w_q, w_k, w_v, w_o),
+{
+    let projection_cols = choose|projection_cols: nat|
+        well_formed(w_q, w_q.len(), projection_cols)
+            && well_formed(w_k, w_k.len(), projection_cols)
+            && well_formed(w_v, w_v.len(), projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_q, projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_k, projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_v, projection_cols);
+
+    let q0 = local_projection_tp2(x, w_q, 0);
+    let q1 = local_projection_tp2(x, w_q, 1);
+    let k0 = local_projection_tp2(x, w_k, 0);
+    let k1 = local_projection_tp2(x, w_k, 1);
+    let v0 = local_projection_tp2(x, w_v, 0);
+    let v1 = local_projection_tp2(x, w_v, 1);
+    q4_three_way_split(x, w_q, w_k, w_v, 0, 2);
+    q4_three_way_split(x, w_q, w_k, w_v, 1, 2);
+    q3_qkv_forward_correctness_tp2(x, w_q, w_k, w_v);
+
+    let a0 = local_attention_tp2(x, w_q, w_k, w_v, 0);
+    let a1 = local_attention_tp2(x, w_q, w_k, w_v, 1);
+    a1_attention_head_gather_tp2(q0, q1, k0, k1, v0, v1);
+    let full_attention = attention(
+        matmul(x, transpose(w_q)),
+        matmul(x, transpose(w_k)),
+        matmul(x, transpose(w_v)),
+    );
+    assert(concat_cols(a0, a1) == full_attention);
+    assert(a0.len() == a1.len());
+
+    lemma_dim1_shards_reconstruct_tp2(
+        w_o, w_o.len(), w_o[0].len(),
+    );
+    axiom_m2(
+        full_attention,
+        w_o,
+        a0,
+        a1,
+        shard_dim1(w_o, 0, 2),
+        shard_dim1(w_o, 1, 2),
+    );
+}
 
 } // verus!
 

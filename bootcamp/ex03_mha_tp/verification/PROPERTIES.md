@@ -11,7 +11,9 @@ sharded heads, followed by a row-parallel output projection.
 The abstraction model (`Tensor = Seq<Row>`, matmul uninterpreted, axiom M1)
 extends Ex02 with two new elements: a **three-way merged shard** and an
 **attention** uninterpreted op with a "attention commutes with head-shard"
-axiom.
+axiom. Each outer `Tensor` row represents one token position and its inner
+`Row` stores the flattened head/features dimension, so head-shard gathering is
+modeled by `concat_cols` on corresponding token rows.
 
 ## Abstraction model additions
 
@@ -34,11 +36,10 @@ $$
 = \mathrm{concat}_1(\mathrm{attention}(q_0, k_0, v_0), \mathrm{attention}(q_1, k_1, v_1))
 $$
 
-where `concat_1` concatenates along the head-axis (dim 1 in the
-`[B*T, n_heads, head_dim]` view; equivalently dim 0 in our
-`Tensor = Seq<Row>` model where each row is a single head's data). This
-captures the semantic fact that attention is head-local: attention on
-concatenated head-shards equals concatenation of per-head-shard attentions.
+where `concat_1` concatenates along the flattened head/features axis of every
+token row. This captures the semantic fact that attention is head-local:
+attention on concatenated head-shards equals concatenation of per-head-shard
+attentions.
 It's the reason MHA is TP-parallelizable at all.
 
 ## Properties to verify — QKVParallelLinear
@@ -77,14 +78,19 @@ $$
 ### Q3 — Merged QKV forward correctness (via axiom M1, tp=2)
 
 The QKV projection on rank `r` is
-`qkv_out_r := matmul(x, transpose(qkv_shard(r)))`. Gathering:
+`qkv_out_r := matmul(x, transpose(qkv_shard(r)))`. Because each rank packs its
+local Q, K, and V slices, the two packed rank outputs cannot simply be
+concatenated in rank order. Q3 instead reconstructs each projection
+independently:
 
 $$
-\bigparallel_{r=0}^{\text{tp}-1} qkv\_out_r = \mathrm{matmul}(x, \mathrm{transpose}(qkv\_full))
+\bigparallel_r q_r = xW_q^\top,\quad
+\bigparallel_r k_r = xW_k^\top,\quad
+\bigparallel_r v_r = xW_v^\top.
 $$
 
-**Proof**: apply Ex02's M1 axiom twice (three-way concat = two nested
-binary concats). Stated at tp=2 concretely; parameterized version stubbed.
+**Proof**: reconstruct each weight from its two dim-0 shards and apply M1 to
+each projection. Stated and machine-checked at tp=2.
 
 ### Q4 — Three-way split matches per-projection shards
 
@@ -96,7 +102,7 @@ regions:
 
 **Proof**: three-way application of axiom M1. This is what makes the
 Python `torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)` correspond to
-the abstract split.
+the abstract split. Machine-checked as `q4_three_way_split`.
 
 ## Properties to verify — TPMHA composition
 
@@ -132,6 +138,12 @@ $$
 **Proof**: chain Q3 (gathered QKV = unsharded matmul) with A1 (attention
 commutes with gather) with ex01's R4 (row-parallel all-reduce sum
 reconstructs the o_proj matmul).
+
+The artifact machine-checks this exact equality for `tp_size == 2` as
+`a2_block_correctness_tp2`. Its M2 contract is applicable only after both the
+attention input and output-projection weight have been proved to reconstruct
+from their two shards. The parameterized general-TP theorem remains future
+work.
 
 ## What each tool proves — this exercise
 

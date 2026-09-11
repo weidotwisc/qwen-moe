@@ -210,17 +210,121 @@ pub proof fn m2_w1_gather_roundtrip(w1: Tensor, tp_size: nat)
 pub uninterp spec fn matmul(x: Tensor, w_t: Tensor) -> Tensor;
 pub uninterp spec fn transpose(t: Tensor) -> Tensor;
 pub uninterp spec fn silu_mul(gate: Tensor, up: Tensor) -> Tensor;
+pub uninterp spec fn tensor_sum(a: Tensor, b: Tensor) -> Tensor;
 
 pub open spec fn concat_cols(a: Tensor, b: Tensor) -> Tensor
     recommends a.len() == b.len(),
-    decreases a.len(),
 {
-    if a.len() == 0 {
-        Seq::<Row>::empty()
-    } else {
-        seq![a[0] + b[0]] + concat_cols(a.subrange(1, a.len() as int),
-                                        b.subrange(1, b.len() as int))
+    Seq::new(a.len(), |i: int| a[i] + b[i])
+}
+
+/// The row-parallel down projection shards each weight row on its input
+/// dimension.  This is the dim-1 sharding rule used by Ex01.
+pub open spec fn shard_dim1(
+    w: Tensor,
+    rank: nat,
+    tp_size: nat,
+) -> Tensor
+    recommends
+        tp_size >= 1,
+        w.len() >= 1,
+        w[0].len() % tp_size == 0,
+        rank < tp_size,
+{
+    let shard_size = (w[0].len() / tp_size) as int;
+    Seq::new(w.len(), |i: int|
+        w[i].subrange(
+            (rank as int) * shard_size,
+            (rank as int + 1) * shard_size,
+        )
+    )
+}
+
+proof fn lemma_dim0_shards_reconstruct_tp2(w: Tensor)
+    requires w.len() % 2 == 0,
+    ensures shard(w, 0, 2) + shard(w, 1, 2) == w,
+{
+    let n = w.len() as int;
+    let s = (w.len() / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+    assert(shard(w, 0, 2) == w.subrange(0, s));
+    assert(shard(w, 1, 2) == w.subrange(s, n));
+    assert(w.subrange(0, s) + w.subrange(s, n) =~= w);
+}
+
+proof fn lemma_dim0_shards_well_formed_tp2(
+    w: Tensor,
+    cols: nat,
+)
+    requires
+        w.len() >= 2,
+        w.len() % 2 == 0,
+        well_formed(w, w.len(), cols),
+    ensures
+        well_formed(shard(w, 0, 2), w.len() / 2, cols),
+        well_formed(shard(w, 1, 2), w.len() / 2, cols),
+{
+    let n = w.len() as int;
+    let s = (w.len() / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+    let w0 = shard(w, 0, 2);
+    let w1 = shard(w, 1, 2);
+    assert(w0 == w.subrange(0, s));
+    assert(w1 == w.subrange(s, n));
+    assert(w0.len() == w.len() / 2);
+    assert(w1.len() == w.len() / 2);
+    assert forall|i: int| 0 <= i < w0.len() implies
+        #[trigger] w0[i].len() == cols by {
+        assert(w0[i] == w[i]);
     }
+    assert forall|i: int| 0 <= i < w1.len() implies
+        #[trigger] w1[i].len() == cols by {
+        assert(w1[i] == w[s + i]);
+        assert(0 <= s + i < w.len());
+    }
+}
+
+proof fn lemma_dim1_shards_reconstruct_tp2(
+    w: Tensor,
+    rows: nat,
+    cols: nat,
+)
+    requires
+        w.len() >= 1,
+        well_formed(w, rows, cols),
+        cols % 2 == 0,
+    ensures concat_cols(
+        shard_dim1(w, 0, 2),
+        shard_dim1(w, 1, 2),
+    ) == w,
+{
+    let n = cols as int;
+    let s = (cols / 2) as int;
+    lemma_fundamental_div_mod(n, 2);
+    assert(n == 2 * s) by (nonlinear_arith)
+        requires n == 2 * (n / 2) + n % 2, n % 2 == 0,
+            s == n / 2;
+
+    let w0 = shard_dim1(w, 0, 2);
+    let w1 = shard_dim1(w, 1, 2);
+    assert(w[0].len() == cols);
+    assert(w0.len() == w.len());
+    assert(w1.len() == w.len());
+    assert(concat_cols(w0, w1).len() == w.len());
+    assert forall|i: int| 0 <= i < w.len() implies
+        concat_cols(w0, w1)[i] == w[i] by {
+        assert(w[i].len() == cols);
+        assert(w0[i] == w[i].subrange(0, s));
+        assert(w1[i] == w[i].subrange(s, n));
+        assert(w[i].subrange(0, s) + w[i].subrange(s, n) =~= w[i]);
+    }
+    assert(concat_cols(w0, w1) =~= w);
 }
 
 /// Axiom AXIOM_M1: matmul splits over the out-dim of the weight.
@@ -241,16 +345,24 @@ pub proof fn axiom_m1(x: Tensor, w0: Tensor, w1: Tensor)
 /// (Row-parallel's post-all-reduce equivalence.)
 #[verifier::external_body]
 pub proof fn axiom_m2(
-    x0: Tensor, x1: Tensor,
-    w0: Tensor, w1: Tensor,
-    sum_of_matmuls: Tensor,
+    x: Tensor,
+    w: Tensor,
+    x0: Tensor,
+    x1: Tensor,
+    w0: Tensor,
+    w1: Tensor,
 )
     requires
-        // Full input is concat_cols(x0, x1); full weight (transposed) is transpose(w0 + w1).
-        // Postcondition: matmul(concat_cols(x0, x1), transpose(w0 + w1))
-        //             == sum_of_matmuls where sum_of_matmuls represents the elementwise sum.
-        true,
-    ensures true,
+        x0.len() == x1.len(),
+        w0.len() > 0,
+        w0.len() == w1.len(),
+        x == concat_cols(x0, x1),
+        w == concat_cols(w0, w1),
+    ensures
+        tensor_sum(
+            matmul(x0, transpose(w0)),
+            matmul(x1, transpose(w1)),
+        ) == matmul(x, transpose(w)),
 {}
 
 /// Axiom AXIOM_S1: elementwise silu_mul commutes with dim-1 concatenation.
@@ -262,7 +374,9 @@ pub proof fn axiom_s1(g0: Tensor, g1: Tensor, u0: Tensor, u1: Tensor)
         g0.len() == g1.len(),
     ensures
         silu_mul(concat_cols(g0, g1), concat_cols(u0, u1))
-        == concat_cols(silu_mul(g0, u0), silu_mul(g1, u1)),
+            == concat_cols(silu_mul(g0, u0), silu_mul(g1, u1)),
+        silu_mul(g0, u0).len() == g0.len(),
+        silu_mul(g1, u1).len() == g1.len(),
 {}
 
 // =====================================================================
@@ -451,39 +565,171 @@ pub proof fn t2_elementwise_commutes_with_gather_tp2(
 }
 
 // =====================================================================
-// §10 — Property T3: block correctness (tp_size == 2, stubbed general case).
+// §10 — Property T3: block correctness (tp_size == 2).
 //
 // The block output — sum over ranks of matmul(silu_mul(g_r, u_r), transpose
 // of the down-projection's row shard) — equals the unsharded MLP output.
 //
-// This requires composing M3, T1, T2, and AXIOM_M2 (row-parallel all-reduce).
-// The full mechanization requires modeling row-shard on dim 1, which
-// mirrors ex01's RowParallelLinear side; we leave it as an external_body
-// stub whose ensures clause states the block-level equivalence, with the
-// proof-composition sketch documented inline.
+// This composes dim-0 reconstruction, AXIOM_M1, T2, dim-1 reconstruction,
+// and the meaningful AXIOM_M2 row-parallel/all-reduce contract above.
 // =====================================================================
 
-/// T3 (block correctness, external stub): the TP-sharded MLP block output
-/// equals the unsharded MLP block output up to reduction-order tolerance.
-///
-/// Proof composition (documented, not machine-checked here):
-///   1. By T1, each rank's merged forward output splits as (g_r, u_r).
-///   2. By T2, elementwise silu_mul on (g_r, u_r) then dim-1 gather
-///      equals silu_mul on the dim-1-gathered (g, u).
-///   3. By M3, dim-1-gathered g and u each equal the unsharded matmul
-///      against W_gate and W_up.
-///   4. By AXIOM_M2 (RowParallelLinear all-reduce), sum-over-ranks of
-///      matmul(h_r, W_down_shard_r) equals matmul(h, W_down).
-///   5. Composing 1-4 gives the block-level equivalence.
-///
-/// The general-tp_size version and the RowParallelLinear formalization
-/// are in scope for follow-up work; see PROPERTIES.md §"Correspondence to
-/// Python" for the empirical validation via `bootcamp/tests/`.
-#[verifier::external_body]
-pub proof fn t3_block_correctness_stub()
-    ensures true,
+pub open spec fn local_gate_output_tp2(
+    x: Tensor,
+    w_gate: Tensor,
+    rank: nat,
+) -> Tensor
+    recommends rank < 2, w_gate.len() % 2 == 0,
 {
-    // External stub. See docstring for proof structure.
+    matmul(x, transpose(shard(w_gate, rank, 2)))
+}
+
+pub open spec fn local_up_output_tp2(
+    x: Tensor,
+    w_up: Tensor,
+    rank: nat,
+) -> Tensor
+    recommends rank < 2, w_up.len() % 2 == 0,
+{
+    matmul(x, transpose(shard(w_up, rank, 2)))
+}
+
+pub open spec fn local_hidden_tp2(
+    x: Tensor,
+    w_gate: Tensor,
+    w_up: Tensor,
+    rank: nat,
+) -> Tensor
+    recommends
+        rank < 2,
+        w_gate.len() % 2 == 0,
+        w_up.len() % 2 == 0,
+{
+    silu_mul(
+        local_gate_output_tp2(x, w_gate, rank),
+        local_up_output_tp2(x, w_up, rank),
+    )
+}
+
+/// Exact two-rank TP execution after expanding the merged projection with T1:
+/// each rank computes its SwiGLU hidden shard, applies the matching dim-1
+/// shard of the down projection, and all-reduce sums the partial outputs.
+pub open spec fn tp_mlp_forward_tp2(
+    x: Tensor,
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+) -> Tensor
+    recommends
+        w_gate.len() % 2 == 0,
+        w_up.len() % 2 == 0,
+        w_down.len() >= 1,
+        w_down[0].len() % 2 == 0,
+{
+    tensor_sum(
+        matmul(
+            local_hidden_tp2(x, w_gate, w_up, 0),
+            transpose(shard_dim1(w_down, 0, 2)),
+        ),
+        matmul(
+            local_hidden_tp2(x, w_gate, w_up, 1),
+            transpose(shard_dim1(w_down, 1, 2)),
+        ),
+    )
+}
+
+/// Exact unsharded mathematical SwiGLU MLP.
+pub open spec fn unsharded_mlp_forward(
+    x: Tensor,
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+) -> Tensor {
+    matmul(
+        silu_mul(
+            matmul(x, transpose(w_gate)),
+            matmul(x, transpose(w_up)),
+        ),
+        transpose(w_down),
+    )
+}
+
+/// T3: the exact tp=2 merged-column/SwiGLU/row-parallel execution equals
+/// the unsharded MLP.  Shape premises are the valid-matmul obligations of
+/// the abstract tensor model; no functional-equivalence premise is assumed.
+pub proof fn t3_block_correctness_tp2(
+    x: Tensor,
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+)
+    requires
+        w_gate.len() >= 2,
+        w_up.len() >= 2,
+        w_gate.len() % 2 == 0,
+        w_up.len() % 2 == 0,
+        exists|projection_cols: nat|
+            #[trigger] well_formed(
+                w_gate, w_gate.len(), projection_cols,
+            ) && well_formed(w_up, w_up.len(), projection_cols),
+        local_gate_output_tp2(x, w_gate, 0).len()
+            == local_gate_output_tp2(x, w_gate, 1).len(),
+        local_up_output_tp2(x, w_up, 0).len()
+            == local_up_output_tp2(x, w_up, 1).len(),
+        local_gate_output_tp2(x, w_gate, 0).len()
+            == local_up_output_tp2(x, w_up, 0).len(),
+        w_down.len() >= 1,
+        well_formed(w_down, w_down.len(), w_down[0].len()),
+        w_down[0].len() % 2 == 0,
+    ensures tp_mlp_forward_tp2(x, w_gate, w_up, w_down)
+        == unsharded_mlp_forward(x, w_gate, w_up, w_down),
+{
+    let projection_cols = choose|projection_cols: nat|
+        well_formed(w_gate, w_gate.len(), projection_cols)
+            && well_formed(w_up, w_up.len(), projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_gate, projection_cols);
+    lemma_dim0_shards_well_formed_tp2(w_up, projection_cols);
+    lemma_dim0_shards_reconstruct_tp2(w_gate);
+    lemma_dim0_shards_reconstruct_tp2(w_up);
+
+    let g0 = local_gate_output_tp2(x, w_gate, 0);
+    let g1 = local_gate_output_tp2(x, w_gate, 1);
+    let u0 = local_up_output_tp2(x, w_up, 0);
+    let u1 = local_up_output_tp2(x, w_up, 1);
+    t1_chunk_split_matches_shard(x, w_gate, w_up, 0, 2);
+    t1_chunk_split_matches_shard(x, w_gate, w_up, 1, 2);
+    axiom_m1(
+        x, shard(w_gate, 0, 2), shard(w_gate, 1, 2),
+    );
+    axiom_m1(
+        x, shard(w_up, 0, 2), shard(w_up, 1, 2),
+    );
+    assert(concat_cols(g0, g1)
+        == matmul(x, transpose(w_gate)));
+    assert(concat_cols(u0, u1)
+        == matmul(x, transpose(w_up)));
+
+    axiom_s1(g0, g1, u0, u1);
+    let h0 = local_hidden_tp2(x, w_gate, w_up, 0);
+    let h1 = local_hidden_tp2(x, w_gate, w_up, 1);
+    let h = silu_mul(
+        matmul(x, transpose(w_gate)),
+        matmul(x, transpose(w_up)),
+    );
+    assert(concat_cols(h0, h1) == h);
+    assert(h0.len() == h1.len());
+
+    lemma_dim1_shards_reconstruct_tp2(
+        w_down, w_down.len(), w_down[0].len(),
+    );
+    axiom_m2(
+        h,
+        w_down,
+        h0,
+        h1,
+        shard_dim1(w_down, 0, 2),
+        shard_dim1(w_down, 1, 2),
+    );
 }
 
 } // verus!

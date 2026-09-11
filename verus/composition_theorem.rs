@@ -1,9 +1,10 @@
 // End-to-end Tier-3 composition over one shared exact MoE semantic model.
 //
 // High-level refinement and swap propositions are proved here, not accepted
-// as theorem premises.  Component bridges invoke Ex01's collective contract,
-// Ex05's argsort proof, Ex06's expert-partition proof, and Ex09's pointwise
-// kernel contract.  Remaining assumptions are explicit model-to-source facts.
+// as theorem premises.  Component bridges invoke Ex04's GQA-output contract
+// (which reuses Ex01's collective postcondition), Ex05's argsort proof, Ex06's
+// expert-partition proof, and Ex09's pointwise kernel contract.  Remaining
+// assumptions are explicit model-to-source facts.
 //
 // Run with:
 //   verus --crate-type=lib verus/composition_theorem.rs
@@ -35,83 +36,90 @@ verus! {
 // §1 — Exact DP=1 block composition.
 // =====================================================================
 
-pub uninterp spec fn attention_forward(x: Tensor) -> Tensor;
-pub uninterp spec fn residual_add(attn_out: Tensor, moe_out: Tensor) -> Tensor;
-
-pub open spec fn moe_input_matches_attention(x: Tensor, input: MoeInput) -> bool {
-    input.token_values == attention_forward(x).content
-}
-
 pub open spec fn block_forward(
-    x: Tensor,
+    block_residual: Tensor,
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     world_size: nat,
     use_lean: bool,
     use_fused: bool,
 ) -> Tensor {
-    if moe_input_matches_attention(x, input) {
-        residual_add(
-            attention_forward(x),
-            scheduled_forward(
-                input, tensor_id, ep_group, world_size, use_lean, use_fused,
-            ),
-        )
-    } else {
-        Tensor { content: Seq::empty() }
-    }
+    residual_add(
+        block_residual,
+        scheduled_forward(
+            input, input_view, ep_group, world_size, use_lean, use_fused,
+        ),
+    )
 }
 
-pub open spec fn block_spec(x: Tensor, input: MoeInput) -> Tensor {
-    residual_add(attention_forward(x), moe_spec(input))
+pub open spec fn block_spec(
+    block_residual: Tensor,
+    input: MoeInput,
+) -> Tensor {
+    residual_add(block_residual, moe_spec(input))
 }
 
 /// The MoE input used by the integrated theorem is built from the preceding
-/// attention output and Ex05's concrete argsort result.
+/// GQA output, residual-add, RMSNorm, and Ex05's concrete argsort result.
 pub open spec fn verified_component_input(
-    x: Tensor,
+    residual: Tensor,
+    gqa_output_id: nat,
+    representative: Rank,
     config: ComponentMoeConfig,
     fused_values: Seq<int>,
 ) -> MoeInput {
+    let input_view = post_attention_view(residual, gqa_output_id);
     component_moe_input(
-        component_data_after_attention(attention_forward(x), config),
+        component_data_from_moe_input(input_view(representative), config),
         fused_values,
+    )
+}
+
+/// Residual carried around the MoE sublayer after the GQA residual-add and
+/// before post-attention RMSNorm.
+pub open spec fn verified_block_residual(
+    residual: Tensor,
+    gqa_output_id: nat,
+    representative: Rank,
+) -> Tensor {
+    post_gqa_residual(
+        residual, tensor_on(gqa_output_id, representative),
     )
 }
 
 /// Exact MoE equality is preserved by the attention/residual block context.
 pub proof fn lemma_block_context_congruence(
-    x: Tensor,
+    block_residual: Tensor,
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     world_size: nat,
     use_lean: bool,
     use_fused: bool,
 )
     requires
-        moe_input_matches_attention(x, input),
         semantic_eq(
             scheduled_forward(
-                input, tensor_id, ep_group, world_size, use_lean, use_fused,
+                input, input_view, ep_group, world_size, use_lean, use_fused,
             ),
             moe_spec(input),
         ),
     ensures semantic_eq(
         block_forward(
-            x, input, tensor_id, ep_group, world_size, use_lean, use_fused,
+            block_residual, input, input_view, ep_group, world_size,
+            use_lean, use_fused,
         ),
-        block_spec(x, input),
+        block_spec(block_residual, input),
     ),
 {
 }
 
 /// Every concrete schedule/kernel choice refines the same full-block spec.
 proof fn lemma_block_variant_refines_spec_from_invariants(
-    x: Tensor,
+    block_residual: Tensor,
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     world_size: nat,
     tp_size: nat,
     dp_size: nat,
@@ -125,32 +133,33 @@ proof fn lemma_block_variant_refines_spec_from_invariants(
         valid_dp1_topology(
             world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         ),
-        ReplicatedInput(input, tensor_id, tp_group),
+        ReplicatedInput(input, input_view, tp_group),
         ExpertPartitioned(input, world_size),
-        moe_input_matches_attention(x, input),
         RoutingConsistent(input),
         use_lean || all_to_all_partitionable(input),
         !use_fused || fused_rows_correct(input),
     ensures semantic_eq(
         block_forward(
-            x, input, tensor_id, ep_group, world_size, use_lean, use_fused,
+            block_residual, input, input_view, ep_group, world_size,
+            use_lean, use_fused,
         ),
-        block_spec(x, input),
+        block_spec(block_residual, input),
     ),
 {
     lemma_dp1_replication_transfers_to_ep(
-        input, tensor_id, world_size, tp_size, dp_size, ep_size,
+        input, input_view, world_size, tp_size, dp_size, ep_size,
         tp_group, ep_group,
     );
     if use_lean {
         l6_all_reduce_refines_spec(
-            input, tensor_id, ep_group, world_size, use_fused,
+            input, input_view, ep_group, world_size, use_fused,
         );
     } else {
-        h6_all_to_all_refines_spec(input, tensor_id, ep_group, use_fused);
+        h6_all_to_all_refines_spec(input, input_view, ep_group, use_fused);
     }
     lemma_block_context_congruence(
-        x, input, tensor_id, ep_group, world_size, use_lean, use_fused,
+        block_residual, input, input_view, ep_group, world_size,
+        use_lean, use_fused,
     );
 }
 
@@ -159,11 +168,11 @@ proof fn lemma_block_variant_refines_spec_from_invariants(
 /// established by their component proofs instead of supplied as Tier-3
 /// semantic assumptions.
 pub proof fn theorem_block_variant_from_components(
-    x: Tensor,
+    residual: Tensor,
     config: ComponentMoeConfig,
     fused_values: Seq<int>,
     fused_run: Ex09FusedRun,
-    tensor_id: nat,
+    gqa_output_id: nat,
     representative: Rank,
     world_size: nat,
     tp_size: nat,
@@ -179,48 +188,70 @@ pub proof fn theorem_block_variant_from_components(
             world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         ),
         config.expert_parallel_size == ep_size,
-        well_formed_component_data(component_data_after_attention(
-            attention_forward(x), config,
+        well_formed_component_data(component_data_from_moe_input(
+            post_attention_view(residual, gqa_output_id)(representative),
+            config,
         )),
         tp_group.contains(representative),
-        tensor_on(tensor_id, representative) == attention_forward(x),
         use_lean || all_to_all_partitionable(
-            verified_component_input(x, config, fused_values),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
         ),
         !use_fused || Ex09KernelContract(
-            verified_component_input(x, config, fused_values), fused_run,
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
+            fused_run,
         ),
     ensures semantic_eq(
         block_forward(
-            x,
-            verified_component_input(x, config, fused_values),
-            tensor_id,
+            verified_block_residual(
+                residual, gqa_output_id, representative,
+            ),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
+            post_attention_view(residual, gqa_output_id),
             ep_group,
             world_size,
             use_lean,
             use_fused,
         ),
         block_spec(
-            x, verified_component_input(x, config, fused_values),
+            verified_block_residual(
+                residual, gqa_output_id, representative,
+            ),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
         ),
     ),
 {
-    let data = component_data_after_attention(attention_forward(x), config);
+    let input_view = post_attention_view(residual, gqa_output_id);
+    let block_residual = verified_block_residual(
+        residual, gqa_output_id, representative,
+    );
+    let data = component_data_from_moe_input(
+        input_view(representative), config,
+    );
     let input = component_moe_input(data, fused_values);
-    assert(input == verified_component_input(x, config, fused_values));
+    assert(input == verified_component_input(
+        residual, gqa_output_id, representative, config, fused_values,
+    ));
 
     ex05_establishes_routing_consistent(data, fused_values);
     ex06_establishes_expert_partitioned(data, fused_values, world_size);
-    ex01_establishes_replicated_input(
-        input, tensor_id, tp_group, representative,
+    ex04_establishes_replicated_post_attention_input(
+        residual, gqa_output_id, tp_group, representative,
+        config, fused_values,
     );
-    assert(moe_input_matches_attention(x, input));
     if use_fused {
         ex09_establishes_fused_rows_correct(input, fused_run);
     }
 
     lemma_block_variant_refines_spec_from_invariants(
-        x, input, tensor_id, world_size, tp_size, dp_size, ep_size,
+        block_residual, input, input_view, world_size, tp_size, dp_size, ep_size,
         tp_group, ep_group, use_lean, use_fused,
     );
 }
@@ -229,11 +260,11 @@ pub proof fn theorem_block_variant_from_components(
 /// component contracts.  The only fused-path boundary is Ex09's pointwise
 /// kernel postcondition and its explicit representation relation.
 pub proof fn corollary_block_variants_from_components(
-    x: Tensor,
+    residual: Tensor,
     config: ComponentMoeConfig,
     fused_values: Seq<int>,
     fused_run: Ex09FusedRun,
-    tensor_id: nat,
+    gqa_output_id: nat,
     representative: Rank,
     world_size: nat,
     tp_size: nat,
@@ -251,34 +282,49 @@ pub proof fn corollary_block_variants_from_components(
             world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         ),
         config.expert_parallel_size == ep_size,
-        well_formed_component_data(component_data_after_attention(
-            attention_forward(x), config,
+        well_formed_component_data(component_data_from_moe_input(
+            post_attention_view(residual, gqa_output_id)(representative),
+            config,
         )),
         tp_group.contains(representative),
-        tensor_on(tensor_id, representative) == attention_forward(x),
         use_lean_a || all_to_all_partitionable(
-            verified_component_input(x, config, fused_values),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
         ),
         use_lean_b || all_to_all_partitionable(
-            verified_component_input(x, config, fused_values),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
         ),
         (use_fused_a || use_fused_b) ==> Ex09KernelContract(
-            verified_component_input(x, config, fused_values), fused_run,
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
+            fused_run,
         ),
     ensures semantic_eq(
         block_forward(
-            x,
-            verified_component_input(x, config, fused_values),
-            tensor_id,
+            verified_block_residual(
+                residual, gqa_output_id, representative,
+            ),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
+            post_attention_view(residual, gqa_output_id),
             ep_group,
             world_size,
             use_lean_a,
             use_fused_a,
         ),
         block_forward(
-            x,
-            verified_component_input(x, config, fused_values),
-            tensor_id,
+            verified_block_residual(
+                residual, gqa_output_id, representative,
+            ),
+            verified_component_input(
+                residual, gqa_output_id, representative, config, fused_values,
+            ),
+            post_attention_view(residual, gqa_output_id),
             ep_group,
             world_size,
             use_lean_b,
@@ -286,27 +332,35 @@ pub proof fn corollary_block_variants_from_components(
         ),
     ),
 {
-    let input = verified_component_input(x, config, fused_values);
+    let input = verified_component_input(
+        residual, gqa_output_id, representative, config, fused_values,
+    );
+    let input_view = post_attention_view(residual, gqa_output_id);
+    let block_residual = verified_block_residual(
+        residual, gqa_output_id, representative,
+    );
     theorem_block_variant_from_components(
-        x, config, fused_values, fused_run, tensor_id, representative,
+        residual, config, fused_values, fused_run,
+        gqa_output_id, representative,
         world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         use_lean_a, use_fused_a,
     );
     theorem_block_variant_from_components(
-        x, config, fused_values, fused_run, tensor_id, representative,
+        residual, config, fused_values, fused_run,
+        gqa_output_id, representative,
         world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         use_lean_b, use_fused_b,
     );
     theorem_shared_spec_implies_equiv(
         block_forward(
-            x, input, tensor_id, ep_group, world_size,
+            block_residual, input, input_view, ep_group, world_size,
             use_lean_a, use_fused_a,
         ),
         block_forward(
-            x, input, tensor_id, ep_group, world_size,
+            block_residual, input, input_view, ep_group, world_size,
             use_lean_b, use_fused_b,
         ),
-        block_spec(x, input),
+        block_spec(block_residual, input),
     );
 }
 

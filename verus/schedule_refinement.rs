@@ -8,6 +8,11 @@ verus! {
 
 pub type Rank = nat;
 pub type Group = Set<Rank>;
+pub type RankTensorView = spec_fn(Rank) -> Tensor;
+
+pub open spec fn stored_tensor_view(tensor_id: nat) -> RankTensorView {
+    |rank: Rank| tensor_on(tensor_id, rank)
+}
 
 /// The contiguous expert placement used by the implementation.  Invalid
 /// expert ids map to rank zero only to keep the specification total; routing
@@ -122,13 +127,13 @@ pub proof fn lemma_all_reduce_reconstructs_work_value(
 /// Every rank in a non-empty group observes this exact MoE input tensor.
 pub open spec fn ReplicatedInput(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     group: Group,
 ) -> bool {
     let input_tensor = Tensor { content: input.token_values };
     &&& exists|r: Rank| group.contains(r)
     &&& forall|r: Rank| group.contains(r)
-        ==> tensor_on(tensor_id, r) == input_tensor
+        ==> input_view(r) == input_tensor
 }
 
 /// DP=1 makes both the TP and EP groups equal to the world group.
@@ -154,7 +159,7 @@ pub open spec fn valid_dp1_topology(
 
 pub proof fn lemma_dp1_replication_transfers_to_ep(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     world_size: nat,
     tp_size: nat,
     dp_size: nat,
@@ -166,15 +171,15 @@ pub proof fn lemma_dp1_replication_transfers_to_ep(
         valid_dp1_topology(
             world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         ),
-        ReplicatedInput(input, tensor_id, tp_group),
-    ensures ReplicatedInput(input, tensor_id, ep_group),
+        ReplicatedInput(input, input_view, tp_group),
+    ensures ReplicatedInput(input, input_view, ep_group),
 {
     assert(ep_group.contains(0nat));
     assert(exists|r: Rank| ep_group.contains(r)) by {
         assert(ep_group.contains(0nat));
     }
     assert forall|r: Rank| ep_group.contains(r)
-        implies tensor_on(tensor_id, r)
+        implies input_view(r)
             == Tensor { content: input.token_values } by {
         assert(r < world_size);
         assert(tp_group.contains(r));
@@ -519,12 +524,12 @@ pub proof fn theorem_rank_local_partials_sum_to_moe_spec(
 /// collective sums those tensors elementwise.
 pub open spec fn all_reduce_forward(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     world_size: nat,
     use_fused: bool,
 ) -> Tensor {
-    if ReplicatedInput(input, tensor_id, ep_group) {
+    if ReplicatedInput(input, input_view, ep_group) {
         all_reduce_partial_outputs(
             input,
             world_size,
@@ -799,11 +804,11 @@ pub proof fn theorem_all_to_all_pipeline_refines_routed_execution(
 /// scatter-adds them into token rows.
 pub open spec fn all_to_all_forward(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     use_fused: bool,
 ) -> Tensor {
-    if ReplicatedInput(input, tensor_id, ep_group)
+    if ReplicatedInput(input, input_view, ep_group)
         && all_to_all_partitionable(input) {
         all_to_all_pipeline_output(input, use_fused)
     } else {
@@ -813,35 +818,35 @@ pub open spec fn all_to_all_forward(
 
 pub open spec fn scheduled_forward(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     group: Group,
     world_size: nat,
     use_all_reduce: bool,
     use_fused: bool,
 ) -> Tensor {
     if use_all_reduce {
-        all_reduce_forward(input, tensor_id, group, world_size, use_fused)
+        all_reduce_forward(input, input_view, group, world_size, use_fused)
     } else {
-        all_to_all_forward(input, tensor_id, group, use_fused)
+        all_to_all_forward(input, input_view, group, use_fused)
     }
 }
 
 /// L6: the DP=1 all-reduce schedule refines the shared exact MoE semantics.
 pub proof fn l6_all_reduce_refines_spec(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     world_size: nat,
     use_fused: bool,
 )
     requires
-        ReplicatedInput(input, tensor_id, ep_group),
+        ReplicatedInput(input, input_view, ep_group),
         ExpertPartitioned(input, world_size),
         RoutingConsistent(input),
         !use_fused || fused_rows_correct(input),
     ensures semantic_eq(
         all_reduce_forward(
-            input, tensor_id, ep_group, world_size, use_fused,
+            input, input_view, ep_group, world_size, use_fused,
         ),
         moe_spec(input),
     ),
@@ -870,25 +875,25 @@ pub proof fn l6_all_reduce_refines_spec(
 /// same logical token/expert work even though they communicate differently.
 pub proof fn h6_all_to_all_refines_spec(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     use_fused: bool,
 )
     requires
-        ReplicatedInput(input, tensor_id, ep_group),
+        ReplicatedInput(input, input_view, ep_group),
         ExpertPartitioned(input, input.expert_parallel_size),
         all_to_all_partitionable(input),
         RoutingConsistent(input),
         !use_fused || fused_rows_correct(input),
     ensures semantic_eq(
-        all_to_all_forward(input, tensor_id, ep_group, use_fused),
+        all_to_all_forward(input, input_view, ep_group, use_fused),
         moe_spec(input),
     ),
 {
     theorem_all_to_all_pipeline_refines_routed_execution(input, use_fused);
     e2_permuted_refines_spec(input);
     lemma_semantic_eq_trans(
-        all_to_all_forward(input, tensor_id, ep_group, use_fused),
+        all_to_all_forward(input, input_view, ep_group, use_fused),
         permuted_forward(input),
         moe_spec(input),
     );
@@ -899,7 +904,7 @@ pub proof fn h6_all_to_all_refines_spec(
 /// this replacement when the input is partitioned across data-parallel ranks.
 pub proof fn theorem_all_to_all_equiv_all_reduce_dp1(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     world_size: nat,
     tp_size: nat,
     dp_size: nat,
@@ -912,32 +917,32 @@ pub proof fn theorem_all_to_all_equiv_all_reduce_dp1(
         valid_dp1_topology(
             world_size, tp_size, dp_size, ep_size, tp_group, ep_group,
         ),
-        ReplicatedInput(input, tensor_id, tp_group),
+        ReplicatedInput(input, input_view, tp_group),
         ExpertPartitioned(input, world_size),
         all_to_all_partitionable(input),
         RoutingConsistent(input),
         !use_fused || fused_rows_correct(input),
     ensures semantic_eq(
         all_reduce_forward(
-            input, tensor_id, ep_group, world_size, use_fused,
+            input, input_view, ep_group, world_size, use_fused,
         ),
-        all_to_all_forward(input, tensor_id, ep_group, use_fused),
+        all_to_all_forward(input, input_view, ep_group, use_fused),
     ),
 {
     lemma_dp1_replication_transfers_to_ep(
-        input, tensor_id, world_size, tp_size, dp_size, ep_size,
+        input, input_view, world_size, tp_size, dp_size, ep_size,
         tp_group, ep_group,
     );
 
     l6_all_reduce_refines_spec(
-        input, tensor_id, ep_group, world_size, use_fused,
+        input, input_view, ep_group, world_size, use_fused,
     );
-    h6_all_to_all_refines_spec(input, tensor_id, ep_group, use_fused);
+    h6_all_to_all_refines_spec(input, input_view, ep_group, use_fused);
     theorem_shared_spec_implies_equiv(
         all_reduce_forward(
-            input, tensor_id, ep_group, world_size, use_fused,
+            input, input_view, ep_group, world_size, use_fused,
         ),
-        all_to_all_forward(input, tensor_id, ep_group, use_fused),
+        all_to_all_forward(input, input_view, ep_group, use_fused),
         moe_spec(input),
     );
 }
@@ -945,43 +950,43 @@ pub proof fn theorem_all_to_all_equiv_all_reduce_dp1(
 /// Kernel swap for either schedule, proved from E1/E2/F4.
 pub proof fn theorem_python_equiv_fused_for_schedule(
     input: MoeInput,
-    tensor_id: nat,
+    input_view: RankTensorView,
     ep_group: Group,
     world_size: nat,
     use_all_reduce: bool,
 )
     requires
-        ReplicatedInput(input, tensor_id, ep_group),
+        ReplicatedInput(input, input_view, ep_group),
         ExpertPartitioned(input, world_size),
         use_all_reduce || all_to_all_partitionable(input),
         RoutingConsistent(input),
         fused_rows_correct(input),
     ensures semantic_eq(
         scheduled_forward(
-            input, tensor_id, ep_group, world_size, use_all_reduce, false,
+            input, input_view, ep_group, world_size, use_all_reduce, false,
         ),
         scheduled_forward(
-            input, tensor_id, ep_group, world_size, use_all_reduce, true,
+            input, input_view, ep_group, world_size, use_all_reduce, true,
         ),
     ),
 {
     if use_all_reduce {
         l6_all_reduce_refines_spec(
-            input, tensor_id, ep_group, world_size, false,
+            input, input_view, ep_group, world_size, false,
         );
         l6_all_reduce_refines_spec(
-            input, tensor_id, ep_group, world_size, true,
+            input, input_view, ep_group, world_size, true,
         );
     } else {
-        h6_all_to_all_refines_spec(input, tensor_id, ep_group, false);
-        h6_all_to_all_refines_spec(input, tensor_id, ep_group, true);
+        h6_all_to_all_refines_spec(input, input_view, ep_group, false);
+        h6_all_to_all_refines_spec(input, input_view, ep_group, true);
     }
     theorem_shared_spec_implies_equiv(
         scheduled_forward(
-            input, tensor_id, ep_group, world_size, use_all_reduce, false,
+            input, input_view, ep_group, world_size, use_all_reduce, false,
         ),
         scheduled_forward(
-            input, tensor_id, ep_group, world_size, use_all_reduce, true,
+            input, input_view, ep_group, world_size, use_all_reduce, true,
         ),
         moe_spec(input),
     );

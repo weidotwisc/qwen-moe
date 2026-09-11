@@ -126,6 +126,21 @@ $$
 the multiplication by `n_rep = num_heads_per_rank / num_kv_heads_per_rank`
 gives the required equality.
 
+### G5 — Output projection all-reduce makes GQA output replicated
+
+The GQA output projection is a row-parallel linear layer. After its exit
+all-reduce, every rank in the TP group observes the same projected attention
+tensor:
+
+$$
+\forall r,r' \in TP,\quad y_r = y_{r'}.
+$$
+
+**Proof**: direct application of Ex01's
+`r4b_output_replicated_after_all_reduce`. This is a structural collective
+postcondition. It does not prove that the common value equals unsharded GQA;
+that stronger numerical statement remains the deferred R3 property.
+
 ### R2 — Two replica-siblings compute the same attention output
 
 For ranks r, r' with `kv_slot(r) == kv_slot(r')`, if they receive the same
@@ -177,6 +192,9 @@ matmul. Correspondence:
    the per-original-index content property.
 3. Everything else (RoPE folded into attention, SDPA head-locality) is
    identical to Ex03's abstraction.
+4. `TPGQA.forward` passes the row-parallel output projection through an
+   all-reduce. G5 reuses Ex01's audited all-reduce replication postcondition
+   for this exact seam into the downstream residual-add/RMSNorm operations.
 
 ## Correctness of the abstraction
 

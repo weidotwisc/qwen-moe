@@ -7,6 +7,7 @@
 //   G3 (KV shards partition, coarser: gather-by-slot reconstructs w_k, w_v)
 //   G4 (three-projection weight_loader post-condition)
 //   R1 (post-repeat_interleave head count matches Q's per-rank count)
+//   G5 (output projection all-reduce makes the GQA output replicated)
 //   R2 stubbed (replica-siblings attend against identical K,V)
 //   R3 stubbed (block correctness)
 //
@@ -16,6 +17,13 @@
 use vstd::prelude::*;
 use vstd::calc;
 use vstd::arithmetic::div_mod::lemma_fundamental_div_mod;
+
+#[path = "../../../verus/composition_core.rs"]
+mod composition_core;
+use crate::composition_core::tensor_on;
+
+#[path = "../../ex01_linear_tp/verification/row_parallel.rs"]
+mod ex01_row_parallel;
 
 verus! {
 
@@ -306,7 +314,36 @@ pub proof fn r1_repeat_interleave_head_count(
 }
 
 // =====================================================================
-// §10 — Property R2: replica-siblings compute identical K/V (external stub).
+// §10 — Property G5: output projection replication.
+//
+// GQA's output projection is row-parallel.  Its exit all-reduce therefore
+// gives every rank in the TP group the same projected attention tensor.
+// This structural postcondition is sufficient for the downstream MoE seam;
+// it does not claim full numerical equivalence to unsharded GQA (R3 below).
+// =====================================================================
+
+pub open spec fn GqaOutputReplicated(
+    output_id: nat,
+    tp_group: Set<nat>,
+) -> bool {
+    forall|r1: nat, r2: nat|
+        tp_group.contains(r1) && tp_group.contains(r2)
+            ==> tensor_on(output_id, r1) == tensor_on(output_id, r2)
+}
+
+pub proof fn g5_gqa_output_replicated_after_output_projection(
+    output_id: nat,
+    tp_group: Set<nat>,
+)
+    ensures GqaOutputReplicated(output_id, tp_group),
+{
+    ex01_row_parallel::r4b_output_replicated_after_all_reduce(
+        output_id, tp_group,
+    );
+}
+
+// =====================================================================
+// §11 — Property R2: replica-siblings compute identical K/V (external stub).
 // =====================================================================
 
 /// R2 (external stub): two ranks with the same kv_slot, when handed the
@@ -319,7 +356,7 @@ pub proof fn r2_replica_siblings_identical_kv_stub()
 {}
 
 // =====================================================================
-// §11 — Property R3: block correctness (external stub).
+// §12 — Property R3: block correctness (external stub).
 //
 // Full GQA block equals unsharded GQA. Composes G3+G4+R1+Ex03-A1+Ex01-R4.
 // =====================================================================

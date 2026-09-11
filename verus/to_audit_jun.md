@@ -5,15 +5,15 @@ efficiently. Written by Claude (AI drafter). Wei has read this and
 signed off on the structure; Jun is the auditor of record.
 
 **Status** (updated 2026-09-11):
-- **204 unique verified proof functions, 0 errors** across **20 Verus source
+- **220 unique verified proof functions, 0 errors** across **20 Verus source
   files**. This counts shared modules once. Standalone command totals must not
   be added together because the core, kernel, schedule, and deadlock modules
   are re-verified when imported by another crate root.
 - The Tier-3 bridge files contain no new `#[verifier::external_body]`.
-  The public block theorem now imports and invokes Ex01, Ex05, Ex06, and Ex09
-  contracts to establish replication, routing, ownership, and fused-row
-  obligations. The imported component files retain their documented low-level
-  model-to-source axioms.
+  The public block theorem now imports and invokes Ex04, Ex05, Ex06, and Ex09
+  contracts to establish the GQA-to-MoE seam, routing, ownership, and fused-row
+  obligations. Ex04 reuses Ex01's all-reduce postcondition. The imported
+  component files retain their documented low-level model-to-source axioms.
 - All files typecheck against Verus 0.2025.07.12.0b6f3cb.
 - Every proof has been drafted by Claude in this session; Jun's audit
   is the human-verification step of the paper's methodology contribution.
@@ -58,20 +58,24 @@ math. Read `PROPERTIES.md` first, then the `.rs`.
 |----------|------|---------:|----------------|--------------------|
 | Ex01 linear_tp (col) | `column_parallel.rs` | 12 | C1-C4 for ColumnParallelLinear | AXIOM_M1 (matmul splits over out-dim) |
 | Ex01 linear_tp (row) | `row_parallel.rs` | 13 | R1-R4 for RowParallelLinear + R4b (Replicated after all-reduce) | AXIOM_M2, `axiom_all_reduce_produces_replicated` |
-| Ex02 mlp_tp | `mlp_tp.rs` | 13 | M1-M3 merged column + T1-T3 SwiGLU composition | AXIOM_M1, AXIOM_M2, AXIOM_S1 |
-| Ex03 mha_tp | `mha_tp.rs` | 13 | Q1-Q4 QKV column + A1-A2 attention composition | AXIOM_M1, AXIOM_ATTN_HEAD_LOCAL |
-| Ex04 gqa_tp | `gqa_tp.rs` | 11 | G1-G4 GQA + R1 KV-replication invariants | AXIOM_RI1 (repeat_interleave) |
+| Ex02 mlp_tp | `mlp_tp.rs` | 19 | M1-M3 merged column + exact tp=2 T1-T3 SwiGLU block composition | AXIOM_M1, meaningful reconstruction-conditioned AXIOM_M2, AXIOM_S1 |
+| Ex03 mha_tp | `mha_tp.rs` | 22 | Q1-Q4 QKV projection/split + exact tp=2 A1-A2 attention block composition | AXIOM_M1, reconstruction-conditioned AXIOM_M2, AXIOM_ATTN_HEAD_LOCAL |
+| Ex04 gqa_tp | `gqa_tp.rs` | 12 | G1-G5 GQA + R1 KV-replication invariants, including replicated output projection | AXIOM_RI1 (repeat_interleave), Ex01 all-reduce replication axiom |
 | Ex05 moe_baseline | `moe_baseline.rs` | 24 | RT1-RT3 routing invariants + RT5 partition-size correctness (catches v8/v10) + unconditional conservation + RT4 permutation bijection; exact E1/E2 live in the shared Tier-3 model | AXIOM_SOFTMAX_SUM, AXIOM_ARGSORT_INVERSE |
 | Ex06_ep_pure | `ep_pure.rs` | 8 | EP1-EP4 expert-partition + dispatch symmetry | AXIOM_A2A_COUNT_SYMMETRIC |
 | Ex06_ep (lean) | `lean.rs` | 7 | L2 disjointness + L2-covers + L3/L5; exact L4 lives in the shared Tier-3 model | AXIOM_ALLREDUCE_SUM_REPLICATED |
 | Ex07 tp_ep_hybrid | `hybrid.rs` | 3 | H2 striping determinism; exact H6 lives in the shared Tier-3 model | tensor_on opaque |
 | Ex09 fused_moe (contract) | `fused_moe.rs` | 2 | F1 offset coverage + F3 empty-expert; exact F4 lives in the shared Tier-3 model | expert_apply opaque |
 | Ex09 fused_moe (DSL) | `fused_kernel_dsl.rs` | 24 | K1 tile coverage/disjointness, exact K2 reduction, grouped-GEMM K3, and three-GEMM fused F4 | none; source-to-DSL correspondence remains audited |
-| **Subtotal** | | **130** | | |
+| **Subtotal** | | **146** | | |
 
 The Ex01 row file has 13 unique local verification items; its standalone
 command now reports 29 because it imports the 16-item shared composition model
 to use the same distributed tensor observation as Tier 3.
+
+The Ex04 file has 12 unique local verification items; its standalone command
+reports 57 because G5 imports Ex01 row and both modules import the shared
+composition model. These imported results must not be counted again.
 
 **Ex01 detail** — the paper's exemplar per-component proof. Read
 [`bootcamp/ex01_linear_tp/verification/PROPERTIES.md`](../bootcamp/ex01_linear_tp/verification/PROPERTIES.md)
@@ -112,10 +116,10 @@ files re-export shared proof modules so they can also be checked standalone.
 | `composition_core.rs` | 16 | 16 | Exact equality, work semantics, permutation invariance, fused-row refinement, and work conservation |
 | `kernel_refinement.rs` | imported | 6 | E1, E2, F4 and Naive/Permuted/Fused equivalences |
 | `schedule_refinement.rs` | imported | 18 | Expert ownership, rank-local partial outputs, elementwise all-reduce SUM, explicit all-to-all dispatch/compute/combine round trip, schedule swap, and per-schedule kernel swap |
-| `component_integration.rs` | imported | 8 | Bridges Ex01 replication, Ex05 argsort, Ex06 expert partition, and the proved Ex09 DSL execution into the shared Tier-3 predicates |
+| `component_integration.rs` | imported | 8 | Bridges Ex04/Ex01 replication through residual-add and RMSNorm, Ex05 argsort, Ex06 expert partition, and the proved Ex09 DSL execution into the shared Tier-3 predicates |
 | `lean_equiv_hybrid_dp1.rs` | 40 | 0 | Standalone crate root importing core + kernel + schedule modules (historical filename) |
 | `naive_equiv_fused_moe.rs` | 22 | 0 | Standalone crate root importing core + kernel modules |
-| `composition_theorem.rs` | 156 | 10 | Component-connected block composition + work, deadlock, and atomic-scatter safety; imports shared modules and relevant Tier-1 proofs |
+| `composition_theorem.rs` | 184 | 10 | Component-connected block composition + work, deadlock, and atomic-scatter safety; imports shared modules and relevant Tier-1 proofs |
 | `deadlock_free.rs` | 12 | 12 | Transition-system deadlock proof + concrete DP=1 all-reduce and all-to-all schedules |
 | **Unique subtotal** | | **70** | Shared modules counted once; imported Tier-1 proofs remain counted in the Tier-1 subtotal |
 
@@ -130,8 +134,8 @@ the other `(dp,tp)` points.
 
 ## 3. Grand total
 
-**204 unique verified proof functions, 0 errors, 20 source files**
-(per-component: 130; `axiom_base.rs`: 4; current composition cluster: 70).
+**220 unique verified proof functions, 0 errors, 20 source files**
+(per-component: 146; `axiom_base.rs`: 4; current composition cluster: 70).
 Re-verified 2026-09-11. Shared imports are counted once.
 
 ## 4. Property matrix — what's actually proved
@@ -144,11 +148,15 @@ Re-verified 2026-09-11. Shared imports are counted once.
 | RowParallelLinear sum-of-partials = unsharded matmul | Ex01 row | `r4_forward_correctness_tp2` |
 | RowParallelLinear output is Replicated on tp_group | Ex01 row | `r4b_output_replicated_after_all_reduce` |
 | Merged column-parallel = unsharded merged matmul | Ex02 | `m3_merged_forward_correctness_tp2` |
-| QKV three-way split matches per-projection matmul | Ex03 | `q3_qkv_forward_correctness_tp2` |
+| TP=2 SwiGLU MLP block = unsharded MLP | Ex02 | `t3_block_correctness_tp2` |
+| TP=2 Q/K/V projection shards reconstruct unsharded projections | Ex03 | `q3_qkv_forward_correctness_tp2` |
+| Rank-local packed QKV output splits into the three shard projections | Ex03 | `q4_three_way_split` |
+| TP=2 MHA block = unsharded MHA | Ex03 | `a2_block_correctness_tp2` |
 | GQA weight_loader post-condition | Ex04 | `g4_gqa_weight_loader_postcondition` |
+| GQA output projection is replicated after all-reduce | Ex04 | `g5_gqa_output_replicated_after_output_projection` |
 | Ex05 argsort establishes shared routing consistency | `component_integration.rs` | `ex05_establishes_routing_consistent` |
 | Ex06 contiguous partition establishes shared expert ownership | `component_integration.rs` | `ex06_establishes_expert_partitioned` |
-| Ex01 row-parallel replication establishes shared replicated input | `component_integration.rs` | `ex01_establishes_replicated_input` |
+| GQA output replication survives residual-add/RMSNorm and establishes MoE input replication | `component_integration.rs` | `ex04_establishes_replicated_post_attention_input` |
 | Ex09 DSL equals the Python mathematical expert reference | `fused_kernel_dsl.rs` | `k2_k_reduce_correctness`, `k3_grouped_matmul_dsl_equals_reference`, `f4_fused_moe_dsl_equals_python_reference` |
 | Ex09 DSL execution establishes the component row postcondition | `component_integration.rs` | `ex09_dsl_execution_establishes_postcondition`, `ex09_establishes_fused_rows_correct` |
 | Naive MoE refines MoE_spec | `kernel_refinement.rs` | `e1_naive_refines_spec` |
@@ -160,7 +168,7 @@ Re-verified 2026-09-11. Shared imports are counted once.
 | Permuted ≡ Fused Triton | `kernel_refinement.rs` | `theorem_permuted_equiv_fused` |
 | Naive ≡ Fused Triton | `kernel_refinement.rs` | `theorem_naive_equiv_fused` |
 | Naive ≡ Permuted | `kernel_refinement.rs` | `corollary_naive_equiv_permuted` |
-| Block-level 2×2 grid equivalence | `composition_theorem.rs` §1 | `corollary_block_variants_from_components`; invokes Ex01/Ex05/Ex06/Ex09 bridges before the concrete refinements |
+| Block-level 2×2 grid equivalence | `composition_theorem.rs` §1 | `corollary_block_variants_from_components`; invokes Ex04/Ex05/Ex06/Ex09 bridges before the concrete refinements; Ex04 invokes Ex01's all-reduce contract |
 
 ### Global safety goals — the paper's four goals, and where each is PROVED
 
@@ -257,7 +265,7 @@ a well-known mathematical fact.
 | Axiom | Where | What it says |
 |-------|-------|--------------|
 | AXIOM_M1 | Ex01 col, Ex02-03 | matmul splits over out-dim of weight |
-| AXIOM_M2 | Ex01 row, Ex02 | matmul splits over in-dim with sum |
+| AXIOM_M2 | Ex01 row, Ex02-03 | matmul splits over in-dim with sum; Ex02/Ex03 contracts explicitly require the full input and weight to reconstruct from the two shards |
 | AXIOM_S1 | Ex02 | silu × mul commutes with dim-1 concat |
 | AXIOM_ATTN_HEAD_LOCAL | Ex03 | attention commutes with head-shard |
 | AXIOM_RI1 (length + content) | Ex04 | repeat_interleave semantics |
@@ -281,7 +289,8 @@ The remaining model-to-source boundaries are:
 
 | Boundary | Formal role | Audit evidence required |
 |----------|-------------|-------------------------|
-| Ex01 representative tensor identity | connects the replicated all-reduce result to the attention output consumed by MoE | tensor identity at one participating rank; Ex01 proves equality for all other ranks |
+| GQA output identifier | identifies `gqa_output_id` with the tensor returned by the source output-projection all-reduce | audit the output projection call and tensor identity; Ex04/Ex01 prove equality across participating ranks, while the theorem no longer assumes equality to an abstract `attention_forward` value |
+| Residual-add and RMSNorm functions | deterministically map the replicated GQA output and common residual to the rank-indexed MoE input view | audit that all ranks apply the same source operations and parameters; numerical GQA/reference equivalence is not claimed |
 | Ex05 argsort contract | produces the concrete routed order | `axiom_argsort_is_inverse_pair`; the bridge proves this implies `RoutingConsistent` |
 | Ex09 source-to-DSL execution + reference representation | connects the concrete Triton wrapper to the proved DSL execution, then identifies the Python mathematical reference with shared `expert_apply` | audit dispatch construction, kernel indexing/masking, wrapper call sequence, and vector-to-scalar layout; K2/K3/F4 arithmetic is machine-checked |
 | `expert_apply` | common exact expert semantic primitive | Python and Triton operations implement this abstraction |
@@ -299,9 +308,6 @@ proof structure is documented inline.
 |------|-------|-----------------|
 | `c4_forward_correctness_general` | Ex01 col | Parameterized-over-tp_size version of C4 |
 | `r4_forward_correctness_general_stub` | Ex01 row | Parameterized-over-tp_size version of R4 |
-| `t3_block_correctness_stub` | Ex02 | Full MLP-TP block correctness |
-| `q4_three_way_split_stub` | Ex03 | Three-way QKV split proof |
-| `a2_block_correctness_stub` | Ex03 | Full MHA-TP block correctness |
 | `r2_replica_siblings_identical_kv_stub` | Ex04 | Replica-sibling attention equality |
 | `r3_block_correctness_stub` | Ex04 | Full GQA-TP block correctness |
 | `ep6_deadlock_free_stub` | Ex06_ep_pure | Deadlock-freedom (structural) |
@@ -332,10 +338,10 @@ the commutative-fold proof is valid for mathematical integers, and
 
 Read `kernel_refinement.rs`, `schedule_refinement.rs`,
 `component_integration.rs`, and `composition_theorem.rs`. Check that the
-public block theorem calls Ex01/Ex05/Ex06/Ex09 bridges before E1/E2/F4 and
+public block theorem calls Ex04/Ex05/Ex06/Ex09 bridges before E1/E2/F4 and
 L6/H6, and that no final refinement/swap statement appears in a `requires`
 clause. Then audit the remaining low-level boundaries against Python: the
-representative tensor identity, Ex05 argsort contract, Ex09 source-to-DSL and
+GQA output identity plus residual/RMSNorm mapping, Ex05 argsort contract, Ex09 source-to-DSL and
 reference-representation relations, and the mapping from schedule choice to
 execution order.
 
@@ -454,9 +460,9 @@ verus --crate-type=lib verus/composition_theorem.rs
 ```
 
 Expected top-level outputs are 4 (`axiom_base`), 16 (`composition_core`),
-12 (`deadlock_free`), 40 (schedule crate), 22 (kernel crate), and 156
+12 (`deadlock_free`), 40 (schedule crate), 22 (kernel crate), and 184
 (`composition_theorem`), all with 0 errors. These numbers overlap because
-imported modules are re-verified; use the 204 unique count above for the
+imported modules are re-verified; use the 220 unique count above for the
 artifact total.
 
 Total wall-clock time: ~2 minutes on the shared pod.

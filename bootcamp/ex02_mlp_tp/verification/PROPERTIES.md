@@ -135,6 +135,12 @@ $$
 step; ex01's R4 (all-reduce sum reconstructs the row-parallel matmul)
 finishes.
 
+The Verus artifact machine-checks this exact equality for `tp_size == 2` as
+`t3_block_correctness_tp2`. It proves both the gate/up dim-0 reconstruction
+and down-projection dim-1 reconstruction before applying the audited M1, S1,
+and M2 mathematical contracts. The parameterized general-TP theorem remains
+future work.
+
 ## What each tool proves in this exercise
 
 Same three-tool structure as Ex01: Verus / Dafny / Z3 (Verus proof shipped
