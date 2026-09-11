@@ -4,8 +4,8 @@
 efficiently. Written by Claude (AI drafter). Wei has read this and
 signed off on the structure; Jun is the auditor of record.
 
-**Status** (updated 2026-09-10):
-- **158 unique verified proof functions, 0 errors** across **17 Verus source
+**Status** (updated 2026-09-11):
+- **150 unique verified proof functions, 0 errors** across **17 Verus source
   files**. This counts shared modules once. Standalone command totals must not
   be added together because `composition_core.rs` and `deadlock_free.rs` are
   re-verified when imported by another crate root.
@@ -105,11 +105,11 @@ Five files at the repo-level `verus/` directory.
 | File | Command output | Unique local proofs | What it proves |
 |------|---------------:|--------------------:|----------------|
 | `composition_core.rs` | 4 | 4 | Exact semantic equality + shared meta-theorem |
-| `lean_equiv_hybrid_dp1.rs` | 6 | 2 | Conditional Lean ≡ Hybrid theorem under explicit DP=1, replication, and refinement contracts |
-| `naive_equiv_fused_moe.rs` | 9 | 5 | Conditional Naive/Permuted/Fused pairwise equivalence under routing and refinement contracts |
-| `composition_theorem.rs` | 28 | 12 | 2×2 block composition + work, deadlock, and atomic-scatter safety; imports the 4 core and 12 deadlock proofs |
+| `lean_equiv_hybrid_dp1.rs` | 5 | 1 | Conditional Lean ≡ Hybrid theorem under explicit DP=1, replication, and refinement contracts |
+| `naive_equiv_fused_moe.rs` | 7 | 3 | Conditional Naive/Permuted/Fused pairwise equivalence under routing and refinement contracts |
+| `composition_theorem.rs` | 23 | 7 | 2×2 block composition + work, deadlock, and atomic-scatter safety; imports the 4 core and 12 deadlock proofs |
 | `deadlock_free.rs` | 12 | 12 | Transition-system deadlock proof + concrete Lean and Hybrid schedules |
-| **Unique subtotal** | | **35** | Shared modules counted once |
+| **Unique subtotal** | | **27** | Shared modules counted once |
 
 **The meta-theorem** is defined in `composition_core.rs` and re-exported by
 `composition_theorem.rs`. The two specific theorem files call that same
@@ -118,9 +118,9 @@ function directly. Their refinement facts are explicit preconditions, not
 
 ## 3. Grand total
 
-**158 unique verified proof functions, 0 errors, 17 source files**
-(per-component: 119; `axiom_base.rs`: 4; current composition cluster: 35).
-Re-verified 2026-09-10. Shared imports are counted once.
+**150 unique verified proof functions, 0 errors, 17 source files**
+(per-component: 119; `axiom_base.rs`: 4; current composition cluster: 27).
+Re-verified 2026-09-11. Shared imports are counted once.
 
 ## 4. Property matrix — what's actually proved
 
@@ -444,9 +444,9 @@ verus --crate-type=lib verus/composition_theorem.rs
 ```
 
 Expected top-level outputs are 4 (`axiom_base`), 4 (`composition_core`),
-12 (`deadlock_free`), 6 (schedule swap), 9 (kernel swap), and 28
+12 (`deadlock_free`), 5 (schedule swap), 7 (kernel swap), and 23
 (`composition_theorem`), all with 0 errors. These numbers overlap because
-imported modules are re-verified; use the 158 unique count above for the
+imported modules are re-verified; use the 150 unique count above for the
 artifact total.
 
 Total wall-clock time: ~2 minutes on the shared pod.

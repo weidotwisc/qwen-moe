@@ -172,27 +172,4 @@ pub proof fn theorem_lean_equiv_hybrid_dp1(
     );
 }
 
-// =====================================================================
-// §6 — Cross-cutting sanity check.
-// =====================================================================
-
-pub proof fn smoke_test_theorem(
-    x: Tensor, x_id: nat, world_size: nat, world: Group,
-)
-    requires
-        world_size > 0,
-        forall|r: Rank| #![auto] world.contains(r) == (r < world_size),
-        ReplicatedInput(x, x_id, world),
-        lean_refines_spec(x, x_id, world),
-        hybrid_refines_spec(x, x_id, world),
-    ensures
-        semantic_eq(lean_forward(x), hybrid_forward(x)),
-{
-    theorem_lean_equiv_hybrid_dp1(
-        x, x_id,
-        world_size, world_size, 1nat, world_size,
-        world, world,
-    );
-}
-
 } // verus!

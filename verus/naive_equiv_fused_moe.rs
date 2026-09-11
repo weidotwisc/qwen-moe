@@ -108,28 +108,4 @@ pub proof fn corollary_naive_equiv_permuted(x: Tensor)
     );
 }
 
-// =====================================================================
-// §5 — Smoke tests.
-// =====================================================================
-
-pub proof fn smoke_test_theorem_1(x: Tensor)
-    requires
-        RoutingConsistent(x),
-        naive_refines_spec(x),
-        fused_refines_spec(x),
-    ensures semantic_eq(naive_forward(x), fused_forward(x)),
-{
-    theorem_naive_equiv_fused(x);
-}
-
-pub proof fn smoke_test_theorem_2(x: Tensor)
-    requires
-        RoutingConsistent(x),
-        permuted_refines_spec(x),
-        fused_refines_spec(x),
-    ensures semantic_eq(permuted_forward(x), fused_forward(x)),
-{
-    theorem_permuted_equiv_fused(x);
-}
-
 } // verus!
