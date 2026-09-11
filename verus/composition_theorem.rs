@@ -1,15 +1,15 @@
 // verus/composition_theorem.rs
 //
 // The paper's Contribution 2 headline theorem — the composition theorem
-// stated as an abstract meta-theorem, together with its concrete
-// instantiations for the compositions the paper cares about.
+// stated as an abstract meta-theorem, together with the block-level and
+// safety consequences used by the paper.
 //
 // The meta-theorem says: for any two implementations A and B that both
 // refine a shared semantic spec S, A and B produce semantically equal
 // outputs. This is a direct application of semantic_eq transitivity.
 //
-// Every specific composition theorem in the paper's artifact is an
-// INSTANCE of this meta-theorem:
+// The specific composition theorems import and instantiate this shared
+// meta-theorem directly:
 //
 //   Instance 1 (lean_equiv_hybrid_dp1.rs):
 //     A = lean_forward, B = hybrid_forward, S = MoE_forward_spec.
@@ -23,157 +23,26 @@
 // its two instantiations that cover the schedule swap (lean ↔ hybrid)
 // and the kernel swap (Python loop ↔ fused Triton).
 //
-// A block-level corollary states that a Qwen3-MoE-block assembled from
-// any certified choice of subcomponent variants produces output
-// semantically equal to the single-GPU reference block.
+// A block-level corollary states that any two Qwen3-MoE blocks assembled
+// from certified schedule and kernel choices produce semantically equal
+// outputs.
 //
 // Run with:
 //   verus --crate-type=lib verus/composition_theorem.rs
 
 use vstd::prelude::*;
-use vstd::multiset::Multiset;
+
+#[path = "composition_core.rs"]
+mod composition_core;
+pub use composition_core::*;
+
+#[path = "deadlock_free.rs"]
+mod deadlock_model;
 
 verus! {
 
 // =====================================================================
-// §1 — Types (abstract, shared with all Tier-3 composition files).
-//
-// A MoE-layer output is modeled by the MULTISET of weighted per-expert
-// contributions it aggregates. A single contribution says "token `token`
-// receives expert `expert`'s output scaled by (integer-encoded) weight
-// `weight`". Because summation over a multiset is order-independent, two
-// outputs built from the SAME multiset of contributions have the same
-// semantics.
-// =====================================================================
-
-pub struct Contribution {
-    pub token: nat,
-    pub expert: nat,
-    pub weight: int,
-}
-
-pub struct Tensor {
-    pub content: Seq<int>,
-    /// The multiset of weighted per-expert contributions aggregated into
-    /// this output. This is the semantic content the equivalence relation
-    /// compares; `content` is kept only for shape.
-    pub contribs: Multiset<Contribution>,
-}
-
-// =====================================================================
-// §2 — Semantic equality: equality of the contribution multiset.
-// =====================================================================
-
-pub open spec fn semantic_eq(x: Tensor, y: Tensor) -> bool {
-    x.contribs == y.contribs
-}
-
-pub proof fn lemma_semantic_eq_refl(x: Tensor)
-    ensures semantic_eq(x, x),
-{}
-
-pub proof fn lemma_semantic_eq_sym(x: Tensor, y: Tensor)
-    requires semantic_eq(x, y),
-    ensures semantic_eq(y, x),
-{}
-
-pub proof fn lemma_semantic_eq_trans(x: Tensor, y: Tensor, z: Tensor)
-    requires
-        semantic_eq(x, y),
-        semantic_eq(y, z),
-    ensures semantic_eq(x, z),
-{}
-
-// =====================================================================
-// §3 — THE META-THEOREM.
-//
-// Given ANY two implementations A_out and B_out that refine a shared
-// spec S_out, A_out and B_out produce semantically equal outputs.
-//
-// This is the entire content of the paper's Contribution 2. Every
-// specific composition theorem in the paper's artifact is an INSTANCE
-// of this meta-theorem.
-// =====================================================================
-
-pub proof fn theorem_shared_spec_implies_equiv(
-    a_out: Tensor,
-    b_out: Tensor,
-    s_out: Tensor,
-)
-    requires
-        semantic_eq(a_out, s_out),
-        semantic_eq(b_out, s_out),
-    ensures
-        semantic_eq(a_out, b_out),
-{
-    lemma_semantic_eq_sym(b_out, s_out);
-    lemma_semantic_eq_trans(a_out, s_out, b_out);
-}
-
-// =====================================================================
-// §4 — INSTANCE 1: schedule-swap equivalence (lean ↔ hybrid, DP=1).
-//
-// See verus/lean_equiv_hybrid_dp1.rs for the full version with the
-// TP-row-parallel-establishes-Replicated precondition chain. Here we
-// state the theorem as a direct instance of the meta-theorem, with the
-// per-component refinement axioms as its inputs.
-// =====================================================================
-
-pub uninterp spec fn moe_forward_spec(x: Tensor) -> Tensor;
-pub uninterp spec fn lean_forward(x: Tensor) -> Tensor;
-pub uninterp spec fn hybrid_forward(x: Tensor) -> Tensor;
-
-#[verifier::external_body]
-pub proof fn axiom_lean_refines_spec(x: Tensor)
-    ensures semantic_eq(lean_forward(x), moe_forward_spec(x)),
-{}
-
-#[verifier::external_body]
-pub proof fn axiom_hybrid_refines_spec(x: Tensor)
-    ensures semantic_eq(hybrid_forward(x), moe_forward_spec(x)),
-{}
-
-/// Instance 1 of the meta-theorem.
-pub proof fn theorem_lean_equiv_hybrid(x: Tensor)
-    ensures semantic_eq(lean_forward(x), hybrid_forward(x)),
-{
-    axiom_lean_refines_spec(x);
-    axiom_hybrid_refines_spec(x);
-    theorem_shared_spec_implies_equiv(
-        lean_forward(x), hybrid_forward(x), moe_forward_spec(x),
-    );
-}
-
-// =====================================================================
-// §5 — INSTANCE 2: kernel-swap equivalence (Python loop ↔ fused Triton).
-// =====================================================================
-
-pub uninterp spec fn permuted_forward(x: Tensor) -> Tensor;
-pub uninterp spec fn fused_forward(x: Tensor) -> Tensor;
-
-#[verifier::external_body]
-pub proof fn axiom_permuted_refines_spec(x: Tensor)
-    ensures semantic_eq(permuted_forward(x), moe_forward_spec(x)),
-{}
-
-#[verifier::external_body]
-pub proof fn axiom_fused_refines_spec(x: Tensor)
-    ensures semantic_eq(fused_forward(x), moe_forward_spec(x)),
-{}
-
-/// Instance 2 of the meta-theorem.
-pub proof fn theorem_permuted_equiv_fused(x: Tensor)
-    ensures semantic_eq(permuted_forward(x), fused_forward(x)),
-{
-    axiom_permuted_refines_spec(x);
-    axiom_fused_refines_spec(x);
-    theorem_shared_spec_implies_equiv(
-        permuted_forward(x), fused_forward(x), moe_forward_spec(x),
-    );
-}
-
-// =====================================================================
-// §6 — BLOCK-LEVEL COROLLARY: full Qwen3-MoE-block equivalence.
+// §1 — BLOCK-LEVEL COROLLARY: full Qwen3-MoE-block equivalence.
 //
 // A Qwen3-MoE-block is a chain of components:
 //   attn_out = attention_TP(x)
@@ -185,30 +54,118 @@ pub proof fn theorem_permuted_equiv_fused(x: Tensor)
 // the same semantic block-level output.
 // =====================================================================
 
-/// The block-level forward output, parameterized by the two variant choices.
-pub uninterp spec fn block_forward(
-    x: Tensor,
+pub uninterp spec fn attention_forward(x: Tensor) -> Tensor;
+
+/// MoE output for one schedule/kernel choice.
+pub uninterp spec fn moe_variant_forward(
+    attn_out: Tensor,
     use_lean: bool,   // true = lean schedule, false = hybrid dispatch
     use_fused: bool,  // true = fused Triton, false = Python loop
 ) -> Tensor;
 
-/// Two block-level variants that both refine a single "block spec".
-/// Their equivalence follows from the two instance theorems above.
-pub uninterp spec fn block_spec(x: Tensor) -> Tensor;
+pub uninterp spec fn residual_add(attn_out: Tensor, moe_out: Tensor) -> Tensor;
 
-/// AXIOM: each of the four block-variant configurations refines the
-/// same block_spec. Follows from composing the per-schedule and
-/// per-kernel refinement axioms above with the surrounding block
-/// structure (attn_TP + residual, treated as identity-modulo-shape here).
-#[verifier::external_body]
-pub proof fn axiom_block_variant_refines_spec(
-    x: Tensor, use_lean: bool, use_fused: bool,
+/// The block structure is explicit: attention, then MoE, then residual.
+pub open spec fn block_forward(
+    x: Tensor,
+    use_lean: bool,
+    use_fused: bool,
+) -> Tensor {
+    let attn_out = attention_forward(x);
+    residual_add(
+        attn_out,
+        moe_variant_forward(attn_out, use_lean, use_fused),
+    )
+}
+
+/// Obligation supplied by the schedule-swap theorem, for either kernel.
+pub open spec fn schedule_swap_equiv(x: Tensor, use_fused: bool) -> bool {
+    let attn_out = attention_forward(x);
+    semantic_eq(
+        moe_variant_forward(attn_out, true, use_fused),
+        moe_variant_forward(attn_out, false, use_fused),
+    )
+}
+
+/// Obligation supplied by the kernel-swap theorem, for either schedule.
+pub open spec fn kernel_swap_equiv(x: Tensor, use_lean: bool) -> bool {
+    let attn_out = attention_forward(x);
+    semantic_eq(
+        moe_variant_forward(attn_out, use_lean, true),
+        moe_variant_forward(attn_out, use_lean, false),
+    )
+}
+
+/// Exact equality of MoE outputs is preserved by the residual context.
+pub proof fn lemma_block_context_congruence(
+    x: Tensor,
+    use_lean_a: bool, use_fused_a: bool,
+    use_lean_b: bool, use_fused_b: bool,
 )
+    requires semantic_eq(
+        moe_variant_forward(attention_forward(x), use_lean_a, use_fused_a),
+        moe_variant_forward(attention_forward(x), use_lean_b, use_fused_b),
+    ),
     ensures semantic_eq(
-        block_forward(x, use_lean, use_fused),
-        block_spec(x),
+        block_forward(x, use_lean_a, use_fused_a),
+        block_forward(x, use_lean_b, use_fused_b),
     ),
 {}
+
+/// Every variant is equivalent to the canonical lean+fused variant.
+pub proof fn lemma_block_variant_equiv_canonical(
+    x: Tensor, use_lean: bool, use_fused: bool,
+)
+    requires
+        forall|kernel: bool| schedule_swap_equiv(x, kernel),
+        forall|schedule: bool| kernel_swap_equiv(x, schedule),
+    ensures semantic_eq(
+        block_forward(x, use_lean, use_fused),
+        block_forward(x, true, true),
+    ),
+{
+    if use_lean {
+        if use_fused {
+            lemma_semantic_eq_refl(block_forward(x, true, true));
+        } else {
+            assert(kernel_swap_equiv(x, true));
+            lemma_semantic_eq_sym(
+                moe_variant_forward(attention_forward(x), true, true),
+                moe_variant_forward(attention_forward(x), true, false),
+            );
+            lemma_block_context_congruence(x, true, false, true, true);
+        }
+    } else {
+        if use_fused {
+            assert(schedule_swap_equiv(x, true));
+            lemma_semantic_eq_sym(
+                moe_variant_forward(attention_forward(x), true, true),
+                moe_variant_forward(attention_forward(x), false, true),
+            );
+            lemma_block_context_congruence(x, false, true, true, true);
+        } else {
+            assert(kernel_swap_equiv(x, false));
+            lemma_semantic_eq_sym(
+                moe_variant_forward(attention_forward(x), false, true),
+                moe_variant_forward(attention_forward(x), false, false),
+            );
+            lemma_block_context_congruence(x, false, false, false, true);
+
+            assert(schedule_swap_equiv(x, true));
+            lemma_semantic_eq_sym(
+                moe_variant_forward(attention_forward(x), true, true),
+                moe_variant_forward(attention_forward(x), false, true),
+            );
+            lemma_block_context_congruence(x, false, true, true, true);
+
+            lemma_semantic_eq_trans(
+                block_forward(x, false, false),
+                block_forward(x, false, true),
+                block_forward(x, true, true),
+            );
+        }
+    }
+}
 
 /// BLOCK-LEVEL COROLLARY: any two block-variant configurations produce
 /// semantically equal outputs.
@@ -217,41 +174,42 @@ pub proof fn corollary_block_variants_equivalent(
     use_lean_a: bool, use_fused_a: bool,
     use_lean_b: bool, use_fused_b: bool,
 )
+    requires
+        forall|kernel: bool| schedule_swap_equiv(x, kernel),
+        forall|schedule: bool| kernel_swap_equiv(x, schedule),
     ensures semantic_eq(
         block_forward(x, use_lean_a, use_fused_a),
         block_forward(x, use_lean_b, use_fused_b),
     ),
 {
-    axiom_block_variant_refines_spec(x, use_lean_a, use_fused_a);
-    axiom_block_variant_refines_spec(x, use_lean_b, use_fused_b);
+    lemma_block_variant_equiv_canonical(x, use_lean_a, use_fused_a);
+    lemma_block_variant_equiv_canonical(x, use_lean_b, use_fused_b);
     theorem_shared_spec_implies_equiv(
         block_forward(x, use_lean_a, use_fused_a),
         block_forward(x, use_lean_b, use_fused_b),
-        block_spec(x),
+        block_forward(x, true, true),
     );
 }
 
 // =====================================================================
-// §7 — GLOBAL SAFETY PROPERTIES.
+// §2 — GLOBAL SAFETY PROPERTIES.
 //
-// The functional-equivalence theorems (§3-§6) say "different variants
-// produce equivalent outputs". The theorems below say the SYSTEM's
+// The functional-equivalence theorems say "different variants produce
+// equivalent outputs". The theorems below say the SYSTEM's
 // execution is well-formed regardless of which variant is chosen. They
 // are the block-scope form of the paper's four goals (paper section
 // "What we prove per component"):
 //
-//   Work conservation         every routed token is processed exactly
-//   (Completeness+Disjointness): top_k times across all ranks -- none
-//                              dropped, none double-counted.
+//   Work conservation         every (token, top-k slot) routing item is
+//   (Completeness+Disjointness): processed exactly once across all ranks.
 //   Deadlock freedom:          for any variant, the collective schedule
 //                              posts matched collectives in a fixed order
 //                              on every rank. The substrate-trust
 //                              reduction is proved in deadlock_free.rs;
 //                              here we state the variant-independent form.
-//   Data-race freedom:         for any output position on any rank, at
-//                              most one source writes it per forward (the
-//                              unique-writer mechanism), so there is no
-//                              race.
+//   Data-race freedom:         top-k contributions may share an output
+//                              position, but every such conflicting
+//                              scatter-add is atomic.
 //
 // Each is stated as a variant-independent property: it holds regardless
 // of which lean/hybrid × python/fused configuration is running. This is
@@ -259,145 +217,243 @@ pub proof fn corollary_block_variants_equivalent(
 // =====================================================================
 
 // ---------------------------------------------------------------------
-// §7.1 — Work conservation (Completeness + Disjointness).
+// §2.1 — Work conservation (Completeness + Disjointness).
 // ---------------------------------------------------------------------
 
-/// Total input records to the MoE forward on some rank.
-pub uninterp spec fn total_records_in(x: Tensor) -> nat;
+/// A routing work item is one selected top-k slot of one input token.
+/// Slots, rather than expert ids, distinguish the individual obligations.
+pub struct WorkItem {
+    pub token: nat,
+    pub slot: nat,
+}
 
-/// Total output-slot writes performed by variant `(use_lean, use_fused)`.
-/// A "write" here is one entry in an expert's contribution to some
-/// token's final output — so this counts the (token, expert) pairs
-/// actually processed.
-pub uninterp spec fn total_records_out(
-    x: Tensor, use_lean: bool, use_fused: bool,
+pub uninterp spec fn input_token_count(x: Tensor) -> nat;
+pub uninterp spec fn top_k(x: Tensor) -> nat;
+
+pub open spec fn required_work_item(x: Tensor, item: WorkItem) -> bool {
+    item.token < input_token_count(x) && item.slot < top_k(x)
+}
+
+/// Global number of executions of one routing item across all ranks.
+pub uninterp spec fn times_processed(
+    x: Tensor,
+    use_lean: bool,
+    use_fused: bool,
+    item: WorkItem,
 ) -> nat;
 
-pub uninterp spec fn top_k() -> nat;
-
-/// AXIOM (from per-component RT1 / EP4 / F1): every variant satisfies
-/// records_in * top_k == records_out (i.e., each token is processed
-/// exactly top_k times regardless of routing schedule or kernel).
-///
-/// Per-component sources:
-///   Ex05 RT1 (moe_baseline.rs): `cumsum(counts).last() == total_tokens`.
-///   Ex06_ep_pure EP4 (ep_pure.rs): send/recv pairwise equality.
-///   Ex09 F1 (fused_moe.rs): offsets partition [0, M) exactly once.
-#[verifier::external_body]
-pub proof fn axiom_variant_conserves_records(
+/// Exact component-level obligation: every required item occurs once and
+/// every non-required item occurs zero times.
+pub open spec fn exact_work_execution(
     x: Tensor, use_lean: bool, use_fused: bool,
-)
-    ensures total_records_out(x, use_lean, use_fused)
-         == total_records_in(x) * top_k(),
-{}
+) -> bool {
+    forall|item: WorkItem|
+        #![trigger times_processed(x, use_lean, use_fused, item)]
+        times_processed(x, use_lean, use_fused, item)
+            == if required_work_item(x, item) { 1nat } else { 0nat }
+}
 
-/// THEOREM (work conservation = Completeness + Disjointness, variant-independent):
-/// For any variant configuration, records_out == records_in * top_k.
-/// Trivial once the axiom is available — the point is that the axiom
-/// holds for EVERY choice of `(use_lean, use_fused)`, not just one.
+pub open spec fn work_complete(
+    x: Tensor, use_lean: bool, use_fused: bool,
+) -> bool {
+    forall|item: WorkItem|
+        #![trigger times_processed(x, use_lean, use_fused, item)]
+        required_work_item(x, item)
+            ==> times_processed(x, use_lean, use_fused, item) == 1nat
+}
+
+pub open spec fn work_disjoint(
+    x: Tensor, use_lean: bool, use_fused: bool,
+) -> bool {
+    forall|item: WorkItem|
+        #![trigger times_processed(x, use_lean, use_fused, item)]
+        times_processed(x, use_lean, use_fused, item) <= 1nat
+}
+
+pub open spec fn no_spurious_work(
+    x: Tensor, use_lean: bool, use_fused: bool,
+) -> bool {
+    forall|item: WorkItem|
+        #![trigger times_processed(x, use_lean, use_fused, item)]
+        !required_work_item(x, item)
+            ==> times_processed(x, use_lean, use_fused, item) == 0nat
+}
+
+/// Work conservation now proves coverage and uniqueness separately.
 pub proof fn theorem_token_conservation(
     x: Tensor, use_lean: bool, use_fused: bool,
 )
-    ensures total_records_out(x, use_lean, use_fused)
-         == total_records_in(x) * top_k(),
+    requires exact_work_execution(x, use_lean, use_fused),
+    ensures
+        work_complete(x, use_lean, use_fused),
+        work_disjoint(x, use_lean, use_fused),
+        no_spurious_work(x, use_lean, use_fused),
 {
-    axiom_variant_conserves_records(x, use_lean, use_fused);
 }
 
-/// COROLLARY: any two variants preserve the SAME total-record count.
-pub proof fn corollary_records_variant_invariant(
+/// Any two correct variants execute each routing item the same number of times.
+pub proof fn corollary_work_variant_invariant(
     x: Tensor,
     ul_a: bool, uf_a: bool,
     ul_b: bool, uf_b: bool,
 )
-    ensures total_records_out(x, ul_a, uf_a) == total_records_out(x, ul_b, uf_b),
+    requires
+        exact_work_execution(x, ul_a, uf_a),
+        exact_work_execution(x, ul_b, uf_b),
+    ensures forall|item: WorkItem|
+        #![trigger times_processed(x, ul_a, uf_a, item)]
+        times_processed(x, ul_a, uf_a, item)
+            == times_processed(x, ul_b, uf_b, item),
 {
-    axiom_variant_conserves_records(x, ul_a, uf_a);
-    axiom_variant_conserves_records(x, ul_b, uf_b);
 }
 
 // ---------------------------------------------------------------------
-// §7.2 — Deadlock freedom.
+// §2.2 — Deadlock freedom.
 //
-// This is the variant-independent WRAPPER. The substantive treatment ---
-// trusting NCCL's collective-matching contract as a substrate and PROVING
-// that a data-independent schedule meets its matching precondition --- is
-// in deadlock_free.rs (theorem_deadlock_free via
-// lemma_data_independent_implies_matched). Here we only record that the
-// property holds for every variant.
+// The schedule and transition-system proof live in deadlock_free.rs and are
+// imported above. Kernel choice is local computation and does not change the
+// collective trace; schedule choice selects the two-phase lean trace or the
+// six-phase hybrid trace.
 // ---------------------------------------------------------------------
 
-/// A predicate on a variant configuration: "the collective schedule
-/// this variant issues terminates on every rank without deadlock."
-pub uninterp spec fn schedule_terminates(use_lean: bool, use_fused: bool) -> bool;
+pub open spec fn variant_schedule(
+    world_size: nat,
+    tp_size: nat,
+    use_lean: bool,
+    _use_fused: bool,
+) -> deadlock_model::Schedule {
+    if use_lean {
+        deadlock_model::lean_schedule(world_size, tp_size)
+    } else {
+        deadlock_model::hybrid_schedule(world_size, tp_size)
+    }
+}
 
-/// AXIOM: every variant's schedule is data-independent (fixed sequence of
-/// group-matched collectives on every rank), so under the NCCL substrate
-/// contract it is deadlock-free. The data-independence-implies-matched
-/// reduction is proved in deadlock_free.rs; the NCCL contract itself is
-/// trusted (see deadlock_free.rs::axiom_matched_implies_no_deadlock).
-///
-/// Per-component sources:
-///   Ex06_ep_pure EP6 (ep_pure.rs).
-///   Ex07 H5 (hybrid.rs).
-#[verifier::external_body]
-pub proof fn axiom_variant_schedule_terminates(use_lean: bool, use_fused: bool)
-    ensures schedule_terminates(use_lean, use_fused),
-{}
-
-/// THEOREM (deadlock freedom, variant-independent):
-/// Every variant's collective schedule terminates deadlock-free.
-pub proof fn theorem_deadlock_free(use_lean: bool, use_fused: bool)
-    ensures schedule_terminates(use_lean, use_fused),
+/// Every reachable state of either concrete collective schedule is
+/// non-deadlocked. Runtime completion still assumes failure-free NCCL and
+/// fair scheduling, as documented in deadlock_free.rs.
+pub proof fn theorem_deadlock_free(
+    world_size: nat,
+    tp_size: nat,
+    use_lean: bool,
+    use_fused: bool,
+    states: Seq<deadlock_model::State>,
+    i: nat,
+)
+    requires
+        world_size > 0,
+        tp_size > 0,
+        world_size % tp_size == 0,
+        deadlock_model::execution(
+            variant_schedule(world_size, tp_size, use_lean, use_fused),
+            states,
+        ),
+        i < states.len(),
+    ensures !deadlock_model::deadlocked(
+        variant_schedule(world_size, tp_size, use_lean, use_fused),
+        states[i as int],
+    ),
 {
-    axiom_variant_schedule_terminates(use_lean, use_fused);
+    if use_lean {
+        deadlock_model::theorem_lean_execution_deadlock_free(
+            world_size, tp_size, states, i,
+        );
+    } else {
+        deadlock_model::theorem_hybrid_execution_deadlock_free(
+            world_size, tp_size, states, i,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------
-// §7.3 — Data-race freedom (via the unique-writer invariant).
+// §2.3 — Data-race freedom for atomic scatter-add.
 //
-// In a distributed MoE with atomics-free scatter (each rank writes into
-// its OWN output buffer, no cross-rank shared memory), the relevant
-// property is: each output-tensor position on each rank is written by at
-// most one source per forward — the "unique-writer" invariant, which is
-// the mechanism by which data-race freedom holds.
+// Different top-k slots for one token intentionally accumulate into the
+// same output row. CUDA index_add_ implements these conflicting additions
+// atomically; the order may be nondeterministic, but there is no data race.
 // ---------------------------------------------------------------------
 
-pub uninterp spec fn unique_writer_invariant(
-    x: Tensor, use_lean: bool, use_fused: bool,
+pub uninterp spec fn output_width(x: Tensor) -> nat;
+
+pub struct OutputLocation {
+    pub token: nat,
+    pub feature: nat,
+}
+
+/// One scalar addition produced by one routed top-k work item.
+pub struct ScatterWrite {
+    pub source: WorkItem,
+    /// Distinguishes repeated executions if a buggy variant processes the
+    /// same work item more than once.
+    pub occurrence: nat,
+    pub feature: nat,
+}
+
+pub open spec fn active_scatter_write(
+    x: Tensor, use_lean: bool, use_fused: bool, write: ScatterWrite,
+) -> bool {
+    write.occurrence < times_processed(x, use_lean, use_fused, write.source)
+        && write.feature < output_width(x)
+}
+
+pub open spec fn scatter_target(write: ScatterWrite) -> OutputLocation {
+    OutputLocation {
+        token: write.source.token,
+        feature: write.feature,
+    }
+}
+
+/// Runtime property of the index_add_ implementation for this variant.
+pub uninterp spec fn scatter_write_is_atomic(
+    x: Tensor,
+    use_lean: bool,
+    use_fused: bool,
+    write: ScatterWrite,
 ) -> bool;
 
-/// AXIOM (from Ex06_ep/lean L3, Ex05 RT4 permutation invertibility,
-/// Ex09 F3 empty-expert handling): every variant maintains the
-/// unique-writer invariant on output buffers. Each rank writes to its
-/// own output positions determined by routing; different ranks' output
-/// buffers are disjoint; per-rank writes are ordered by the scatter
-/// (index_add_) semantics.
-///
-/// Per-component sources:
-///   Ex06_ep/lean L3 (lean.rs): zero-outside-contributing predicate.
-///   Ex05 RT4 (moe_baseline.rs): permutation bijection.
-///   Ex09 F3 (fused_moe.rs): empty-expert doesn't read/write outside its block.
-#[verifier::external_body]
-pub proof fn axiom_variant_unique_writer(
+/// Explicit substrate obligation: every active output accumulation is atomic.
+pub open spec fn atomic_scatter_contract(
     x: Tensor, use_lean: bool, use_fused: bool,
-)
-    ensures unique_writer_invariant(x, use_lean, use_fused),
-{}
+) -> bool {
+    forall|write: ScatterWrite|
+        #![trigger scatter_write_is_atomic(x, use_lean, use_fused, write)]
+        active_scatter_write(x, use_lean, use_fused, write)
+            ==> scatter_write_is_atomic(x, use_lean, use_fused, write)
+}
 
-/// THEOREM (data-race freedom, variant-independent):
-/// Every variant maintains the unique-writer invariant, so no two sources
-/// write the same output position in a forward pass.
+/// Two distinct contributions conflict when they target the same output cell.
+pub open spec fn scatter_conflict(
+    x: Tensor, use_lean: bool, use_fused: bool,
+    left: ScatterWrite, right: ScatterWrite,
+) -> bool {
+    &&& left != right
+    &&& active_scatter_write(x, use_lean, use_fused, left)
+    &&& active_scatter_write(x, use_lean, use_fused, right)
+    &&& scatter_target(left) == scatter_target(right)
+}
+
+pub open spec fn scatter_data_race_free(
+    x: Tensor, use_lean: bool, use_fused: bool,
+) -> bool {
+    forall|left: ScatterWrite, right: ScatterWrite| #![auto]
+        scatter_conflict(x, use_lean, use_fused, left, right) ==> (
+            scatter_write_is_atomic(x, use_lean, use_fused, left)
+            && scatter_write_is_atomic(x, use_lean, use_fused, right)
+        )
+}
+
+/// Multiple contributors to one output location are safe because every
+/// conflicting read-modify-write is atomic, not because writers are unique.
 pub proof fn theorem_data_race_free(
     x: Tensor, use_lean: bool, use_fused: bool,
 )
-    ensures unique_writer_invariant(x, use_lean, use_fused),
+    requires atomic_scatter_contract(x, use_lean, use_fused),
+    ensures scatter_data_race_free(x, use_lean, use_fused),
 {
-    axiom_variant_unique_writer(x, use_lean, use_fused);
 }
 
 // =====================================================================
-// §8 — Smoke tests: exercise each level of the theorem hierarchy.
+// §3 — Smoke tests: exercise each level of the theorem hierarchy.
 // =====================================================================
 
 pub proof fn smoke_meta_theorem(a: Tensor, b: Tensor, s: Tensor)
@@ -409,19 +465,10 @@ pub proof fn smoke_meta_theorem(a: Tensor, b: Tensor, s: Tensor)
     theorem_shared_spec_implies_equiv(a, b, s);
 }
 
-pub proof fn smoke_instance_1(x: Tensor)
-    ensures semantic_eq(lean_forward(x), hybrid_forward(x)),
-{
-    theorem_lean_equiv_hybrid(x);
-}
-
-pub proof fn smoke_instance_2(x: Tensor)
-    ensures semantic_eq(permuted_forward(x), fused_forward(x)),
-{
-    theorem_permuted_equiv_fused(x);
-}
-
 pub proof fn smoke_block(x: Tensor)
+    requires
+        forall|kernel: bool| schedule_swap_equiv(x, kernel),
+        forall|schedule: bool| kernel_swap_equiv(x, schedule),
     ensures semantic_eq(
         block_forward(x, true, true),   // lean + fused
         block_forward(x, false, false), // hybrid + python-loop
@@ -431,21 +478,45 @@ pub proof fn smoke_block(x: Tensor)
 }
 
 pub proof fn smoke_safety_conservation(x: Tensor)
-    ensures total_records_out(x, true, true)
-         == total_records_in(x) * top_k(),
+    requires exact_work_execution(x, true, true),
+    ensures
+        work_complete(x, true, true),
+        work_disjoint(x, true, true),
+        no_spurious_work(x, true, true),
 {
     theorem_token_conservation(x, true, true);
 }
 
-pub proof fn smoke_safety_deadlock()
-    ensures schedule_terminates(true, true) && schedule_terminates(false, false),
+pub proof fn smoke_safety_deadlock(
+    world_size: nat,
+    tp_size: nat,
+    use_lean: bool,
+    use_fused: bool,
+    states: Seq<deadlock_model::State>,
+    i: nat,
+)
+    requires
+        world_size > 0,
+        tp_size > 0,
+        world_size % tp_size == 0,
+        deadlock_model::execution(
+            variant_schedule(world_size, tp_size, use_lean, use_fused),
+            states,
+        ),
+        i < states.len(),
+    ensures !deadlock_model::deadlocked(
+        variant_schedule(world_size, tp_size, use_lean, use_fused),
+        states[i as int],
+    ),
 {
-    theorem_deadlock_free(true, true);
-    theorem_deadlock_free(false, false);
+    theorem_deadlock_free(
+        world_size, tp_size, use_lean, use_fused, states, i,
+    );
 }
 
 pub proof fn smoke_safety_data_race_free(x: Tensor)
-    ensures unique_writer_invariant(x, true, true),
+    requires atomic_scatter_contract(x, true, true),
+    ensures scatter_data_race_free(x, true, true),
 {
     theorem_data_race_free(x, true, true);
 }

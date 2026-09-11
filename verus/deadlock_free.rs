@@ -509,6 +509,47 @@ pub open spec fn tp_group_of(
         q < world_size && q / tp_size == r / tp_size)
 }
 
+/// Lean block schedule:
+///   phase 0: TP attention all-reduce
+///   phase 1: EP MoE all-reduce over the world group
+pub open spec fn lean_step(
+    world_size: nat,
+    tp_size: nat,
+    r: Rank,
+    phase: int,
+) -> Step
+    recommends
+        tp_size > 0,
+        r < world_size,
+        0 <= phase < 2,
+{
+    if phase == 0 {
+        Step {
+            site: 0,
+            op: CollOp::AllReduce,
+            group: tp_group_of(world_size, tp_size, r),
+        }
+    } else {
+        Step {
+            site: 1,
+            op: CollOp::AllReduce,
+            group: world_group(world_size),
+        }
+    }
+}
+
+pub open spec fn lean_schedule(world_size: nat, tp_size: nat) -> Schedule {
+    Schedule {
+        world_size,
+        phases: 2,
+        trace: Seq::new(world_size, |r: int|
+            Seq::new(2, |phase: int|
+                lean_step(world_size, tp_size, r as nat, phase)
+            )
+        ),
+    }
+}
+
 pub open spec fn hybrid_step(
     world_size: nat,
     tp_size: nat,
@@ -577,6 +618,55 @@ proof fn lemma_tp_peers_name_same_group(
                 == tp_group_of(world_size, tp_size, r).contains(x) by {
             assert((x / tp_size == q / tp_size)
                 == (x / tp_size == r / tp_size));
+        }
+    }
+}
+
+/// The concrete two-phase lean schedule satisfies the generic static
+/// collective-matching obligations.
+pub proof fn lemma_lean_schedule_well_formed(
+    world_size: nat,
+    tp_size: nat,
+)
+    requires
+        world_size > 0,
+        tp_size > 0,
+        world_size % tp_size == 0,
+    ensures well_formed_schedule(lean_schedule(world_size, tp_size)),
+{
+    let schedule = lean_schedule(world_size, tp_size);
+
+    assert(schedule.trace.len() == world_size);
+    assert forall|r: Rank| #![auto] valid_rank(schedule, r)
+        implies schedule.trace[r as int].len() == schedule.phases by {
+        assert(schedule.trace[r as int].len() == 2);
+    }
+
+    assert forall|r: Rank, phase: int| #![auto]
+        valid_rank(schedule, r) && 0 <= phase < schedule.phases
+        implies step_at(schedule, r, phase).group.contains(r) by {
+        if phase == 0 {
+            assert(tp_group_of(world_size, tp_size, r).contains(r));
+        } else {
+            assert(world_group(world_size).contains(r));
+        }
+    }
+
+    assert forall|r: Rank, q: Rank, phase: int|
+        valid_rank(schedule, r)
+        && 0 <= phase < schedule.phases
+        && step_at(schedule, r, phase).group.contains(q)
+        implies valid_rank(schedule, q)
+            && step_at(schedule, q, phase) == step_at(schedule, r, phase) by {
+        if phase == 0 {
+            lemma_tp_peers_name_same_group(world_size, tp_size, r, q);
+            assert(valid_rank(schedule, q));
+            assert(tp_group_of(world_size, tp_size, q)
+                == tp_group_of(world_size, tp_size, r));
+        } else {
+            assert(world_group(world_size).contains(q));
+            assert(q < world_size);
+            assert(valid_rank(schedule, q));
         }
     }
 }
@@ -653,6 +743,32 @@ pub proof fn theorem_hybrid_execution_deadlock_free(
     lemma_hybrid_schedule_well_formed(world_size, tp_size);
     theorem_execution_deadlock_free(
         hybrid_schedule(world_size, tp_size),
+        states,
+        i,
+    );
+}
+
+/// Paper-facing theorem for the concrete lean schedule.
+pub proof fn theorem_lean_execution_deadlock_free(
+    world_size: nat,
+    tp_size: nat,
+    states: Seq<State>,
+    i: nat,
+)
+    requires
+        world_size > 0,
+        tp_size > 0,
+        world_size % tp_size == 0,
+        execution(lean_schedule(world_size, tp_size), states),
+        i < states.len(),
+    ensures !deadlocked(
+        lean_schedule(world_size, tp_size),
+        states[i as int],
+    ),
+{
+    lemma_lean_schedule_well_formed(world_size, tp_size);
+    theorem_execution_deadlock_free(
+        lean_schedule(world_size, tp_size),
         states,
         i,
     );
