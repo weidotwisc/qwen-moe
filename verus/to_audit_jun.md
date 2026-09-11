@@ -5,7 +5,7 @@ efficiently. Written by Claude (AI drafter). Wei has read this and
 signed off on the structure; Jun is the auditor of record.
 
 **Status** (updated 2026-09-11):
-- **192 unique verified proof functions, 0 errors** across **20 Verus source
+- **204 unique verified proof functions, 0 errors** across **20 Verus source
   files**. This counts shared modules once. Standalone command totals must not
   be added together because the core, kernel, schedule, and deadlock modules
   are re-verified when imported by another crate root.
@@ -66,8 +66,8 @@ math. Read `PROPERTIES.md` first, then the `.rs`.
 | Ex06_ep (lean) | `lean.rs` | 7 | L2 disjointness + L2-covers + L3/L5; exact L4 lives in the shared Tier-3 model | AXIOM_ALLREDUCE_SUM_REPLICATED |
 | Ex07 tp_ep_hybrid | `hybrid.rs` | 3 | H2 striping determinism; exact H6 lives in the shared Tier-3 model | tensor_on opaque |
 | Ex09 fused_moe (contract) | `fused_moe.rs` | 2 | F1 offset coverage + F3 empty-expert; exact F4 lives in the shared Tier-3 model | expert_apply opaque |
-| Ex09 fused_moe (DSL) | `fused_kernel_dsl.rs` | 13 | K1a/K1b/K1c tile coverage; K2/K3 remain external | AXIOM_MATMUL_SPLITS_OVER_K, zero-padding axiom |
-| **Subtotal** | | **119** | | |
+| Ex09 fused_moe (DSL) | `fused_kernel_dsl.rs` | 24 | K1 tile coverage/disjointness, exact K2 reduction, grouped-GEMM K3, and three-GEMM fused F4 | none; source-to-DSL correspondence remains audited |
+| **Subtotal** | | **130** | | |
 
 The Ex01 row file has 13 unique local verification items; its standalone
 command now reports 29 because it imports the 16-item shared composition model
@@ -112,12 +112,12 @@ files re-export shared proof modules so they can also be checked standalone.
 | `composition_core.rs` | 16 | 16 | Exact equality, work semantics, permutation invariance, fused-row refinement, and work conservation |
 | `kernel_refinement.rs` | imported | 6 | E1, E2, F4 and Naive/Permuted/Fused equivalences |
 | `schedule_refinement.rs` | imported | 18 | Expert ownership, rank-local partial outputs, elementwise all-reduce SUM, explicit all-to-all dispatch/compute/combine round trip, schedule swap, and per-schedule kernel swap |
-| `component_integration.rs` | imported | 7 | Bridges Ex01 replication, Ex05 argsort, Ex06 expert partition, and Ex09 row contracts into the shared Tier-3 predicates |
+| `component_integration.rs` | imported | 8 | Bridges Ex01 replication, Ex05 argsort, Ex06 expert partition, and the proved Ex09 DSL execution into the shared Tier-3 predicates |
 | `lean_equiv_hybrid_dp1.rs` | 40 | 0 | Standalone crate root importing core + kernel + schedule modules (historical filename) |
 | `naive_equiv_fused_moe.rs` | 22 | 0 | Standalone crate root importing core + kernel modules |
-| `composition_theorem.rs` | 131 | 10 | Component-connected block composition + work, deadlock, and atomic-scatter safety; imports shared modules and relevant Tier-1 proofs |
+| `composition_theorem.rs` | 156 | 10 | Component-connected block composition + work, deadlock, and atomic-scatter safety; imports shared modules and relevant Tier-1 proofs |
 | `deadlock_free.rs` | 12 | 12 | Transition-system deadlock proof + concrete DP=1 all-reduce and all-to-all schedules |
-| **Unique subtotal** | | **69** | Shared modules counted once; imported Tier-1 proofs remain counted in the Tier-1 subtotal |
+| **Unique subtotal** | | **70** | Shared modules counted once; imported Tier-1 proofs remain counted in the Tier-1 subtotal |
 
 **The meta-theorem** is defined in `composition_core.rs`. E1/E2/F4 prove the
 kernel refinements from canonical work, routing permutation, and the row-level
@@ -130,8 +130,8 @@ the other `(dp,tp)` points.
 
 ## 3. Grand total
 
-**192 unique verified proof functions, 0 errors, 20 source files**
-(per-component: 119; `axiom_base.rs`: 4; current composition cluster: 69).
+**204 unique verified proof functions, 0 errors, 20 source files**
+(per-component: 130; `axiom_base.rs`: 4; current composition cluster: 70).
 Re-verified 2026-09-11. Shared imports are counted once.
 
 ## 4. Property matrix — what's actually proved
@@ -149,7 +149,8 @@ Re-verified 2026-09-11. Shared imports are counted once.
 | Ex05 argsort establishes shared routing consistency | `component_integration.rs` | `ex05_establishes_routing_consistent` |
 | Ex06 contiguous partition establishes shared expert ownership | `component_integration.rs` | `ex06_establishes_expert_partitioned` |
 | Ex01 row-parallel replication establishes shared replicated input | `component_integration.rs` | `ex01_establishes_replicated_input` |
-| Ex09 row postcondition establishes shared fused-row correctness | `component_integration.rs` | `ex09_establishes_fused_rows_correct` |
+| Ex09 DSL equals the Python mathematical expert reference | `fused_kernel_dsl.rs` | `k2_k_reduce_correctness`, `k3_grouped_matmul_dsl_equals_reference`, `f4_fused_moe_dsl_equals_python_reference` |
+| Ex09 DSL execution establishes the component row postcondition | `component_integration.rs` | `ex09_dsl_execution_establishes_postcondition`, `ex09_establishes_fused_rows_correct` |
 | Naive MoE refines MoE_spec | `kernel_refinement.rs` | `e1_naive_refines_spec` |
 | Permuted MoE refines MoE_spec | `kernel_refinement.rs` | `e2_permuted_refines_spec`, from `RoutingConsistent` |
 | Fused rows refine MoE_spec | `kernel_refinement.rs` | `f4_fused_refines_spec`, from routing + pointwise `fused_rows_correct` |
@@ -261,8 +262,6 @@ a well-known mathematical fact.
 | AXIOM_ATTN_HEAD_LOCAL | Ex03 | attention commutes with head-shard |
 | AXIOM_RI1 (length + content) | Ex04 | repeat_interleave semantics |
 | AXIOM_SOFTMAX_SUM | Ex05 | softmax sums to 1 |
-| AXIOM_MATMUL_SPLITS_OVER_K | Ex09 DSL | tiled K reductions sum to the full matmul |
-| AXIOM_MATMUL_ZERO_PAD | Ex09 DSL | padded K elements contribute zero |
 
 ### Python-correspondence axioms (Verus-Python bridge)
 
@@ -284,7 +283,7 @@ The remaining model-to-source boundaries are:
 |----------|-------------|-------------------------|
 | Ex01 representative tensor identity | connects the replicated all-reduce result to the attention output consumed by MoE | tensor identity at one participating rank; Ex01 proves equality for all other ranks |
 | Ex05 argsort contract | produces the concrete routed order | `axiom_argsort_is_inverse_pair`; the bridge proves this implies `RoutingConsistent` |
-| Ex09 pointwise kernel postcondition + layout relation | connects grouped-GEMM rows to routed `(token,slot)` values | audited kernel contract and vector-to-scalar abstraction; the bridge proves `fused_rows_correct` |
+| Ex09 source-to-DSL execution + reference representation | connects the concrete Triton wrapper to the proved DSL execution, then identifies the Python mathematical reference with shared `expert_apply` | audit dispatch construction, kernel indexing/masking, wrapper call sequence, and vector-to-scalar layout; K2/K3/F4 arithmetic is machine-checked |
 | `expert_apply` | common exact expert semantic primitive | Python and Triton operations implement this abstraction |
 | `scatter_primitive = AtomicIndexAdd` | models conflicting output accumulation as atomic | inspect the actual `index_add_`/kernel implementation |
 | all-to-all record-transfer semantics | moves each record to its requested destination and, with swapped split sizes, returns it to its source | audit `all_to_all_variable` and the split-size construction against the global record model |
@@ -311,9 +310,6 @@ proof structure is documented inline.
 | `h3_ep_dispatch_symmetric_stub` | Ex07 | Inherited from Ex06 EP3 |
 | `h4_moe_out_tp_replicated_stub` | Ex07 | All-gather postcondition |
 | `h5_subgroup_deadlock_free_stub` | Ex07 | Sub-group deadlock-freedom (structural) |
-| `f2_postcondition_determines_output_stub` | Ex09 | Exact fused-kernel postcondition determinism |
-| `k2_k_reduce_correctness` | Ex09 DSL | K-reduction correctness |
-| `k3_derives_f4_full_kernel_correctness` | Ex09 DSL | Full kernel correctness from K1/K2 |
 
 **Note on stubs:** the former E1/E2/F4/L4/L6/H6, EP5/EP7, and local
 composition stubs were removed. Their shared exact proofs now live in
@@ -339,8 +335,9 @@ Read `kernel_refinement.rs`, `schedule_refinement.rs`,
 public block theorem calls Ex01/Ex05/Ex06/Ex09 bridges before E1/E2/F4 and
 L6/H6, and that no final refinement/swap statement appears in a `requires`
 clause. Then audit the remaining low-level boundaries against Python: the
-representative tensor identity, Ex05 argsort contract, Ex09 row postcondition
-and layout relation, and the mapping from schedule choice to execution order.
+representative tensor identity, Ex05 argsort contract, Ex09 source-to-DSL and
+reference-representation relations, and the mapping from schedule choice to
+execution order.
 
 ### Priority 3 — the anecdote-driven proof (30 min)
 
@@ -411,14 +408,12 @@ The paper's §Methodology section refers to these files:
    lower-level argsort/collective/kernel contracts, tensor identity, atomic
    primitive choice, and schedule-to-Python correspondence remain auditable
    boundaries.
-3. **The Triton kernel's DSL semantics is modeled and structurally verified
-   (`fused_kernel_dsl.rs`, K1a/K1b/K1c), but PTX/SASS compilation and A100
-   hardware execution are trusted below the DSL level.** The kernel's
-   correspondence to its Verus DSL model is established empirically via
-   `bootcamp/tests/test_ex09_fused_moe.py` (8 tests: fp32/bf16 × uniform/skewed × small/Qwen3-scale).
-   F4 is now proved from the pointwise `fused_rows_correct` boundary. K2/K3
-   remain the work needed to establish that boundary from the Triton DSL rather
-   than runtime/source correspondence evidence.
+3. **The Triton kernel's exact DSL semantics is modeled and verified through
+   full fused F4 (`fused_kernel_dsl.rs`, K1/K2/K3/F4), but source-to-DSL
+   correspondence, PTX/SASS compilation, floating-point effects, and A100
+   hardware execution remain trusted boundaries.** Runtime correspondence is
+   tested by `bootcamp/tests/test_ex09_fused_moe.py`; the tests are evidence,
+   not part of the machine proof.
 4. **Every per-component `c4_forward_correctness_general` / `r4_forward_correctness_general` is stubbed.**
    The parameterized-over-tp_size versions. Concrete tp_size=2 versions
    are proved.
@@ -459,9 +454,9 @@ verus --crate-type=lib verus/composition_theorem.rs
 ```
 
 Expected top-level outputs are 4 (`axiom_base`), 16 (`composition_core`),
-12 (`deadlock_free`), 40 (schedule crate), 22 (kernel crate), and 131
+12 (`deadlock_free`), 40 (schedule crate), 22 (kernel crate), and 156
 (`composition_theorem`), all with 0 errors. These numbers overlap because
-imported modules are re-verified; use the 192 unique count above for the
+imported modules are re-verified; use the 204 unique count above for the
 artifact total.
 
 Total wall-clock time: ~2 minutes on the shared pod.

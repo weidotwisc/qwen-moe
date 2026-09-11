@@ -3,11 +3,10 @@
 // Verus attempt at the algorithmic-contract correctness of Ex09's
 // fused-MoE Triton grouped-GEMM kernel.
 //
-// The Triton kernel itself is NOT verified — GPU kernels are out of
-// scope for source-level formal methods. Instead we verify the
+// The companion `fused_kernel_dsl.rs` proves the exact DSL model equal to
+// the Python grouped-expert reference.  This file states the component-facing
 // ALGORITHMIC CONTRACT:
 //   F1 (precondition consistency: monotone offsets partition [0, M))
-//   F2 stubbed (postcondition determinism up to approx_eq)
 //   F3 (empty-expert handling: rows outside any block unaffected)
 //   F4 is proved from a row-level fused-kernel postcondition in
 //   verus/kernel_refinement.rs.
@@ -123,19 +122,6 @@ pub open spec fn fused_moe_postcondition_holds(
     &&& forall|i: int| #![trigger out[i]] 0 <= i < out.len() as int
             ==> out[i] == expert_apply(owner(i as nat), sorted_x[i])
 }
-
-// =====================================================================
-// §7 — Property F2: postcondition determinism (external stub).
-//
-// Any two outputs satisfying the postcondition are `approx_eq` — since the
-// postcondition specifies the output pointwise up to tolerance, this is
-// direct but requires the `approx_eq` predicate. Stubbed.
-// =====================================================================
-
-#[verifier::external_body]
-pub proof fn f2_postcondition_determines_output_stub()
-    ensures true,
-{}
 
 // F4 is intentionally not restated as a whole-output axiom.  The shared
 // exact proof in `verus/kernel_refinement.rs` derives it from the pointwise

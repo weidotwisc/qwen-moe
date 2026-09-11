@@ -1,118 +1,80 @@
 # Ex09 — Formal properties for the fused-MoE Triton grouped-GEMM kernel
 
-This directory formalizes the correctness of
-[`solution.py`](../solution.py) — the Triton kernel that replaces the
-per-expert Python loop in Ex05b/Ex06/Ex07 with a single grouped-GEMM
-launch.
+This directory formalizes the exact-arithmetic DSL semantics of the three
+grouped-GEMM launches in [`reference.py`](../reference.py): gate projection,
+up projection, and down projection around the pointwise SwiGLU activation.
 
-**The Triton kernel is NOT verified directly.** GPU kernels are outside
-the scope of source-level formal methods; instead we verify the
-**algorithmic contract** of the kernel — the pre/post condition that the
-kernel promises to satisfy — and use that contract as the target that
-downstream compositions (Ex10 fused hybrid) refine.
+The machine-checked theorem compares this DSL model with the mathematical
+Python per-expert reference. It does not verify Triton-to-PTX compilation,
+hardware execution, floating-point rounding, or parse the Python/Triton source
+into Verus. Source-to-model correspondence remains an explicit audit boundary.
 
-**Style follows [ex06/verification/PROPERTIES.md](../../ex06_ep_pure/verification/PROPERTIES.md).**
+## Model
 
-## Abstraction model
-
-The kernel is treated as an uninterpreted spec function:
+`fused_kernel_dsl.rs` represents tensors as exact integer matrices. For one
+output element, the Python reference computes the untiled dot product
 
 $$
-\mathrm{fused\_moe\_forward}(\text{sorted\_x}, \text{offsets}, W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}) \to \text{out}
+\sum_{k=0}^{K-1} x_k w_k,
 $$
 
-Precondition (formalized in Verus as `fused_moe_precondition`):
-- `sorted_x: [M, H]`, well-formed rows all length H.
-- `offsets: [E+1]` with `offsets[0] == 0` and monotone non-decreasing.
-- `offsets[E] == M` (token conservation, from Ex06).
-- `W_gate, W_up: [E, I, H]`; `W_down: [E, H, I]`; all well-formed.
+while the Triton model partitions the same products into `BLOCK_K` intervals,
+accumulates the intervals in program order, and clamps the last interval to
+`K`. Clamping is the exact-arithmetic meaning of Triton's zero padding.
 
-Postcondition (formalized as `fused_moe_postcondition`):
-- `out: [M, H]`, well-formed.
-- For every row `i` in `[0, M)`, letting `e` be the unique expert with
-  `offsets[e] <= i < offsets[e+1]`:
-  `out[i] == expert_apply(e, sorted_x[i])`
-  up to declared floating-point tolerance.
+The dispatch-table contract states that every logical row is covered by
+exactly one M-axis program and that the program selects the same expert as the
+offsets-based Python owner function. The N-axis launch grid covers every output
+column exactly once.
 
-Where `expert_apply(e, x)` is the semantic per-expert operation
-`down_proj(silu(gate_proj(x)) * up_proj(x))`, uninterpreted at this level.
+## Machine-checked properties
 
-## Properties to verify
+### K1 — Output-tile coverage and disjointness
 
-### F1 — Precondition consistency
+- `k1a_m_axis_disjoint` proves that distinct M-axis programs cannot cover the
+  same logical output row under the dispatch contract.
+- `k1b_n_axis_covers` proves that the N-axis launch grid covers every logical
+  output column.
+- `k1c_n_axis_disjoint` proves that distinct N-axis program identifiers have
+  disjoint column intervals.
 
-The precondition is internally consistent:
-- Monotonic offsets + `offsets[0] == 0` + `offsets[E] == M` implies
-  every expert's block `[offsets[e], offsets[e+1])` is contained in
-  `[0, M)`.
-- Every row index in `[0, M)` falls in exactly one expert's block.
+### K2 — Exact K-reduction correctness
 
-**Proof**: from monotonicity + endpoint conditions.
+`k2_k_reduce_correctness` proves by induction that the sequence of clamped
+`BLOCK_K` reductions equals the untiled dot product. The proof uses concrete
+integer multiplication and addition; it has no matmul-splitting or
+zero-padding axiom.
 
-### F2 — Postcondition determines output uniquely
+### K3 — Grouped-matmul correctness
 
-Two calls to `fused_moe_forward` with the same
-`(sorted_x, offsets, W_gate, W_up, W_down)` produce outputs that are
-`approx_eq` to each other. (Deterministic-up-to-tolerance property.)
+`k3_grouped_matmul_dsl_equals_reference` lifts K2 to every output row and
+column. Under the dispatch and launch-shape contracts, the modeled Triton
+grouped GEMM equals the mathematical Python grouped-matmul reference.
 
-**Proof**: the postcondition specifies the output content pointwise, up
-to tolerance; any two outputs both satisfying it are `approx_eq`.
+### F4 — Complete fused-expert correctness
 
-### F3 — Empty-expert handling
+`f4_fused_moe_dsl_equals_python_reference` composes K3 for gate, up, and down
+projections. Since both paths apply the same deterministic pointwise
+`silu(gate) * up` operation, the complete modeled fused expert equals the
+Python expert reference in exact arithmetic.
 
-If `offsets[e] == offsets[e+1]` for some expert `e`, expert `e` gets
-zero tokens. The output at other tokens is unaffected — the empty expert
-does not read or write outside its (zero-length) block.
+`component_integration.rs::ex09_dsl_execution_establishes_postcondition`
+imports this result into the shared MoE composition model. Consequently,
+Ex09's pointwise output postcondition is derived rather than assumed by the
+composition theorem.
 
-**Proof**: from the postcondition — no row index falls in an empty
-block, so no output row references expert `e`.
+## Remaining trust boundary
 
-### F4 — Composition with Ex06/Ex07 (external stub)
+The composition contract still records that the concrete Ex09 run corresponds
+to `fused_moe_dsl`, and that the mathematical Python reference represents the
+shared abstract `expert_apply`. Auditing these relations requires checking:
 
-If Ex06's or Ex07's dispatch step establishes the routing-conservation
-precondition (i.e., produces `(sorted_x, offsets)` satisfying F1), then
-calling `fused_moe_forward` on those inputs produces the same output
-(up to `approx_eq`) as running Ex05b's per-expert Python loop.
+- `_build_tile_dispatch` against `dispatch_matches_row_owner`;
+- `grouped_matmul_kernel_v2` against the modeled M/N/K indexing and masking;
+- the wrapper's gate/up/SwiGLU/down call sequence against `fused_moe_dsl`;
+- the compiler and GPU execution stack; and
+- numerical behavior separately, because the theorem uses exact integers.
 
-**Proof composition**:
-1. Ex06/Ex07's dispatch postcondition matches F1 (routing conservation).
-2. F2 gives that the output is uniquely determined by inputs.
-3. The Python per-expert loop refines the same postcondition (F3-style
-   per-block computation).
-4. By transitivity, fused kernel output equals Python-loop output up to
-   `approx_eq`.
-
-This is the load-bearing property for **Ex10's fused-hybrid composition
-theorem**.
-
-## What each tool proves — this exercise
-
-Same three-tool pattern as Ex01-07. Verus proof shipped first.
-
-## Correspondence to Python + Triton
-
-1. The Python wrapper `fused_moe_forward` in `solution.py` calls the
-   Triton kernel three times (gate, up, down projections). The final
-   output is the down-projection result at the tokens' original
-   positions in `sorted_x`.
-2. The Triton kernel itself (`grouped_matmul_kernel`) is treated as
-   uninterpreted; the correspondence between the kernel's SASS-level
-   behavior and the abstract spec function is established by:
-   - The unit tests in `bootcamp/tests/test_ex09_fused_moe.py`, which
-     compare the kernel's output to a pure-PyTorch reference oracle at
-     fp32 and bf16 tolerances.
-   - The kernel's own comment invariants (see the module docstring in
-     `solution.py`).
-
-This is the **trust boundary** of the Ex09 verification: the Triton
-kernel's per-block-tile behavior is trusted; the abstract algorithmic
-contract is what downstream compositions rely on.
-
-## Correctness of the abstraction
-
-The uninterpreted `fused_moe_forward` spec function is an abstract
-interface, not a claim about the Triton kernel's specific implementation.
-The paper's threats-to-validity section names this trust surface:
-GPU-kernel-level correctness of the Triton implementation is out of
-scope for source-level formal verification tools like Verus, Dafny, and
-Z3.
+The runtime tests in `bootcamp/tests/test_ex09_fused_moe.py` provide empirical
+evidence for these implementation boundaries; they are not part of the formal
+proof.

@@ -17,6 +17,9 @@ mod ex01_row_parallel;
 #[path = "../bootcamp/ex09_fused_moe/verification/fused_moe.rs"]
 mod ex09_fused_moe;
 
+#[path = "../bootcamp/ex09_fused_moe/verification/fused_kernel_dsl.rs"]
+mod ex09_fused_dsl;
+
 verus! {
 
 /// Source-level MoE fields before routing and kernel execution add their
@@ -332,12 +335,164 @@ pub struct Ex09FusedRun {
     pub offsets: Seq<nat>,
     pub experts_per_rank: nat,
     pub owner: spec_fn(nat) -> ExpertId,
+    pub gate_weights: Seq<ex09_fused_dsl::Tensor>,
+    pub up_weights: Seq<ex09_fused_dsl::Tensor>,
+    pub down_weights: Seq<ex09_fused_dsl::Tensor>,
+    pub dispatch: ex09_fused_dsl::DispatchTable,
+    pub hidden_cols: nat,
+    pub intermediate_cols: nat,
+    pub gate_block_n: nat,
+    pub gate_num_n_tiles: nat,
+    pub gate_block_k: nat,
+    pub gate_num_k_tiles: nat,
+    pub down_block_n: nat,
+    pub down_num_n_tiles: nat,
+    pub down_block_k: nat,
+    pub down_num_k_tiles: nat,
+}
+
+/// Representation boundary between the mathematical Python expert and the
+/// shared composition model's abstract expert function.  Unlike kernel
+/// correctness, this predicate only identifies which mathematical function
+/// the two layers call `expert_apply`.
+pub open spec fn ex09_reference_matches_expert_apply(
+    run: Ex09FusedRun,
+) -> bool {
+    let reference = ex09_fused_dsl::fused_moe_reference(
+        run.sorted_x,
+        run.gate_weights,
+        run.up_weights,
+        run.down_weights,
+        run.owner,
+        run.sorted_x.len(),
+        run.hidden_cols,
+        run.intermediate_cols,
+    );
+    &&& reference.len() == run.sorted_x.len()
+    &&& forall|i: int| #![trigger reference[i]]
+        0 <= i < reference.len() ==> reference[i]
+            == ex09_fused_moe::expert_apply(
+                (run.owner)(i as nat), run.sorted_x[i],
+            )
+}
+
+/// Faithful-input contract for one modeled execution of the actual Ex09
+/// Triton wrapper.  The equality to `fused_moe_dsl` is the source/DSL
+/// correspondence boundary; arithmetic correctness is proved from it rather
+/// than assumed as an output postcondition.
+pub open spec fn ex09_dsl_execution(run: Ex09FusedRun) -> bool {
+    &&& run.experts_per_rank == run.dispatch.num_experts
+    &&& run.offsets == run.dispatch.expert_offsets
+    &&& ex09_fused_dsl::well_formed(
+        run.sorted_x, run.sorted_x.len(), run.hidden_cols,
+    )
+    &&& ex09_fused_dsl::grouped_weights_well_formed(
+        run.gate_weights,
+        run.dispatch.num_experts,
+        run.intermediate_cols,
+        run.hidden_cols,
+    )
+    &&& ex09_fused_dsl::grouped_weights_well_formed(
+        run.up_weights,
+        run.dispatch.num_experts,
+        run.intermediate_cols,
+        run.hidden_cols,
+    )
+    &&& ex09_fused_dsl::grouped_weights_well_formed(
+        run.down_weights,
+        run.dispatch.num_experts,
+        run.hidden_cols,
+        run.intermediate_cols,
+    )
+    &&& ex09_fused_dsl::dispatch_matches_row_owner(
+        run.dispatch, run.sorted_x.len(), run.owner,
+    )
+    &&& run.gate_block_n > 0
+    &&& run.intermediate_cols
+        <= run.gate_num_n_tiles * run.gate_block_n
+    &&& run.gate_block_k > 0
+    &&& run.hidden_cols <= run.gate_num_k_tiles * run.gate_block_k
+    &&& run.down_block_n > 0
+    &&& run.hidden_cols <= run.down_num_n_tiles * run.down_block_n
+    &&& run.down_block_k > 0
+    &&& run.intermediate_cols
+        <= run.down_num_k_tiles * run.down_block_k
+    &&& run.out == ex09_fused_dsl::fused_moe_dsl(
+        run.sorted_x,
+        run.gate_weights,
+        run.up_weights,
+        run.down_weights,
+        run.dispatch,
+        run.sorted_x.len(),
+        run.hidden_cols,
+        run.intermediate_cols,
+        run.gate_block_k,
+        run.gate_num_k_tiles,
+        run.down_block_k,
+        run.down_num_k_tiles,
+    )
+    &&& ex09_reference_matches_expert_apply(run)
+}
+
+/// K2/K3/F4 turn a modeled Triton execution into Ex09's pointwise component
+/// postcondition.  The postcondition is therefore a theorem, not a premise of
+/// the composition contract.
+pub proof fn ex09_dsl_execution_establishes_postcondition(
+    run: Ex09FusedRun,
+)
+    requires ex09_dsl_execution(run),
+    ensures ex09_fused_moe::fused_moe_postcondition_holds(
+        run.out,
+        run.sorted_x,
+        run.offsets,
+        run.experts_per_rank,
+        run.owner,
+    ),
+{
+    let reference = ex09_fused_dsl::fused_moe_reference(
+        run.sorted_x,
+        run.gate_weights,
+        run.up_weights,
+        run.down_weights,
+        run.owner,
+        run.sorted_x.len(),
+        run.hidden_cols,
+        run.intermediate_cols,
+    );
+    ex09_fused_dsl::f4_fused_moe_dsl_equals_python_reference(
+        run.sorted_x,
+        run.gate_weights,
+        run.up_weights,
+        run.down_weights,
+        run.dispatch,
+        run.owner,
+        run.sorted_x.len(),
+        run.hidden_cols,
+        run.intermediate_cols,
+        run.gate_block_n,
+        run.gate_num_n_tiles,
+        run.gate_block_k,
+        run.gate_num_k_tiles,
+        run.down_block_n,
+        run.down_num_n_tiles,
+        run.down_block_k,
+        run.down_num_k_tiles,
+    );
+    assert(run.out == reference);
+    assert(run.out.len() == run.sorted_x.len());
+    assert forall|i: int| #![trigger run.out[i]]
+        0 <= i < run.out.len() implies run.out[i]
+            == ex09_fused_moe::expert_apply(
+                (run.owner)(i as nat), run.sorted_x[i],
+            ) by {
+        assert(run.out[i] == reference[i]);
+    }
 }
 
 /// Representation relation between Ex09's vector-row contract and Tier 3's
 /// scalar work-item abstraction.  It only relates layouts and the two levels'
-/// expert semantics; correctness of `out` is supplied separately by Ex09's
-/// kernel postcondition.
+/// expert semantics; correctness of `out` is derived separately from the DSL
+/// execution theorem.
 pub open spec fn ex09_run_matches_shared_layout(
     input: MoeInput,
     run: Ex09FusedRun,
@@ -362,8 +517,8 @@ pub open spec fn ex09_run_matches_shared_layout(
         }
 }
 
-/// The low-level component contract consumed by composition: Ex09's own
-/// pointwise grouped-GEMM postcondition plus an explicit representation map.
+/// The low-level component contract consumed by composition: a modeled Ex09
+/// DSL execution plus the explicit representation map to shared MoE semantics.
 pub open spec fn Ex09KernelContract(
     input: MoeInput,
     run: Ex09FusedRun,
@@ -372,13 +527,7 @@ pub open spec fn Ex09KernelContract(
     &&& ex09_fused_moe::fused_moe_precondition_offsets(
         run.offsets, run.experts_per_rank, run.out.len(),
     )
-    &&& ex09_fused_moe::fused_moe_postcondition_holds(
-        run.out,
-        run.sorted_x,
-        run.offsets,
-        run.experts_per_rank,
-        run.owner,
-    )
+    &&& ex09_dsl_execution(run)
     &&& ex09_run_matches_shared_layout(input, run)
 }
 
@@ -393,6 +542,7 @@ pub proof fn ex09_establishes_fused_rows_correct(
         Ex09KernelContract(input, run),
     ensures fused_rows_correct(input),
 {
+    ex09_dsl_execution_establishes_postcondition(run);
     assert(input.fused_values.len() == input.routing_order.len());
     assert forall|i: int| #![trigger input.fused_values[i]]
         0 <= i < input.routing_order.len()

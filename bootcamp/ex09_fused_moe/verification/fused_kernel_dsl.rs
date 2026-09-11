@@ -18,13 +18,16 @@
 //                                  rather than trusted).
 //
 // What this file does NOT cover:
+//   - A mechanized parser/semantics bridge from the Python Triton AST to
+//     this DSL model; that source-to-model correspondence is audited.
 //   - The Triton → PTX compilation.
 //   - The PTX → SASS lowering.
 //   - A100 hardware execution of the compiled machine code.
 //
-// The trust surface shrinks from "the entire Triton kernel is trusted"
-// to "the Triton compiler correctly implements the DSL semantics we
-// modeled".
+// Within the DSL model, dispatch ownership, launch-grid coverage, the exact
+// K reduction, and all three grouped matmuls are machine-checked.  The
+// remaining trust boundary starts at source-to-model correspondence, followed
+// by the compiler and hardware stack.
 //
 // Run with:
 //   verus fused_kernel_dsl.rs
@@ -53,14 +56,14 @@ pub open spec fn well_formed(t: Tensor, rows: nat, cols: nat) -> bool {
 // Given `expert_offsets: [E+1]` from the routing step, the wrapper
 // `_build_tile_dispatch` in ex09/reference.py builds two arrays:
 //   tile_expert       : [total_tiles] — mid → which expert
-//   tile_local_offset : [total_tiles] — mid → which BLOCK_M-sized tile
-//                                        within that expert (0-indexed).
+//   tile_row_start    : [total_tiles] — mid → global first row of the
+//                                        BLOCK_M-sized expert tile.
 // The launch grid is (total_tiles, cdiv(N, BLOCK_N)).
 // =====================================================================
 
 pub struct DispatchTable {
     pub tile_expert: Seq<ExpertId>,        // [total_tiles]
-    pub tile_local_offset: Seq<nat>,       // [total_tiles]
+    pub tile_row_start: Seq<nat>,          // [total_tiles]
     pub expert_offsets: Seq<nat>,          // [E+1]
     pub total_tiles: nat,
     pub num_experts: nat,
@@ -68,8 +71,8 @@ pub struct DispatchTable {
 }
 
 /// A DispatchTable is well-formed when its arrays have consistent
-/// shapes and every entry references a valid expert with a valid
-/// within-expert tile offset.
+/// shapes and every entry references a valid expert with a row start inside
+/// that expert's contiguous block.
 pub open spec fn dt_well_formed(dt: DispatchTable) -> bool {
     &&& dt.block_m >= 1
     &&& dt.num_experts >= 1
@@ -78,9 +81,14 @@ pub open spec fn dt_well_formed(dt: DispatchTable) -> bool {
     &&& forall|e: int| #![trigger dt.expert_offsets[e]] 0 <= e < dt.num_experts as int
             ==> dt.expert_offsets[e] <= dt.expert_offsets[e + 1]
     &&& dt.tile_expert.len() == dt.total_tiles
-    &&& dt.tile_local_offset.len() == dt.total_tiles
+    &&& dt.tile_row_start.len() == dt.total_tiles
     &&& forall|mid: int| #![trigger dt.tile_expert[mid]] 0 <= mid < dt.total_tiles as int
-            ==> dt.tile_expert[mid] < dt.num_experts
+            ==> {
+                let expert = dt.tile_expert[mid];
+                &&& expert < dt.num_experts
+                &&& dt.expert_offsets[expert as int] <= dt.tile_row_start[mid]
+                &&& dt.tile_row_start[mid] < dt.expert_offsets[expert as int + 1]
+            }
 }
 
 // =====================================================================
@@ -121,94 +129,326 @@ pub proof fn lemma_masked_load_1d_len(seq: Seq<Element>, start: nat, len: nat, u
 }
 
 // =====================================================================
-// §4 — Matmul + K-reduce (uninterpreted spec functions with axioms).
+// §4 — Exact dot product + K-tiled reduction.
+//
+// Triton's `tl.dot(..., acc=acc)` updates every output element by adding
+// the products in one BLOCK_K-wide slice.  We model one output element
+// directly.  Lifting this pointwise fact to a matrix tile is extensional:
+// every (row, column) element executes the same K loop.
 // =====================================================================
 
-pub uninterp spec fn matmul(x: Tensor, w_t: Tensor) -> Tensor;
-pub uninterp spec fn transpose(t: Tensor) -> Tensor;
+pub open spec fn range_sum(values: Seq<Element>, start: nat, end: nat) -> Element
+    decreases end - start,
+{
+    if start >= end || end > values.len() {
+        0
+    } else {
+        values[start as int] + range_sum(values, (start + 1) as nat, end)
+    }
+}
 
-/// Elementwise sum of two tensors of the same shape — used for the
-/// K-reduce accumulator.
-pub uninterp spec fn tensor_add(a: Tensor, b: Tensor) -> Tensor;
+pub open spec fn dot_terms(x: Row, w: Row, k_total: nat) -> Seq<Element> {
+    if k_total <= x.len() && k_total <= w.len() {
+        Seq::new(k_total, |k: int| x[k] * w[k])
+    } else {
+        Seq::empty()
+    }
+}
 
-/// AXIOM: matmul splits over the K (in-dim) with elementwise sum.
-/// Given the K-axis is concatenated from two halves in both x and w,
-/// the full matmul equals the sum of per-half matmuls.
-#[verifier::external_body]
-pub proof fn axiom_matmul_splits_over_k(
-    x: Tensor, w_t: Tensor,
-    x_a: Tensor, x_b: Tensor,
-    w_t_a: Tensor, w_t_b: Tensor,
-)
-    requires
-        // x is horizontally concat(x_a, x_b) on K-axis; w_t is
-        // vertically concat(w_t_a, w_t_b) on the same K-axis.
-        x_a.len() == x.len(),
-        x_b.len() == x.len(),
-    ensures
-        matmul(x, w_t) == tensor_add(matmul(x_a, w_t_a), matmul(x_b, w_t_b)),
-{}
+pub open spec fn dot_product(x: Row, w: Row, k_total: nat) -> Element {
+    range_sum(dot_terms(x, w, k_total), 0, k_total)
+}
 
-/// AXIOM: matmul of a zero-padded input at the end contributes zero to
-/// the accumulator — so the final K-tile (which is often OOB in K if K
-/// is not a multiple of BLOCK_K) doesn't invalidate the accumulation.
-#[verifier::external_body]
-pub proof fn axiom_matmul_zero_pad_contributes_zero(
-    x_tile: Tensor, w_tile: Tensor, zero_padded_result: Tensor,
-)
-    ensures matmul(x_tile, transpose(w_tile)) == zero_padded_result,
-{}
+/// Clamp a K-tile boundary to the logical K extent.  This exactly captures
+/// Triton's zero-padding on the final partial tile: positions at or beyond K
+/// contribute no term to the mathematical reduction.
+pub open spec fn k_boundary(tile: nat, block_k: nat, k_total: nat) -> nat {
+    if tile * block_k < k_total {
+        tile * block_k
+    } else {
+        k_total
+    }
+}
 
-/// K-reduce spec: recursively accumulate matmul contributions over
-/// K-tiles from j = 0 to j = num_k_tiles - 1. Returns the final Y_tile.
-pub open spec fn k_reduce(
-    x_tile_at: spec_fn(nat) -> Tensor,
-    w_tile_at: spec_fn(nat) -> Tensor,
-    j: nat, num_k_tiles: nat,
-    acc: Tensor,
-) -> Tensor
+pub open spec fn k_tile_sum(
+    terms: Seq<Element>, tile: nat, block_k: nat, k_total: nat,
+) -> Element {
+    range_sum(
+        terms,
+        k_boundary(tile, block_k, k_total),
+        k_boundary((tile + 1) as nat, block_k, k_total),
+    )
+}
+
+/// Exact scalar semantics of the BLOCK_K loop for one output element.
+pub open spec fn k_reduce_entry(
+    terms: Seq<Element>,
+    j: nat,
+    num_k_tiles: nat,
+    block_k: nat,
+    k_total: nat,
+    acc: Element,
+) -> Element
     decreases num_k_tiles - j,
 {
     if j >= num_k_tiles {
         acc
     } else {
-        let contribution = matmul(x_tile_at(j), transpose(w_tile_at(j)));
-        k_reduce(x_tile_at, w_tile_at, (j + 1) as nat,
-                 num_k_tiles, tensor_add(acc, contribution))
+        k_reduce_entry(
+            terms,
+            (j + 1) as nat,
+            num_k_tiles,
+            block_k,
+            k_total,
+            acc + k_tile_sum(terms, j, block_k, k_total),
+        )
     }
 }
 
 // =====================================================================
-// §5 — Kernel tile output spec function.
-//
-// Models the kernel body at (mid, nid): produces the Y_tile that gets
-// stored to y[e_start + local_mid*BLOCK_M : ..., nid*BLOCK_N : ...].
+// §5 — Pointwise grouped-matmul semantics.
 // =====================================================================
 
-pub uninterp spec fn kernel_x_tile_at(
-    x: Tensor, dt: DispatchTable, mid: nat, j: nat, block_k: nat,
-) -> Tensor;
+/// One output element of the Python/PyTorch grouped-matmul reference.
+pub open spec fn grouped_matmul_reference_entry(
+    x_row: Row, expert_weight_row: Row, k_total: nat,
+) -> Element {
+    dot_product(x_row, expert_weight_row, k_total)
+}
 
-pub uninterp spec fn kernel_w_tile_at(
-    w_by_expert: spec_fn(ExpertId) -> Tensor,
-    dt: DispatchTable, mid: nat, nid: nat, j: nat, block_n: nat, block_k: nat,
-) -> Tensor;
+/// The corresponding output element produced by the Triton DSL K loop.
+pub open spec fn grouped_matmul_dsl_entry(
+    x_row: Row,
+    expert_weight_row: Row,
+    k_total: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+) -> Element {
+    k_reduce_entry(
+        dot_terms(x_row, expert_weight_row, k_total),
+        0,
+        num_k_tiles,
+        block_k,
+        k_total,
+        0,
+    )
+}
 
-/// The Y_tile produced by program instance (mid, nid) after running
-/// through the K-reduce loop.
-pub open spec fn kernel_tile_output(
+pub open spec fn grouped_weights_well_formed(
+    weights: Seq<Tensor>, experts: nat, output_cols: nat, k_total: nat,
+) -> bool {
+    &&& weights.len() == experts
+    &&& forall|e: int| #![trigger weights[e]] 0 <= e < experts ==> {
+        &&& weights[e].len() == output_cols
+        &&& forall|col: int| #![trigger weights[e][col]]
+            0 <= col < output_cols ==> weights[e][col].len() == k_total
+    }
+}
+
+/// Mathematical Python-loop reference: select the row's expert, then compute
+/// every output column by an untiled exact dot product.
+pub open spec fn grouped_matmul_reference(
     x: Tensor,
-    w_by_expert: spec_fn(ExpertId) -> Tensor,
+    weights: Seq<Tensor>,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    output_cols: nat,
+    k_total: nat,
+) -> Tensor
+    recommends
+        well_formed(x, total_rows, k_total),
+        grouped_weights_well_formed(
+            weights, weights.len(), output_cols, k_total,
+        ),
+        forall|row: nat| #![trigger owner(row)]
+            row < total_rows ==> owner(row) < weights.len(),
+{
+    Seq::new(total_rows, |row: int|
+        Seq::new(output_cols, |col: int|
+            grouped_matmul_reference_entry(
+                x[row], weights[owner(row as nat) as int][col], k_total,
+            )
+        )
+    )
+}
+
+/// Pointwise semantics of the Triton launch after K1 has selected the unique
+/// M-axis program for a row. N-axis coverage determines the unique column
+/// tile; it does not change the value computed at that column.
+pub open spec fn grouped_matmul_dsl(
+    x: Tensor,
+    weights: Seq<Tensor>,
     dt: DispatchTable,
-    mid: nat, nid: nat,
-    block_n: nat, block_k: nat, num_k_tiles: nat,
-    initial_acc: Tensor,
+    total_rows: nat,
+    output_cols: nat,
+    k_total: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+) -> Tensor
+    recommends
+        well_formed(x, total_rows, k_total),
+        grouped_weights_well_formed(
+            weights, dt.num_experts, output_cols, k_total,
+        ),
+        forall|row: nat| #![trigger program_for_row(dt, row)] row < total_rows ==>
+            exists|mid: nat| program_covers_row(dt, mid, row),
+{
+    Seq::new(total_rows, |row: int| {
+        let mid = program_for_row(dt, row as nat);
+        let expert = dt.tile_expert[mid as int];
+        Seq::new(output_cols, |col: int|
+            grouped_matmul_dsl_entry(
+                x[row],
+                weights[expert as int][col],
+                k_total,
+                block_k,
+                num_k_tiles,
+            )
+        )
+    })
+}
+
+pub uninterp spec fn silu(value: Element) -> Element;
+
+pub open spec fn gated_activation(
+    gate: Tensor, up: Tensor, total_rows: nat, cols: nat,
+) -> Tensor
+    recommends
+        well_formed(gate, total_rows, cols),
+        well_formed(up, total_rows, cols),
+{
+    Seq::new(total_rows, |row: int|
+        Seq::new(cols, |col: int| silu(gate[row][col]) * up[row][col])
+    )
+}
+
+pub proof fn lemma_grouped_matmul_reference_well_formed(
+    x: Tensor,
+    weights: Seq<Tensor>,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    output_cols: nat,
+    k_total: nat,
+)
+    requires
+        well_formed(x, total_rows, k_total),
+        grouped_weights_well_formed(
+            weights, weights.len(), output_cols, k_total,
+        ),
+        forall|row: nat| #![trigger owner(row)]
+            row < total_rows ==> owner(row) < weights.len(),
+    ensures well_formed(
+        grouped_matmul_reference(
+            x, weights, owner, total_rows, output_cols, k_total,
+        ),
+        total_rows,
+        output_cols,
+    ),
+{
+}
+
+pub proof fn lemma_grouped_matmul_dsl_well_formed(
+    x: Tensor,
+    weights: Seq<Tensor>,
+    dt: DispatchTable,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    output_cols: nat,
+    k_total: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+)
+    requires
+        well_formed(x, total_rows, k_total),
+        grouped_weights_well_formed(
+            weights, dt.num_experts, output_cols, k_total,
+        ),
+        dispatch_matches_row_owner(dt, total_rows, owner),
+    ensures well_formed(
+        grouped_matmul_dsl(
+            x, weights, dt, total_rows, output_cols, k_total,
+            block_k, num_k_tiles,
+        ),
+        total_rows,
+        output_cols,
+    ),
+{
+    assert forall|row: nat| #![trigger program_for_row(dt, row)]
+        row < total_rows implies {
+            &&& exists|mid: nat| program_covers_row(dt, mid, row)
+            &&& dt.tile_expert[program_for_row(dt, row) as int]
+                < dt.num_experts
+        } by {
+        lemma_program_for_row_matches_owner(dt, total_rows, owner, row);
+    }
+}
+
+pub proof fn lemma_gated_activation_well_formed(
+    gate: Tensor, up: Tensor, total_rows: nat, cols: nat,
+)
+    requires
+        well_formed(gate, total_rows, cols),
+        well_formed(up, total_rows, cols),
+    ensures well_formed(
+        gated_activation(gate, up, total_rows, cols), total_rows, cols,
+    ),
+{
+}
+
+/// Exact Python-loop reference for the three operations in one SwiGLU expert:
+/// gate projection, up projection, pointwise SiLU/product, and down projection.
+pub open spec fn fused_moe_reference(
+    x: Tensor,
+    gate_weights: Seq<Tensor>,
+    up_weights: Seq<Tensor>,
+    down_weights: Seq<Tensor>,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    hidden_cols: nat,
+    intermediate_cols: nat,
 ) -> Tensor {
-    k_reduce(
-        |j: nat| kernel_x_tile_at(x, dt, mid, j, block_k),
-        |j: nat| kernel_w_tile_at(w_by_expert, dt, mid, nid, j, block_n, block_k),
-        0nat, num_k_tiles,
-        initial_acc,
+    let gate = grouped_matmul_reference(
+        x, gate_weights, owner, total_rows, intermediate_cols, hidden_cols,
+    );
+    let up = grouped_matmul_reference(
+        x, up_weights, owner, total_rows, intermediate_cols, hidden_cols,
+    );
+    let hidden = gated_activation(gate, up, total_rows, intermediate_cols);
+    grouped_matmul_reference(
+        hidden, down_weights, owner,
+        total_rows, hidden_cols, intermediate_cols,
+    )
+}
+
+/// Exact DSL semantics of the three grouped-GEMM launches in
+/// `fused_moe_forward`.
+pub open spec fn fused_moe_dsl(
+    x: Tensor,
+    gate_weights: Seq<Tensor>,
+    up_weights: Seq<Tensor>,
+    down_weights: Seq<Tensor>,
+    dt: DispatchTable,
+    total_rows: nat,
+    hidden_cols: nat,
+    intermediate_cols: nat,
+    gate_block_k: nat,
+    gate_num_k_tiles: nat,
+    down_block_k: nat,
+    down_num_k_tiles: nat,
+) -> Tensor {
+    let gate = grouped_matmul_dsl(
+        x, gate_weights, dt, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    let up = grouped_matmul_dsl(
+        x, up_weights, dt, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    let hidden = gated_activation(gate, up, total_rows, intermediate_cols);
+    grouped_matmul_dsl(
+        hidden, down_weights, dt,
+        total_rows, hidden_cols, intermediate_cols,
+        down_block_k, down_num_k_tiles,
     )
 }
 
@@ -217,8 +457,7 @@ pub open spec fn kernel_tile_output(
 //
 // The dispatch table's M-axis tiles partition the union of expert
 // blocks. Specifically:
-//   - Two distinct mid values with the same expert map to disjoint
-//     within-expert offsets.
+//   - Two distinct mid values cover disjoint logical output rows.
 //   - The union of all mid values' tiles covers [0, total_tiles * BLOCK_M).
 // =====================================================================
 
@@ -227,59 +466,81 @@ pub open spec fn tile_m_span(dt: DispatchTable, mid: nat) -> (nat, nat)
     recommends mid < dt.total_tiles,
 {
     let eid = dt.tile_expert[mid as int];
-    let e_start = dt.expert_offsets[eid as int];
-    let local = dt.tile_local_offset[mid as int];
-    let tile_start = e_start + local * dt.block_m;
+    let tile_start = dt.tile_row_start[mid as int];
     let tile_end = tile_start + dt.block_m;
     (tile_start, tile_end)
 }
 
-/// K1a-disjointness: if two distinct mid values map to the same expert,
-/// their within-expert tile offsets are different (this is a property
-/// of `_build_tile_dispatch` in ex09/reference.py — each mid gets a
-/// unique local_mid within its expert).
-pub open spec fn tile_offsets_unique_per_expert(dt: DispatchTable) -> bool {
-    forall|m1: int, m2: int|
-        #![trigger dt.tile_local_offset[m1], dt.tile_local_offset[m2]]
-        0 <= m1 < dt.total_tiles as int
-        && 0 <= m2 < dt.total_tiles as int
-        && m1 != m2
-        && dt.tile_expert[m1] == dt.tile_expert[m2]
-        ==> dt.tile_local_offset[m1] != dt.tile_local_offset[m2]
+/// A dispatch-table program covers the non-padding rows between its global
+/// row start and the end of its expert's contiguous block.
+pub open spec fn program_covers_row(
+    dt: DispatchTable, mid: nat, row: nat,
+) -> bool {
+    &&& mid < dt.total_tiles
+    &&& row >= dt.tile_row_start[mid as int]
+    &&& row < dt.tile_row_start[mid as int] + dt.block_m
+    &&& row < dt.expert_offsets[dt.tile_expert[mid as int] as int + 1]
 }
 
-/// K1a: distinct program instances (mid1 != mid2) write to disjoint
-/// M-axis regions of the output (either different experts or same
-/// expert with different tile offsets).
+/// Semantic contract of `_build_tile_dispatch`: every logical input row is
+/// assigned to exactly one M-axis program and that program names the same
+/// expert as the Python reference's offsets-based owner function.
+pub open spec fn dispatch_matches_row_owner(
+    dt: DispatchTable,
+    total_rows: nat,
+    owner: spec_fn(nat) -> ExpertId,
+) -> bool {
+    &&& dt_well_formed(dt)
+    &&& dt.expert_offsets[dt.num_experts as int] == total_rows
+    &&& forall|row: nat| #![trigger owner(row)] row < total_rows ==> {
+        &&& owner(row) < dt.num_experts
+        &&& exists|mid: nat| program_covers_row(dt, mid, row)
+            && dt.tile_expert[mid as int] == owner(row)
+    }
+    &&& forall|row: nat, mid1: nat, mid2: nat|
+        #![trigger program_covers_row(dt, mid1, row), program_covers_row(dt, mid2, row)]
+        row < total_rows
+        && program_covers_row(dt, mid1, row)
+        && program_covers_row(dt, mid2, row)
+            ==> mid1 == mid2
+}
+
+pub open spec fn program_for_row(dt: DispatchTable, row: nat) -> nat
+    recommends exists|mid: nat| program_covers_row(dt, mid, row),
+{
+    choose|mid: nat| program_covers_row(dt, mid, row)
+}
+
+/// K1a: two distinct M-axis programs never cover the same logical output row.
+/// Padding rows at the end of a tile are excluded by `program_covers_row`.
 pub proof fn k1a_m_axis_disjoint(
-    dt: DispatchTable, mid1: nat, mid2: nat,
+    dt: DispatchTable,
+    total_rows: nat,
+    owner: spec_fn(nat) -> ExpertId,
+    mid1: nat,
+    mid2: nat,
 )
     requires
-        dt_well_formed(dt),
-        tile_offsets_unique_per_expert(dt),
+        dispatch_matches_row_owner(dt, total_rows, owner),
         mid1 < dt.total_tiles,
         mid2 < dt.total_tiles,
         mid1 != mid2,
-        // Same expert case: within-expert offsets differ, so M-axis spans differ.
-        dt.tile_expert[mid1 as int] == dt.tile_expert[mid2 as int],
-    ensures
-        tile_m_span(dt, mid1).0 != tile_m_span(dt, mid2).0,
+    ensures forall|row: nat|
+        row < total_rows ==> !(
+            program_covers_row(dt, mid1, row)
+                && program_covers_row(dt, mid2, row)
+        ),
 {
-    // Same expert, different local_mid → different (e_start + local * block_m).
-    assert(dt.tile_local_offset[mid1 as int] != dt.tile_local_offset[mid2 as int]);
-    // Multiplication by block_m preserves inequality.
-    let eid = dt.tile_expert[mid1 as int];
-    let e_start = dt.expert_offsets[eid as int];
-    let l1 = dt.tile_local_offset[mid1 as int];
-    let l2 = dt.tile_local_offset[mid2 as int];
-    let bm = dt.block_m;
-    assert(l1 != l2);
-    // Show e_start + l1 * bm != e_start + l2 * bm.
-    // Equivalent to l1 * bm != l2 * bm, which holds since l1 != l2 and bm >= 1.
-    assert(l1 * bm != l2 * bm) by (nonlinear_arith)
-        requires l1 != l2, bm >= 1;
-    assert(tile_m_span(dt, mid1).0 == e_start + l1 * bm);
-    assert(tile_m_span(dt, mid2).0 == e_start + l2 * bm);
+    assert forall|row: nat|
+        row < total_rows implies !(
+            program_covers_row(dt, mid1, row)
+                && program_covers_row(dt, mid2, row)
+        ) by {
+        if program_covers_row(dt, mid1, row)
+            && program_covers_row(dt, mid2, row) {
+            assert(mid1 == mid2);
+        }
+    }
 }
 
 // =====================================================================
@@ -347,113 +608,361 @@ pub proof fn k1c_n_axis_disjoint(
 }
 
 // =====================================================================
-// §9 — Property K2: K-reduce correctness (external, structural).
-//
-// The K-reduce loop, when applied to x_tile and w_tile whose K-axis
-// concatenation reconstructs the full K, produces matmul(x_tile,
-// transpose(w_tile)). The proof is by induction on num_k_tiles,
-// invoking axiom_matmul_splits_over_k at each step.
+// §9 — Property K2: K-reduce correctness.
 // =====================================================================
 
-/// K2 (external): the K-reduce loop is equivalent to a single
-/// full-K matmul.
-///
-/// Proof structure (inductive on num_k_tiles):
-///   Base (num_k_tiles == 0): k_reduce returns initial_acc.
-///     Under initial_acc == zero_tensor, this equals matmul on the
-///     empty x/w slice, which is zero_tensor. QED.
-///   Step: k_reduce(x, w, 0, T, acc) =
-///         k_reduce(x, w, 1, T, tensor_add(acc, matmul(x[0], w[0]^T)))
-///         By IH, this equals
-///         tensor_add(acc, matmul(x[0], w[0]^T)) + matmul(concat(x[1..T]), concat(w[1..T])^T)
-///         By axiom_matmul_splits_over_k with the two K-halves
-///         concat(x[0]) and concat(x[1..T]), this equals
-///         matmul(concat(x[0..T]), concat(w[0..T])^T). QED.
-///
-/// Stubbed here because a rigorous induction on the recursive k_reduce
-/// requires unfolding both the recursion and axiom_matmul_splits_over_k
-/// simultaneously, which is proof-search-hard. The structure is
-/// standard; a determined auditor can walk through the induction on
-/// paper.
-#[verifier::external_body]
-pub proof fn k2_k_reduce_correctness(
-    x_full: Tensor, w_full: Tensor,
-    num_k_tiles: nat,
-    x_tile_at: spec_fn(nat) -> Tensor,
-    w_tile_at: spec_fn(nat) -> Tensor,
-    zero_acc: Tensor,
-)
-    ensures
-        k_reduce(x_tile_at, w_tile_at, 0nat, num_k_tiles, zero_acc)
-        == matmul(x_full, transpose(w_full)),
-{}
-
-// =====================================================================
-// §10 — Property K3: kernel correctness (composition of K1 + K2).
-//
-// At each output position, exactly one program instance writes to it
-// (K1), and the value written matches the semantic reference (K2).
-// Therefore the assembled output equals the semantic reference.
-//
-// K3 is the DERIVED form of what fused_moe.rs previously stated as an
-// external axiom (F4). Now F4 traces to K1 + K2 + axiom M2 —
-// mechanically verified except for K2's induction.
-// =====================================================================
-
-/// K3-tp2 concrete instance: kernel output at a specific tile position
-/// equals the semantic reference for that tile's rows and cols.
-///
-/// This is the tp_size=2 analog of ex01's C4-tp2 — proving the kernel
-/// correctness at a concrete instance of the launch grid.
-pub proof fn k3_kernel_correctness_tile(
-    x: Tensor, w_by_expert: spec_fn(ExpertId) -> Tensor,
-    dt: DispatchTable,
-    mid: nat, nid: nat,
-    block_n: nat, block_k: nat, num_k_tiles: nat,
-    initial_acc: Tensor,
-    expected_x_slice: Tensor,   // the sub-tile of x for this (mid) instance
-    expected_w_slice: Tensor,   // the sub-tile of w_by_expert[dt.tile_expert[mid]] for this (mid, nid)
+proof fn lemma_range_sum_split(
+    values: Seq<Element>, start: nat, mid: nat, end: nat,
 )
     requires
-        dt_well_formed(dt),
-        mid < dt.total_tiles,
+        start <= mid,
+        mid <= end,
+        end <= values.len(),
     ensures
-        kernel_tile_output(x, w_by_expert, dt, mid, nid,
-                           block_n, block_k, num_k_tiles, initial_acc)
-        == matmul(expected_x_slice, transpose(expected_w_slice)),
+        range_sum(values, start, end)
+            == range_sum(values, start, mid) + range_sum(values, mid, end),
+    decreases mid - start,
 {
-    // Invoke K2 with the pre-verified spec that the K-reduce collapses
-    // to a single matmul over the full-K x-tile and w-tile.
-    k2_k_reduce_correctness(
-        expected_x_slice, expected_w_slice,
-        num_k_tiles,
-        |j: nat| kernel_x_tile_at(x, dt, mid, j, block_k),
-        |j: nat| kernel_w_tile_at(w_by_expert, dt, mid, nid, j, block_n, block_k),
-        initial_acc,
+    if start < mid {
+        lemma_range_sum_split(values, (start + 1) as nat, mid, end);
+    }
+}
+
+proof fn lemma_k_boundaries_ordered(
+    tile: nat, block_k: nat, k_total: nat,
+)
+    requires block_k > 0,
+    ensures
+        k_boundary(tile, block_k, k_total)
+            <= k_boundary((tile + 1) as nat, block_k, k_total),
+        k_boundary((tile + 1) as nat, block_k, k_total) <= k_total,
+{
+    assert(tile * block_k <= (tile + 1) * block_k) by (nonlinear_arith);
+    if tile * block_k < k_total {
+        if (tile + 1) * block_k < k_total {
+            assert(k_boundary(tile, block_k, k_total) == tile * block_k);
+            assert(k_boundary((tile + 1) as nat, block_k, k_total)
+                == (tile + 1) * block_k);
+        } else {
+            assert(k_boundary(tile, block_k, k_total) == tile * block_k);
+            assert(k_boundary((tile + 1) as nat, block_k, k_total) == k_total);
+        }
+    } else {
+        assert(k_total <= tile * block_k);
+        assert(k_total <= (tile + 1) * block_k);
+        assert(k_boundary(tile, block_k, k_total) == k_total);
+        assert(k_boundary((tile + 1) as nat, block_k, k_total) == k_total);
+    }
+}
+
+proof fn lemma_k_reduce_entry_invariant(
+    terms: Seq<Element>,
+    j: nat,
+    num_k_tiles: nat,
+    block_k: nat,
+    k_total: nat,
+    acc: Element,
+)
+    requires
+        terms.len() == k_total,
+        block_k > 0,
+        j <= num_k_tiles,
+        k_total <= num_k_tiles * block_k,
+    ensures
+        k_reduce_entry(terms, j, num_k_tiles, block_k, k_total, acc)
+            == acc + range_sum(
+                terms, k_boundary(j, block_k, k_total), k_total,
+            ),
+    decreases num_k_tiles - j,
+{
+    if j < num_k_tiles {
+        let here = k_boundary(j, block_k, k_total);
+        let next = k_boundary((j + 1) as nat, block_k, k_total);
+        lemma_k_boundaries_ordered(j, block_k, k_total);
+        lemma_range_sum_split(terms, here, next, k_total);
+        lemma_k_reduce_entry_invariant(
+            terms,
+            (j + 1) as nat,
+            num_k_tiles,
+            block_k,
+            k_total,
+            acc + k_tile_sum(terms, j, block_k, k_total),
+        );
+    } else {
+        assert(j == num_k_tiles);
+        assert(k_boundary(j, block_k, k_total) == k_total) by {
+            assert(k_total <= j * block_k);
+        }
+    }
+}
+
+/// K2: the exact BLOCK_K accumulator equals the untiled dot product.
+/// No arithmetic or decomposition axiom is used; the proof partitions the
+/// concrete sequence of scalar products at successive clamped tile bounds.
+pub proof fn k2_k_reduce_correctness(
+    x_row: Row,
+    expert_weight_row: Row,
+    k_total: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+)
+    requires
+        k_total <= x_row.len(),
+        k_total <= expert_weight_row.len(),
+        block_k > 0,
+        k_total <= num_k_tiles * block_k,
+    ensures
+        grouped_matmul_dsl_entry(
+            x_row, expert_weight_row, k_total, block_k, num_k_tiles,
+        ) == grouped_matmul_reference_entry(
+            x_row, expert_weight_row, k_total,
+        ),
+{
+    let terms = dot_terms(x_row, expert_weight_row, k_total);
+    assert(terms.len() == k_total);
+    lemma_k_reduce_entry_invariant(
+        terms, 0, num_k_tiles, block_k, k_total, 0,
     );
 }
 
 // =====================================================================
-// §11 — Property K3-derived: F4 is no longer an axiom.
-//
-// The whole point of this file: F4 (fused kernel refines
-// moe_forward_spec) which was `external_body` in fused_moe.rs now
-// traces through K1 + K2 + M2. External stubs here compose them into a
-// derived F4.
+// §10 — Property K3: pointwise grouped-matmul correctness.
 // =====================================================================
 
-#[verifier::external_body]
-pub proof fn k3_derives_f4_full_kernel_correctness()
-    ensures true,
+/// Every element in a BLOCK_M x BLOCK_N program tile runs the K loop proved
+/// by K2.  Row/column tile coverage is handled independently by K1.
+pub proof fn k3_kernel_correctness_at_output_element(
+    x_row: Row,
+    expert_weight_row: Row,
+    k_total: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+)
+    requires
+        k_total <= x_row.len(),
+        k_total <= expert_weight_row.len(),
+        block_k > 0,
+        k_total <= num_k_tiles * block_k,
+    ensures
+        grouped_matmul_dsl_entry(
+            x_row, expert_weight_row, k_total, block_k, num_k_tiles,
+        ) == grouped_matmul_reference_entry(
+            x_row, expert_weight_row, k_total,
+        ),
 {
-    // External stub. The full derivation composes:
-    //   K1a (tile M-axis disjoint) + K1b (N-axis covers)
-    //     + K1c (nid disjoint) + K2 (K-reduce correctness)
-    //     + axiom_matmul_splits_over_k
-    //     → for every output position, exactly one program instance
-    //        writes the correct matmul-based value.
-    // This IS the derived F4 that fused_moe.rs previously stubbed.
+    k2_k_reduce_correctness(
+        x_row, expert_weight_row, k_total, block_k, num_k_tiles,
+    );
 }
+
+proof fn lemma_program_for_row_matches_owner(
+    dt: DispatchTable,
+    total_rows: nat,
+    owner: spec_fn(nat) -> ExpertId,
+    row: nat,
+)
+    requires
+        dispatch_matches_row_owner(dt, total_rows, owner),
+        row < total_rows,
+    ensures
+        program_covers_row(dt, program_for_row(dt, row), row),
+        dt.tile_expert[program_for_row(dt, row) as int] == owner(row),
+{
+    let witness = choose|mid: nat| program_covers_row(dt, mid, row)
+        && dt.tile_expert[mid as int] == owner(row);
+    assert(program_covers_row(dt, witness, row));
+    let selected = program_for_row(dt, row);
+    assert(program_covers_row(dt, selected, row));
+    assert(selected == witness);
+}
+
+/// K3: under the dispatch-table contract and launch-grid coverage, the whole
+/// grouped-GEMM tensor produced by the modeled Triton programs is exactly the
+/// Python/PyTorch grouped-matmul reference in integer arithmetic.
+pub proof fn k3_grouped_matmul_dsl_equals_reference(
+    x: Tensor,
+    weights: Seq<Tensor>,
+    dt: DispatchTable,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    output_cols: nat,
+    k_total: nat,
+    block_n: nat,
+    num_n_tiles: nat,
+    block_k: nat,
+    num_k_tiles: nat,
+)
+    requires
+        well_formed(x, total_rows, k_total),
+        grouped_weights_well_formed(
+            weights, dt.num_experts, output_cols, k_total,
+        ),
+        dispatch_matches_row_owner(dt, total_rows, owner),
+        block_n > 0,
+        output_cols <= num_n_tiles * block_n,
+        block_k > 0,
+        k_total <= num_k_tiles * block_k,
+    ensures
+        grouped_matmul_dsl(
+            x, weights, dt, total_rows, output_cols, k_total,
+            block_k, num_k_tiles,
+        ) == grouped_matmul_reference(
+            x, weights, owner, total_rows, output_cols, k_total,
+        ),
+{
+    let dsl = grouped_matmul_dsl(
+        x, weights, dt, total_rows, output_cols, k_total,
+        block_k, num_k_tiles,
+    );
+    let reference = grouped_matmul_reference(
+        x, weights, owner, total_rows, output_cols, k_total,
+    );
+    assert(dsl.len() == total_rows);
+    assert(reference.len() == total_rows);
+    assert forall|row: int| 0 <= row < total_rows implies
+        dsl[row] == reference[row] by {
+        lemma_program_for_row_matches_owner(
+            dt, total_rows, owner, row as nat,
+        );
+        let mid = program_for_row(dt, row as nat);
+        let expert = dt.tile_expert[mid as int];
+        assert(expert == owner(row as nat));
+        assert(dsl[row].len() == output_cols);
+        assert(reference[row].len() == output_cols);
+        assert forall|col: int| 0 <= col < output_cols implies
+            dsl[row][col] == reference[row][col] by {
+            k1b_n_axis_covers(
+                output_cols, block_n, num_n_tiles, col as nat,
+            );
+            assert(weights[expert as int][col].len() == k_total);
+            k3_kernel_correctness_at_output_element(
+                x[row], weights[expert as int][col],
+                k_total, block_k, num_k_tiles,
+            );
+        }
+        assert(dsl[row] =~= reference[row]);
+    }
+    assert(dsl =~= reference);
+}
+
+/// F4 at the DSL level: composing the three verified grouped matmuls with
+/// deterministic pointwise gating gives exactly the Python fused-expert
+/// reference. Gate/up share a launch shape; down has its own N/K tiling.
+pub proof fn f4_fused_moe_dsl_equals_python_reference(
+    x: Tensor,
+    gate_weights: Seq<Tensor>,
+    up_weights: Seq<Tensor>,
+    down_weights: Seq<Tensor>,
+    dt: DispatchTable,
+    owner: spec_fn(nat) -> ExpertId,
+    total_rows: nat,
+    hidden_cols: nat,
+    intermediate_cols: nat,
+    gate_block_n: nat,
+    gate_num_n_tiles: nat,
+    gate_block_k: nat,
+    gate_num_k_tiles: nat,
+    down_block_n: nat,
+    down_num_n_tiles: nat,
+    down_block_k: nat,
+    down_num_k_tiles: nat,
+)
+    requires
+        well_formed(x, total_rows, hidden_cols),
+        grouped_weights_well_formed(
+            gate_weights, dt.num_experts, intermediate_cols, hidden_cols,
+        ),
+        grouped_weights_well_formed(
+            up_weights, dt.num_experts, intermediate_cols, hidden_cols,
+        ),
+        grouped_weights_well_formed(
+            down_weights, dt.num_experts, hidden_cols, intermediate_cols,
+        ),
+        dispatch_matches_row_owner(dt, total_rows, owner),
+        gate_block_n > 0,
+        intermediate_cols <= gate_num_n_tiles * gate_block_n,
+        gate_block_k > 0,
+        hidden_cols <= gate_num_k_tiles * gate_block_k,
+        down_block_n > 0,
+        hidden_cols <= down_num_n_tiles * down_block_n,
+        down_block_k > 0,
+        intermediate_cols <= down_num_k_tiles * down_block_k,
+    ensures
+        fused_moe_dsl(
+            x, gate_weights, up_weights, down_weights, dt,
+            total_rows, hidden_cols, intermediate_cols,
+            gate_block_k, gate_num_k_tiles,
+            down_block_k, down_num_k_tiles,
+        ) == fused_moe_reference(
+            x, gate_weights, up_weights, down_weights, owner,
+            total_rows, hidden_cols, intermediate_cols,
+        ),
+{
+    assert forall|row: nat| #![trigger program_for_row(dt, row)]
+        row < total_rows implies
+            exists|mid: nat| program_covers_row(dt, mid, row) by {
+        lemma_program_for_row_matches_owner(dt, total_rows, owner, row);
+    }
+    let gate_dsl = grouped_matmul_dsl(
+        x, gate_weights, dt, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    let gate_reference = grouped_matmul_reference(
+        x, gate_weights, owner, total_rows, intermediate_cols, hidden_cols,
+    );
+    let up_dsl = grouped_matmul_dsl(
+        x, up_weights, dt, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    let up_reference = grouped_matmul_reference(
+        x, up_weights, owner, total_rows, intermediate_cols, hidden_cols,
+    );
+
+    k3_grouped_matmul_dsl_equals_reference(
+        x, gate_weights, dt, owner,
+        total_rows, intermediate_cols, hidden_cols,
+        gate_block_n, gate_num_n_tiles,
+        gate_block_k, gate_num_k_tiles,
+    );
+    k3_grouped_matmul_dsl_equals_reference(
+        x, up_weights, dt, owner,
+        total_rows, intermediate_cols, hidden_cols,
+        gate_block_n, gate_num_n_tiles,
+        gate_block_k, gate_num_k_tiles,
+    );
+    assert(gate_dsl == gate_reference);
+    assert(up_dsl == up_reference);
+
+    lemma_grouped_matmul_dsl_well_formed(
+        x, gate_weights, dt, owner, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    lemma_grouped_matmul_dsl_well_formed(
+        x, up_weights, dt, owner, total_rows, intermediate_cols, hidden_cols,
+        gate_block_k, gate_num_k_tiles,
+    );
+    let hidden_dsl = gated_activation(
+        gate_dsl, up_dsl, total_rows, intermediate_cols,
+    );
+    let hidden_reference = gated_activation(
+        gate_reference, up_reference, total_rows, intermediate_cols,
+    );
+    assert(hidden_dsl == hidden_reference);
+    lemma_gated_activation_well_formed(
+        gate_dsl, up_dsl, total_rows, intermediate_cols,
+    );
+
+    k3_grouped_matmul_dsl_equals_reference(
+        hidden_dsl, down_weights, dt, owner,
+        total_rows, hidden_cols, intermediate_cols,
+        down_block_n, down_num_n_tiles,
+        down_block_k, down_num_k_tiles,
+    );
+}
+
+// =====================================================================
+// §11 — End of the machine-checked DSL refinement.
+// =====================================================================
 
 } // verus!
 
