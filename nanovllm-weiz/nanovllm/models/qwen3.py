@@ -31,8 +31,11 @@ class Qwen3Attention(nn.Module):
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        # [C4] GQA + KV replication (bootcamp/ex04_gqa_tp): allow tp_size > num_kv_heads
+        # (Qwen3-30B-A3B has 4 KV heads, so tp=8 replicates each across 2 ranks).
+        # flash-attn handles the resulting GQA (num_heads > num_kv_heads) natively.
+        assert self.total_num_kv_heads % tp_size == 0 or tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim

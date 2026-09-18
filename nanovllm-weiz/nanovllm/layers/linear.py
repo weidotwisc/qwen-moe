@@ -106,9 +106,21 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-        output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
+        # [C4] GQA + KV-head replication (bootcamp/ex04_gqa_tp). Q shards normally;
+        # when tp_size > num_kv_heads there aren't enough KV heads for one per rank,
+        # so each KV head is REPLICATED across num_kv_replicas ranks (rank r holds
+        # KV head r // num_kv_replicas). Requires kv | tp OR tp | kv. Reduces to the
+        # stock behavior (num_kv_replicas == 1) whenever tp_size <= num_kv_heads.
+        assert total_num_heads % tp_size == 0
+        assert total_num_kv_heads % tp_size == 0 or tp_size % total_num_kv_heads == 0, (
+            f"num_kv_heads={total_num_kv_heads}, tp_size={tp_size} must divide one way")
+        self.num_heads = total_num_heads // tp_size
+        self.num_kv_heads = max(1, total_num_kv_heads // tp_size)
+        self.num_kv_replicas = max(1, tp_size // total_num_kv_heads)
+        # global out-dim: KV storage grows by num_kv_replicas (each replica a full
+        # copy). ColumnParallelLinear divides by tp_size -> per-rank slice
+        # (num_heads + 2*num_kv_heads)*head_size.
+        output_size = (total_num_heads + 2 * total_num_kv_heads * self.num_kv_replicas) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
@@ -124,7 +136,14 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        if loaded_shard_id == "q":
+            loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        else:
+            # [C4] KV replication-aware: chunk into (tp_size // num_kv_replicas) KV
+            # shards; ranks sharing a KV head take the same chunk. Reduces to
+            # chunk(tp_size)[tp_rank] when num_kv_replicas == 1 (tp <= num_kv_heads).
+            n_kv_shards = self.tp_size // self.num_kv_replicas
+            loaded_weight = loaded_weight.chunk(n_kv_shards, self.tp_dim)[self.tp_rank // self.num_kv_replicas]
         param_data.copy_(loaded_weight)
 
 

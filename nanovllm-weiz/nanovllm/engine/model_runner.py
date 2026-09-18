@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -24,7 +25,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # Rendezvous port is env-overridable so multiple single-GPU instances can
+        # run on one node (upstream hardcodes 2333; two instances collide -> EADDRINUSE).
+        # One LLM instance's TP workers inherit this env, so they share a port; distinct
+        # instances set distinct ports. Default 2333 keeps existing single-run behavior.
+        port = int(os.environ.get("NANOVLLM_DIST_PORT", "2333"))
+        dist.init_process_group("nccl", f"tcp://localhost:{port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -110,7 +116,9 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # [C4] KV replication: tp>num_kv_heads -> 1 (replicated) head per rank, so the
+        # cache is sized for the per-rank head count (matches Qwen3Attention.num_kv_heads).
+        num_kv_heads = max(1, hf_config.num_key_value_heads // self.world_size)
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes

@@ -1,0 +1,55 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# uv-managed virtualenv (uv.lock and .python-version stay tracked)
+.venv/
+.venv-vllm/           # the separate vLLM-oracle venv (scripts/vllm/) — ~8 GB, never commit
+scripts/vllm/results/ # lm-eval oracle outputs (regenerable; per-sample .jsonl can be large)
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode — track launch.json (debug configs are shared); ignore per-user state
+.vscode/*
+!.vscode/launch.json
+
+# Other editors / OS junk
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Model weights (live in ~/.cache/huggingface — don't accidentally commit)
+ckpts/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Scratch / logs
+*.log
+*.tmp
+nohup.out
+
+# Secrets / local shell env
+.env
+.envrc
