@@ -8,12 +8,12 @@ IMPORTANT: this script reproduces a LATENT int32 base-pointer overflow -- it fau
 M >~ 1.57M rows (`e_start * stride_xm` exceeds 2**31 with stride == H == 2048). That
 would be fixed by widening the base multiply to int64, but that fix is NOT applied
 (the kernel is kept verbatim to verified ex09 -- fix + re-verify in ex09, then re-sync).
-This is also NOT the same as the actual `TP=1` crash: at TP=1 a rank receives at most
-the total dispatched (~1.05M rows), which is BELOW this threshold, and the uniform
-M=1.05M case here does NOT crash. The real tp=1 fault is a different, lower-M,
-data-pattern-specific bug -- STILL OPEN. To chase it, dump the exact M / offsets /
-per-expert counts before the failing `fused_moe_forward` in the real run, reconstruct
-that here, and run compute-sanitizer.
+This is also NOT the actual `TP=1` crash that was hit in practice: that one was in
+`store_kvcache` (the attention KV-cache write), caused by per-rank `num_kvcache_blocks`
+never being reconciled across ranks (the rank-0 scheduler over-budgeted workers with
+smaller caches -> OOB). That is FIXED in `model_runner.allocate_kv_cache` via global-min
+reconciliation. This script remains a useful single-GPU probe for the *latent*
+MoE-kernel overflow (unreachable at TP=1's <=1.05M rows).
 
 Still useful: single-GPU, no mesh/distributed, fast, `compute-sanitizer`-able, and it
 checks fused == loop-reference (a silent OOB could corrupt results without crashing):

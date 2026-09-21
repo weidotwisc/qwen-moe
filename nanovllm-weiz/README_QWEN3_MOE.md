@@ -24,7 +24,7 @@ is reused from `models/qwen3.py`.
 | File | Change |
 |---|---|
 | `nanovllm/models/qwen3_moe.py` | **new** — `Qwen3MoeForCausalLM` + `Qwen3MoeSparseMoeBlock`: router + stacked experts, two swappable kernels (`MOE_KERNEL`), and two EP schedules (`MOE_EP_MODE`): **[C6]** filter-to-local + `all_reduce`, and **[C7/C8]** hybrid stripe → all-to-all dispatch → combine → all_gather (`_forward_hybrid`). |
-| `nanovllm/layers/fused_moe.py` | **new** — fused MoE Triton grouped-GEMM (vendored **verbatim** from `bootcamp/ex09_fused_moe`). Has an **OPEN `TP=1` crash** + a latent int32 overflow (>~1.05M rows) — see below; **not patched here** (fix + re-verify in ex09, then re-sync). |
+| `nanovllm/layers/fused_moe.py` | **new** — fused MoE Triton grouped-GEMM (vendored **verbatim** from `bootcamp/ex09_fused_moe`). NOT the cause of the tp=1 crash (that was KV-cache sizing — see below); it does have a *latent* int32 overflow at >~1.05M rows, documented, **not patched here** (fix + re-verify in ex09, re-sync). |
 | `nanovllm/utils/loader.py` | expert-weight routing: parses the global expert id and dispatches to the block's stacked param loader (the per-rank EP shard-map/skip lives in `qwen3_moe.py`). |
 | `nanovllm/layers/linear.py` | **[C4]** `QKVParallelLinear` — GQA + **KV-head replication** when `tp_size > num_kv_heads` (sizing + replication-aware weight loading). |
 | `nanovllm/models/qwen3.py` | **[C4]** `Qwen3Attention` allows `tp_size > num_kv_heads` (`num_kv_heads = max(1, …)`). |
@@ -32,9 +32,9 @@ is reused from `models/qwen3.py`.
 | `smoke_moe.py` | **new** — single-GPU coherence smoke test. |
 | `gsm8k_moe.py` | **new** — GSM8K accuracy harness (loop/fused × any `TP`/`DP`), the quantitative integration test. |
 | `nanovllm/utils/parallel.py` | **new [C7/C8 mesh]** — TP/EP device mesh + accessors (`get_tp_*`/`get_ep_*`); `world = TP × DP = #GPUs = ep_size`. |
-| `nanovllm/config.py`, `engine/llm_engine.py`, `engine/model_runner.py` | **[C7/C8 mesh]** `data_parallel_size` knob; spawn `world = TP×DP` ranks; build `tp_group`/`ep_group`; KV sized by `tp_size`. |
+| `nanovllm/config.py`, `engine/llm_engine.py`, `engine/model_runner.py` | **[C7/C8 mesh]** `data_parallel_size` knob; spawn `world = TP×DP` ranks; build `tp_group`/`ep_group`; KV sized by `tp_size`; **`num_kvcache_blocks` reconciled to the global `min` across ranks** (fixes a `tp=1` KV-cache OOB — see below). |
 | `nanovllm/layers/linear.py`, `layers/embed_head.py`, `models/qwen3.py` | **[C7/C8 mesh]** shard / all_reduce / LM-head gather over `tp_group` via the accessors (was the flat world). |
-| `repro_fused_moe_bug.py` | **new** — single-GPU reproducer + fused-vs-loop equivalence check for the [C9] int32 overflow. |
+| `repro_fused_moe_bug.py` | **new** — single-GPU probe + fused-vs-loop check for the *latent* [C9] int32 overflow (a separate issue from the fixed tp=1 KV-cache crash). |
 
 ## MoE block: two expert kernels on one representation
 
@@ -101,27 +101,36 @@ builds and validates the subgroup collectives but the replicas do redundant work
 until step 3 partitions the batch. `MOE_EP_MODE=allreduce` (C6) stays the default;
 `ep_size==1` is the single-GPU path.
 
-### [C9] fused-kernel crash under `TP=1` — OPEN
+### [C7/C8] `TP=1` KV-cache OOB — FIXED (and why it looked like a kernel bug)
 
-`MOE_EP_MODE=hybrid MOE_KERNEL=fused` at **`TP=1 DP=8`** full-scale GSM8K crashes with
-a **CUDA illegal memory access**; `MOE_KERNEL=loop` at the same config completes
-correctly (strict **0.8908**). So the fault is isolated to the C9 fused Triton kernel,
-and it is **data-dependent** (crashes in prefill or decode across runs, only at full
-scale — never at `LIMIT=128`). **Root cause not yet found; the crash is OPEN.**
+`MOE_EP_MODE=hybrid` at **`TP=1 DP=8`** full-scale GSM8K crashed with a **CUDA illegal
+memory access** — but *not* in the MoE. A synchronous (`CUDA_LAUNCH_BLOCKING=1`)
+traceback put it in **`store_kvcache`** (the attention KV-cache write), and the cause
+is **per-rank `num_kvcache_blocks` that was never reconciled**:
 
-What we ruled out: a real **int32 overflow** exists in `x_ptr + e_start * stride_xm`
-(with `e_start` int32, `stride_xm == H == 2048`) once `e_start` exceeds ~2³¹/2048 ≈
-**1.05M rows** — `repro_fused_moe_bug.py` reproduces it deterministically at M≈1.57M,
-and an **int64 base-pointer widening** removes it (verified in the repro). That fix is
-**not applied here** — the kernel stays **verbatim to verified ex09**, so the fix +
-re-verification belong in ex09, then re-sync. **And that latent overflow is NOT the
-tp=1 crash:** at `TP=1` a rank receives at most the total dispatched (~8·16384·8 ≈
-1.05M rows), where `e_start·2048` stays just *under* 2³¹ — and the uniform M=1.05M
-repro does **not** crash. The real tp=1 fault is a **different, lower-M,
-data-pattern-specific** bug still to be found (next: dump the exact `M`/offsets/
-per-expert counts before the failing `fused_moe_forward`, build a faithful repro, run
-`compute-sanitizer`). For a correctness-focused artifact this matters: an OOB that
-crashes at tp=1 could silently corrupt at another shape, so it needs a real fix.
+- Each rank sizes its KV cache from *its own* free memory after warmup
+  (`model_runner.allocate_kv_cache`) — no cross-rank agreement.
+- The **rank-0 scheduler** hands out block-ids from *its* count to **all** ranks. If a
+  worker sized a smaller cache, a scheduled slot (`slot = block_id*block_size + …`)
+  overflows that worker's cache → `store_kvcache_kernel` writes out of bounds → fault.
+- At `TP=1` the warmup MoE-dispatch is lopsided (uniform warmup input → a few hot
+  experts), so hot-expert ranks hit higher peak memory → fewer blocks. Observed: ranks
+  6,7 = **1902** blocks, rank 0 = **2121** → rank 0 over-budgets ranks 6,7 → OOB on
+  exactly ranks 6,7 (the crash ranks). Invisible under sharded TP (identical footprints).
+
+**Fix:** `all_reduce` **MIN** of `num_kvcache_blocks` across ranks in `allocate_kv_cache`
+(what vLLM does) → every rank's cache holds any block the scheduler assigns. After it,
+`TP=1 DP=8` fused completes: **strict 0.9014** (in-band).
+
+**Why `loop` looked fine (a red herring):** the KV budget derives from *free memory
+after warmup*, and loop vs fused have different warmup peaks → different block counts →
+loop's spread happened not to put rank 0 over a worker. "loop works" wrongly implicated
+the fused kernel; it was never a kernel bug. The `store_kvcache` traceback (captured
+under blocking) was the real evidence — not the loop/fused split.
+
+*(Separately, `fused_moe.py` has a **latent** int32 base-pointer overflow at >~1.05M
+rows — `repro_fused_moe_bug.py` reproduces it; unreachable at `TP=1`'s ≤1.05M rows,
+kept verbatim to ex09, fix + re-verify there then re-sync.)*
 
 ## Run
 
@@ -157,7 +166,7 @@ Greppable tags map each part back to the verified bootcamp components (the
 - `[C5-b]` → `bootcamp/ex05_moe_baseline/reference_b.py` — sorted-offset routing + loop expert path.
 - `[C6]`   → `bootcamp/ex06_ep/solution_lean.py` — lean expert parallelism (DP=1): filter-to-local + one `all_reduce`.
 - `[C7/C8]` → `bootcamp/ex07_tp_ep_hybrid/solution.py` — hybrid stripe/gather (tp) + all-to-all dispatch/combine (ep); `_forward_hybrid`, step 1 at `tp==ep==world` (DP=1).
-- `[C9]`   → `bootcamp/ex09_fused_moe/solution.py` — fused grouped-GEMM kernel (vendored verbatim). **NOTE: a latent int32 base-pointer overflow (>~1.05M rows) — NOT patched here; fix (int64) + re-verify in ex09, then re-sync. The separate `TP=1` fused crash (at realistic M ≤ 1.05M) is still OPEN — see the MoE section.**
+- `[C9]`   → `bootcamp/ex09_fused_moe/solution.py` — fused grouped-GEMM kernel (vendored verbatim). **NOTE: a *latent* int32 base-pointer overflow (>~1.05M rows) — NOT patched here; fix (int64) + re-verify in ex09, then re-sync. (The `TP=1` crash was NOT this kernel — it was a KV-cache sizing bug, now FIXED; see the MoE section.)**
 - `[contract RT1/RT2/RT5]` → ex05 routing-partition contracts on `offsets` (now over the **local** partition under EP).
 
 ```sh
@@ -176,10 +185,10 @@ grep -rn "\[C4\]\|\[C5-b\]\|\[C6\]\|\[C7/C8\]\|\[C9\]\|\[contract" nanovllm/
   **0.8923**): C6 lands **0.8886–0.8969 across ep=1–8** (loop and fused, within the
   oracle's ±0.85%). The **mesh + hybrid** reproduce it across shapes: DP=1 hybrid
   **0.8939** (tp=8 fused) / allreduce **0.8954**; **C8** `TP=4 DP=2` hybrid **0.8923**
-  (fused); **C7** `TP=1 DP=8` hybrid **0.8908** (loop) — so the device mesh and
-  dispatch/combine are correct at every tp. **Caveat:** `TP=1` with `MOE_KERNEL=fused`
-  crashes (CUDA illegal memory access) — an **OPEN** C9 kernel bug (see above); `loop`
-  is the workaround and gives the correct 0.8908.
+  (fused); **C7** `TP=1 DP=8` hybrid **0.8908** (loop) / **0.9014** (fused) — so the
+  device mesh and dispatch/combine are correct at every tp. A `TP=1` KV-cache OOB
+  (per-rank `num_kvcache_blocks` never reconciled) once crashed the fused path;
+  **fixed** by global-`min` reconciliation (see above) — fused now completes at 0.9014.
 - **Speed:** fused ≫ loop; EP throughput peaks around **ep=4** for this
   model+batch (ep=8 is past the knee — the `all_reduce` + expert-load-imbalance
   straggler grow faster than per-rank compute shrinks). vLLM stays ~2–3× faster on

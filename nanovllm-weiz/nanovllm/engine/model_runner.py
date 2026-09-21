@@ -140,8 +140,22 @@ class ModelRunner:
         num_kv_heads = max(1, hf_config.num_key_value_heads // self.tp_size)
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        local_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        assert local_blocks > 0, f"rank {self.rank}: no room for KV cache"
+        # [C7/C8 mesh fix] num_kvcache_blocks is computed per-rank from LOCAL free memory,
+        # but the rank-0 scheduler hands out block-ids from ITS count to ALL ranks. If any
+        # rank sized a smaller cache, a scheduled slot overflows it -> store_kvcache writes
+        # out of bounds -> CUDA illegal memory access on that rank. Reconcile to the GLOBAL
+        # MIN so every rank's cache holds any block the scheduler can assign. (Invisible
+        # under sharded TP where all ranks match; exposed at tp=1, where warmup MoE-dispatch
+        # imbalance diverges peak memory -> divergent block counts across ranks.)
+        if self.world_size > 1:
+            t = torch.tensor([local_blocks], dtype=torch.int64, device="cuda")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = int(t.item())
+        else:
+            config.num_kvcache_blocks = local_blocks
+        print(f"[kvblocks rank={self.rank}] local={local_blocks} reconciled(min)={config.num_kvcache_blocks}", flush=True)
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
