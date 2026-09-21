@@ -12,6 +12,7 @@ from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.parallel import init_parallel, get_tp_rank, get_tp_world_size, get_ep_world_size
 
 
 class ModelRunner:
@@ -21,7 +22,9 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        # world = TP * DP == #GPUs == ep_size; tp_size = the TP subgroup degree.
+        self.world_size = config.tensor_parallel_size * config.data_parallel_size
+        self.tp_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
@@ -32,6 +35,21 @@ class ModelRunner:
         port = int(os.environ.get("NANOVLLM_DIST_PORT", "2333"))
         dist.init_process_group("nccl", f"tcp://localhost:{port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        # [C7/C8 step 2] Build the TP/EP mesh BEFORE constructing the model (layers read
+        # the parallel-state accessors at __init__). ep_group = the whole world (default,
+        # None); tp_group = this rank's block of tp_size contiguous ranks. DP==1 keeps
+        # tp_group=None (the world) -> byte-identical to the old flat path.
+        if config.data_parallel_size == 1:
+            my_ranks, my_tp_group = list(range(self.world_size)), None
+        else:
+            tp_groups = []
+            for j in range(config.data_parallel_size):
+                rs = list(range(j * self.tp_size, (j + 1) * self.tp_size))
+                tp_groups.append((rs, dist.new_group(rs)))   # ALL ranks call new_group for EVERY group, same order
+            my_ranks, my_tp_group = tp_groups[rank // self.tp_size]
+        init_parallel(tp_group=my_tp_group, ep_group=None, tp_ranks=my_ranks)
+        print(f"[mesh] rank={rank} world={self.world_size} tp_group={my_ranks} "
+              f"tp_rank={get_tp_rank()} tp_size={get_tp_world_size()} ep_size={get_ep_world_size()}", flush=True)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -118,7 +136,8 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # [C4] KV replication: tp>num_kv_heads -> 1 (replicated) head per rank, so the
         # cache is sized for the per-rank head count (matches Qwen3Attention.num_kv_heads).
-        num_kv_heads = max(1, hf_config.num_key_value_heads // self.world_size)
+        # [C7/C8 step 2] KV heads shard within the TP group, not the whole world.
+        num_kv_heads = max(1, hf_config.num_key_value_heads // self.tp_size)
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes

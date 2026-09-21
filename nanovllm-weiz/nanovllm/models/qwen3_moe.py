@@ -15,10 +15,13 @@ across ranks -- the "DP=1" precondition the all_reduce schedule needs. ep_size==
 is the original single-GPU path, byte-identical.
 
 Scope also includes [C7/C8] via MOE_EP_MODE=hybrid: the general HybridMoE (stripe ->
-all-to-all dispatch -> local experts -> combine -> all_gather). Step 1 runs it at
-tp_group == ep_group == world (DP=1, no engine change), which validates the dispatch/
-stripe/gather collectives; tp_size < world (true C7/C8) awaits the device mesh + engine
-DP. See Qwen3MoeSparseMoeBlock._forward_hybrid.
+all-to-all dispatch -> local experts -> combine -> all_gather). Groups come from the
+TP/EP device mesh (nanovllm/utils/parallel.py): tp_group scopes the stripe/gather,
+ep_group (= world) the dispatch/combine, with world = tensor_parallel_size(TP) *
+data_parallel_size(DP). tp_size < world (C7=tp1, C8=tp4) is now expressible and correct,
+but the batch stays REPLICATED across DP replicas (redundant) until engine-level DP
+(step 3) partitions it. DP=1 is byte-identical to the flat path. See
+Qwen3MoeSparseMoeBlock._forward_hybrid.
 
 Traceability (for the paper's "generated code -> contracts" thread). Greppable
 tags map integration lines back to the verified bootcamp components:
@@ -52,6 +55,10 @@ from nanovllm.models.qwen3 import Qwen3Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.parallel import (
+    get_tp_group, get_tp_world_size, get_tp_rank,
+    get_ep_group, get_ep_world_size, get_ep_rank,
+)
 # [C9] fused_moe_forward is imported lazily inside the fused branch below, so the
 # default loop path carries no Triton dependency.
 
@@ -95,10 +102,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # experts. ep_size==1 -> experts_per_rank==num_experts, expert_start==0:
         # the original single-GPU path. (Guarded so the block is constructible even
         # without an initialized process group, e.g. in a standalone test.)
-        if dist.is_initialized():
-            self.ep_size, self.ep_rank = dist.get_world_size(), dist.get_rank()
-        else:
-            self.ep_size, self.ep_rank = 1, 0
+        # [C7/C8 step 2] ep_group = the whole world (experts shard across ALL ranks);
+        # the accessors return world when dist is up, (1,0) when it isn't (standalone).
+        self.ep_size, self.ep_rank = get_ep_world_size(), get_ep_rank()
         assert config.num_experts % self.ep_size == 0, (
             f"num_experts={config.num_experts} not divisible by ep_size={self.ep_size}")
         self.experts_per_rank = config.num_experts // self.ep_size
@@ -222,7 +228,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # default (flat tp==ep) group; each (token,expert) is computed on exactly one
         # rank, so the SUM reconstructs the full output with no double-counting.
         if self.ep_size > 1:
-            dist.all_reduce(output, op=dist.ReduceOp.SUM)
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=get_ep_group())
         return output
 
     @staticmethod
@@ -262,10 +268,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         Block invariant: {input replicated within tp_group} -> {output replicated within tp_group}.
         """
-        # [step 1] tp_group == ep_group == the flat world; DP = world/tp_size == 1.
-        # Step 2 (device mesh) replaces these three lines with real subgroups.
-        tp_size, tp_rank, tp_group = self.ep_size, self.ep_rank, None
-        ep_size, ep_group = self.ep_size, None
+        # [C7/C8 step 2] Groups come from the device mesh (nanovllm/utils/parallel.py):
+        # tp_group scopes the stripe + all_gather, ep_group (= world) the dispatch +
+        # combine. At DP=1, tp_group == ep_group == world and this reduces to step 1.
+        tp_size, tp_rank, tp_group = get_tp_world_size(), get_tp_rank(), get_tp_group()
+        ep_size, ep_group = get_ep_world_size(), get_ep_group()
 
         N, H = hidden_states.size(0), hidden_states.size(1)
         dev = hidden_states.device
@@ -339,6 +346,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         local_y.index_add_(0, sorted_token_ids, combined)
 
         # ---- Phase 11: all_gather within tp_group -> replicated [N_pad, H]; drop padding ----
+        # tp_size==1: the stripe was a no-op, so local_y is already the full output --
+        # skip the (single-rank, no-op) collective entirely.
+        if tp_size == 1:
+            return local_y[:N]
         y_flat = local_y.new_empty((N_pad, H))
         dist.all_gather_into_tensor(y_flat, local_y, group=tp_group)
         return y_flat[:N]

@@ -65,7 +65,8 @@ def main():
     n_shot = int(os.environ.get("N_SHOT", 5))
     max_tokens = int(os.environ.get("MAX_TOKENS", 256))
     limit = os.environ.get("LIMIT", "")
-    tp = int(os.environ.get("TP", 1))   # tensor_parallel_size; == ep_size for C6 (DP=1)
+    tp = int(os.environ.get("TP", 1))   # tensor_parallel_size = TP-group size
+    dp = int(os.environ.get("DP", 1))   # data_parallel_size = # tp_groups; world = TP*DP = ep_size
 
     ds = load_dataset("openai/gsm8k", "main")
     tr = ds["train"]                                   # column access -> list[str]
@@ -79,8 +80,10 @@ def main():
     prompts = [shots + f"Question: {q}\nAnswer:" for q in te["question"]]
     golds = [gold(a) for a in te["answer"]]
 
-    print(f"[gsm8k] MOE_KERNEL={kernel}  TP(=ep)={tp}  n={len(prompts)}  n_shot={n_shot}  max_tokens={max_tokens}", flush=True)
-    llm = LLM(resolve_model(), enforce_eager=True, tensor_parallel_size=tp, max_model_len=4096)
+    print(f"[gsm8k] MOE_KERNEL={kernel}  TP={tp} DP={dp} (world={tp*dp}=ep)  "
+          f"MOE_EP_MODE={os.environ.get('MOE_EP_MODE', 'allreduce')}  "
+          f"n={len(prompts)}  n_shot={n_shot}  max_tokens={max_tokens}", flush=True)
+    llm = LLM(resolve_model(), enforce_eager=True, tensor_parallel_size=tp, data_parallel_size=dp, max_model_len=4096)
     sp = SamplingParams(temperature=0.1, max_tokens=max_tokens)   # near-greedy (nano-vLLM forbids temp=0)
     outs = llm.generate(prompts, sp)   # progress bar over len(prompts)
 

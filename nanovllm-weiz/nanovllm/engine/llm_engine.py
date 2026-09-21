@@ -22,7 +22,9 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        # world = TP * DP ranks (== #GPUs); DP==1 -> tensor_parallel_size, unchanged.
+        world_size = config.tensor_parallel_size * config.data_parallel_size
+        for i in range(1, world_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
