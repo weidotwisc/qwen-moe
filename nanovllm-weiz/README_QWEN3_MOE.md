@@ -205,4 +205,17 @@ grep -rn "\[C4\]\|\[C5-b\]\|\[C6\]\|\[C7/C8\]\|\[C9\]\|\[contract" nanovllm/
   straggler grow faster than per-rank compute shrinks). vLLM stays ~2–3× faster on
   generation (mature engine, tuned/graph-able MoE kernel); closing that is future
   work, and the kernel is a swappable verified component.
-```
+
+## Changelog (development journal)
+
+Chronological (newest last); each is a commit on `main` — `git show <hash>` for detail.
+
+- **`aba5ea76`** — vendor pristine upstream nano-vLLM base (dense Qwen3 only).
+- **`3ee1cdf`** — **[C5]** MoE baseline (loop) + **[C9]** fused Triton grouped-GEMM; stacked experts, `MOE_KERNEL=loop|fused`.
+- **`fea0d6d`** — **[C6]** expert parallelism (DP=1 / one `all_reduce`) + **[C4]** GQA KV-head replication for `tp > num_kv_heads`.
+- **`8307f23`** — **[C7/C8] hybrid MoE block** (`MOE_EP_MODE=hybrid`: stripe → all-to-all dispatch → combine → all_gather), run at `tp = ep = world` (DP=1) as a correctness gate.
+- **`d4198ce`** — **[C7/C8 step 2] TP/EP device mesh** (`world = TP × DP`): `tp_group`/`ep_group` + accessors, so `tp < world` (C7/C8 shapes) becomes expressible. *(This commit's message wrongly blamed the `TP=1` fused crash on the C9 kernel — corrected in the next commit.)*
+- **`9dbe261`** — **KV-cache OOB fix.** The `TP=1` crash was `store_kvcache` writing out of bounds: `num_kvcache_blocks` was computed per-rank from local free memory and **never reconciled**, so the rank-0 scheduler over-budgeted workers that had sized smaller caches. Fixed by `all_reduce` **MIN** across ranks (what vLLM does). It was **not** the fused kernel — that inference from "loop works" was a red herring; a *latent* int32 base-pointer overflow in the kernel (>~1.05M rows) is real but unreachable at `TP=1`, documented, left verbatim to `ex09`. Full analysis in the KV-cache section above.
+- **`8734e92`** — **[DP step 3] real data-parallel engine.** Per-replica `Scheduler`s + `run_dp` synchronized global step + `run_dummy` lockstep filler for idle replicas + dp-leader `gather_object` token return; `Sequence` pickles `temperature`. `DP > 1` now runs a **distinct** batch shard per replica → **throughput win**: full 1319 GSM8K, 8×A100, fused hybrid — DP=1 (TP=8) 0.9030/309s → C8 (TP=4 DP=2) 0.8992/234s (1.3×) → C7 (TP=1 DP=8) 0.8939/153s (2.0×), in-band accuracy. `DP > 1` requires `MOE_EP_MODE=hybrid`. `DP=1` byte-identical.
+
+**Known / deferred:** the latent [C9] int32 overflow (fix in `bootcamp/ex09` + re-sync); least-loaded DP admission (vs round-robin); CUDA-graph under DP; a Verus-verified KV-cache/scheduler control plane (this KV bug motivates it).
