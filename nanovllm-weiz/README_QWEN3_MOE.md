@@ -163,6 +163,51 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TP=1 DP=8  MOE_KERNEL=fused MOE_EP_MODE=hyb
 data-dependent block shapes CUDA-graph capture can't handle); the scripts set it.
 Run several instances on one node with distinct `NANOVLLM_DIST_PORT`.
 
+## Comparison to production vLLM (native DP+EP, C7)
+
+To calibrate the **C7** (`TP=1 DP=8 EP=8`) schedule against the reference implementation of
+the *same* parallelization, we ran production **vLLM** in native DP+EP on the identical
+1319-question GSM8K workload (5-shot, temp 0.1, `max_tokens=256`). Harness:
+`scripts/vllm/gsm8k_serve_dp.py`.
+
+**Getting native DP+EP out of vLLM.** Offline `LLM(data_parallel_size>1)` is hard-blocked
+single-process in this build, so the only path is the **online server**
+(`vllm serve … -tp 1 -dp 8 --enable-expert-parallel` — one engine per DP rank behind a
+coordinator) driven by an HTTP client. `ep_size` is *derived* = `DP × TP`; `--enable-expert-parallel`
+is a boolean, not a number. Two operational gotchas: (1) startup trips
+`OpenBLAS … pthread_create: Resource temporarily unavailable` (≈17 processes each spawning
+80 BLAS threads) unless `OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS` are capped — free, since
+vLLM's compute is on-GPU; (2) the client must be **async** (aiohttp) *and* its concurrency
+must match the server's batch capacity, or the **client** becomes the bottleneck (below).
+
+**Load vs generation are separate.** The client's timer starts only after `/health` is 200
+— i.e. after weight load (~14 s) + KV profiling + warmup (~130 s cold-start total, all
+excluded). Scraping vLLM's `/metrics` confirms HTTP overhead is negligible (each connection
+resident ~33 s) and `queue = 0`, so the timed window is a faithful **generation** wall-clock.
+
+**Concurrency must be matched or the comparison is meaningless.** At client concurrency 256
+(≈32 seqs/engine, far below the KV-bound ~165/engine) vLLM managed only **1713 tok/s / 197 s**
+— *slower* than nano, but purely a client-side artifact. Firing all 1319 at once (they all
+fit in KV: ~1.3 M tokens used vs 5.3 M capacity → queue stays 0) fills the batches and vLLM
+reaches its true peak. nano's `generate()` already submits every prompt up front and batches
+greedily, so "all-at-once" is the matched regime for both.
+
+**Result** (8×A100, fused hybrid, `enforce_eager`, **identical 337,664 generated tokens** —
+neither engine stops early: 5-shot completion never emits EOS, the answer is trimmed at
+extraction):
+
+| engine | strict | gen tokens | gen time | throughput |
+|---|---|---|---|---|
+| **vLLM** (native DP+EP, conc=1319) | 0.8976 | 337,664 | **36.3 s** | **9,307 tok/s** |
+| **nano-vLLM** C7 (`TP=1 DP=8`)      | 0.8984 | 337,664 | 90.4 s | 3,737 tok/s |
+
+- **Accuracy identical** (0.898) — nano's pure-EP C7 reproduces production's correctness to
+  within the temp-0.1 band.
+- **vLLM is 2.49× faster** on identical work (same token count, same eager mode, same
+  hardware): production's fused-MoE/attention kernels + scheduler vs a minimal hand-built
+  engine. A rigorous, token-for-token measurement — and 2.5× off production is a respectable
+  place for a from-scratch MoE-EP engine to land.
+
 ## Traceability
 
 Greppable tags map each part back to the verified bootcamp components (the
@@ -200,11 +245,13 @@ grep -rn "\[C4\]\|\[C5-b\]\|\[C6\]\|\[C7/C8\]\|\[C9\]\|\[contract" nanovllm/
   device mesh and dispatch/combine are correct at every tp. A `TP=1` KV-cache OOB
   (per-rank `num_kvcache_blocks` never reconciled) once crashed the fused path;
   **fixed** by global-`min` reconciliation (see above) — fused now completes at 0.9014.
-- **Speed:** fused ≫ loop; EP throughput peaks around **ep=4** for this
-  model+batch (ep=8 is past the knee — the `all_reduce` + expert-load-imbalance
-  straggler grow faster than per-rank compute shrinks). vLLM stays ~2–3× faster on
-  generation (mature engine, tuned/graph-able MoE kernel); closing that is future
-  work, and the kernel is a swappable verified component.
+- **Speed:** fused ≫ loop; in the DP=1 replicated-batch (C6) regime EP throughput peaks
+  around **ep=4** (ep=8 is past the knee — `all_reduce` + expert-load-imbalance straggler
+  grow faster than per-rank compute shrinks). Against production vLLM at **matched
+  full-batch concurrency**, nano C7 is **2.49× slower** (36.3 s vs 90.4 s; 9,307 vs 3,737
+  tok/s on the identical 337,664-token GSM8K run, 8×A100 eager) at **identical accuracy**
+  — see *Comparison to production vLLM* above. The gap is mature fused kernels + scheduler;
+  closing it is future work, and the kernel is a swappable verified component.
 
 ## Changelog (development journal)
 
@@ -217,5 +264,6 @@ Chronological (newest last); each is a commit on `main` — `git show <hash>` fo
 - **`d4198ce`** — **[C7/C8 step 2] TP/EP device mesh** (`world = TP × DP`): `tp_group`/`ep_group` + accessors, so `tp < world` (C7/C8 shapes) becomes expressible. *(This commit's message wrongly blamed the `TP=1` fused crash on the C9 kernel — corrected in the next commit.)*
 - **`9dbe261`** — **KV-cache OOB fix.** The `TP=1` crash was `store_kvcache` writing out of bounds: `num_kvcache_blocks` was computed per-rank from local free memory and **never reconciled**, so the rank-0 scheduler over-budgeted workers that had sized smaller caches. Fixed by `all_reduce` **MIN** across ranks (what vLLM does). It was **not** the fused kernel — that inference from "loop works" was a red herring; a *latent* int32 base-pointer overflow in the kernel (>~1.05M rows) is real but unreachable at `TP=1`, documented, left verbatim to `ex09`. Full analysis in the KV-cache section above.
 - **`8734e92`** — **[DP step 3] real data-parallel engine.** Per-replica `Scheduler`s + `run_dp` synchronized global step + `run_dummy` lockstep filler for idle replicas + dp-leader `gather_object` token return; `Sequence` pickles `temperature`. `DP > 1` now runs a **distinct** batch shard per replica → **throughput win**: full 1319 GSM8K, 8×A100, fused hybrid — DP=1 (TP=8) 0.9030/309s → C8 (TP=4 DP=2) 0.8992/234s (1.3×) → C7 (TP=1 DP=8) 0.8939/153s (2.0×), in-band accuracy. `DP > 1` requires `MOE_EP_MODE=hybrid`. `DP=1` byte-identical.
+- **`1d2ab6e`** (2026-09-22) — **nano vs production-vLLM C7 throughput benchmark.** Ran vLLM native DP+EP (`vllm serve -tp 1 -dp 8 --enable-expert-parallel`) on the identical GSM8K workload via `scripts/vllm/gsm8k_serve_dp.py` (async aiohttp client + `/metrics` latency scrape); `gsm8k_moe.py` now reports `gen_time`/`gen_tokens`/`throughput`. At matched full-batch concurrency, **identical accuracy (0.898)** and **vLLM 2.49× faster** (36.3 s / 9,307 tok/s vs nano 90.4 s / 3,737 tok/s, same 337,664 generated tokens, eager). See *Comparison to production vLLM*. *(Measurement + harness only; no core-engine change.)*
 
 **Known / deferred:** the latent [C9] int32 overflow (fix in `bootcamp/ex09` + re-sync); least-loaded DP admission (vs round-robin); CUDA-graph under DP; a Verus-verified KV-cache/scheduler control plane (this KV bug motivates it).
