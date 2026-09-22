@@ -19,6 +19,7 @@ both in the ~0.89 ballpark.
 import os
 import re
 from glob import glob
+from time import perf_counter
 
 from datasets import load_dataset
 from nanovllm import LLM, SamplingParams
@@ -85,7 +86,9 @@ def main():
           f"n={len(prompts)}  n_shot={n_shot}  max_tokens={max_tokens}", flush=True)
     llm = LLM(resolve_model(), enforce_eager=True, tensor_parallel_size=tp, data_parallel_size=dp, max_model_len=4096)
     sp = SamplingParams(temperature=0.1, max_tokens=max_tokens)   # near-greedy (nano-vLLM forbids temp=0)
-    outs = llm.generate(prompts, sp)   # progress bar over len(prompts)
+    t0 = perf_counter()
+    outs = llm.generate(prompts, sp)   # all prompts submitted up front -> scheduler batches greedily
+    gen_s = perf_counter() - t0        # generation wall-clock (model already loaded), no HTTP
 
     strict_hit = flex_hit = 0
     for o, g in zip(outs, golds):
@@ -93,8 +96,11 @@ def main():
         strict_hit += (s == g)
         flex_hit += (fx == g)
     n = len(prompts)
-    print(f"\n[gsm8k] kernel={kernel}  n={n}  "
+    gen_tokens = sum(len(o["token_ids"]) for o in outs)   # completion tokens only
+    print(f"\n[gsm8k] kernel={kernel}  TP={tp} DP={dp}  n={n}  "
           f"strict={strict_hit / n:.4f}  flexible={flex_hit / n:.4f}", flush=True)
+    print(f"[gsm8k] gen_time={gen_s:.1f}s  gen_tokens={gen_tokens}  "
+          f"throughput={gen_tokens / gen_s:.0f} tok/s  ({gen_tokens / n:.1f} tok/req)", flush=True)
 
 
 if __name__ == "__main__":
