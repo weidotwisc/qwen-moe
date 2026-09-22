@@ -12,7 +12,10 @@ from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.parallel import init_parallel, get_tp_rank, get_tp_world_size, get_ep_world_size
+from nanovllm.utils.parallel import (
+    init_parallel, get_tp_rank, get_tp_world_size, get_ep_world_size,
+    get_replica_index, get_dp_leader_group, is_tp_leader,
+)
 
 
 class ModelRunner:
@@ -27,6 +30,14 @@ class ModelRunner:
         self.tp_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        # [DP step 3] DP>1 requires the hybrid MoE schedule: the allreduce mode all-reduces
+        # a [T,H] tensor over the world, and distinct per-replica batch sizes T -> NCCL shape
+        # mismatch. Hybrid's ep collectives are count-negotiated all_to_alls, so replicas may
+        # differ in phase/size. (gsm8k_moe already sets MOE_EP_MODE=hybrid for DP runs.)
+        if config.data_parallel_size > 1:
+            assert os.environ.get("MOE_EP_MODE") == "hybrid", (
+                "DP>1 requires MOE_EP_MODE=hybrid (allreduce mode all-reduces [T,H] over the "
+                "world -> shape mismatch across replicas with distinct batch sizes)")
 
         # Rendezvous port is env-overridable so multiple single-GPU instances can
         # run on one node (upstream hardcodes 2333; two instances collide -> EADDRINUSE).
@@ -41,13 +52,20 @@ class ModelRunner:
         # tp_group=None (the world) -> byte-identical to the old flat path.
         if config.data_parallel_size == 1:
             my_ranks, my_tp_group = list(range(self.world_size)), None
+            dp_leader_group, replica_index = None, 0
         else:
             tp_groups = []
             for j in range(config.data_parallel_size):
                 rs = list(range(j * self.tp_size, (j + 1) * self.tp_size))
                 tp_groups.append((rs, dist.new_group(rs)))   # ALL ranks call new_group for EVERY group, same order
             my_ranks, my_tp_group = tp_groups[rank // self.tp_size]
-        init_parallel(tp_group=my_tp_group, ep_group=None, tp_ranks=my_ranks)
+            # [DP step 3] DP-leader group = tp_rank-0 of every replica; used to gather each
+            # replica's sampled tokens back to rank 0. All ranks call new_group, AFTER the
+            # tp_groups loop, so the collective ordering matches on every rank.
+            dp_leader_group = dist.new_group(list(range(0, self.world_size, self.tp_size)))
+            replica_index = rank // self.tp_size
+        init_parallel(tp_group=my_tp_group, ep_group=None, tp_ranks=my_ranks,
+                      dp_leader_group=dp_leader_group, replica_index=replica_index)
         print(f"[mesh] rank={rank} world={self.world_size} tp_group={my_ranks} "
               f"tp_rank={get_tp_rank()} tp_size={get_tp_world_size()} ep_size={get_ep_world_size()}", flush=True)
         default_dtype = torch.get_default_dtype()
@@ -67,7 +85,8 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                # [DP step 3] the run_dp payload carries DP sub-batches, so scale the buffer.
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20 * max(1, config.data_parallel_size))
                 dist.barrier()
             else:
                 dist.barrier()
@@ -104,6 +123,7 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        assert n + 4 <= len(self.shm.buf), f"shm payload {n+4}B exceeds buffer {len(self.shm.buf)}B ({method_name})"
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -257,11 +277,51 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        # [DP step 3] each replica's LEADER samples its own sub-batch (was rank-0-only). At
+        # DP=1 tp_group spans the world so is_tp_leader() == (global rank 0) -> unchanged.
+        leader = is_tp_leader()
+        temperatures = self.prepare_sample(seqs) if leader else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if leader else None
         reset_context()
         return token_ids
+
+    @torch.inference_mode()
+    def run_dummy(self):
+        # [DP step 3] Lockstep filler for a drained/idle replica: run a full model forward on
+        # one synthetic token so this replica's ranks still post every ep_group MoE collective
+        # (48 layers) in step with the working replicas. Touches no KV (slot=-1 -> store_kvcache
+        # no-ops) and does no sampling. tp_group collectives (embed/o_proj/all_gather) are
+        # per-replica, so skipping the lm_head gather here is fine (it's not run).
+        input_ids = torch.tensor([0], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor([0], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu = torch.tensor([0, 1], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor([-1], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu, cu, 1, 1, slot_mapping, None, None)
+        self.model(input_ids, positions)   # embed + all MoE layers -> every ep/tp collective
+        reset_context()
+
+    def run_dp(self, payload: list):
+        # [DP step 3] One synchronized global step across DP replicas. `payload[j]` is this
+        # step's (sub_seqs, is_prefill) for replica j; an empty sub_seqs means replica j is
+        # drained -> it runs a dummy forward to stay in ep-collective lockstep. Each replica's
+        # LEADER samples its shard; leaders gather their token lists to rank 0.
+        j = get_replica_index()
+        sub_seqs, is_prefill = payload[j]
+        if sub_seqs:
+            token_ids = self.run(sub_seqs, is_prefill)   # leader: list; non-leaders: None
+        else:
+            self.run_dummy()
+            token_ids = []
+        if is_tp_leader():
+            dp = self.config.data_parallel_size
+            gathered = [None] * dp if self.rank == 0 else None
+            # dst=0 is both global rank 0 and dp-leader-group rank 0 (leader_ranks[0]==0),
+            # so it is unambiguous regardless of gather_object's dst convention.
+            dist.gather_object(token_ids if token_ids is not None else [], gathered, dst=0, group=get_dp_leader_group())
+            if self.rank == 0:
+                return gathered      # gathered[j] == replica j's tokens (group order == replica order)
+        return None
 
     @torch.inference_mode()
     def capture_cudagraph(self):

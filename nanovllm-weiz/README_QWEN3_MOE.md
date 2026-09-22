@@ -35,6 +35,7 @@ is reused from `models/qwen3.py`.
 | `nanovllm/config.py`, `engine/llm_engine.py`, `engine/model_runner.py` | **[C7/C8 mesh]** `data_parallel_size` knob; spawn `world = TP×DP` ranks; build `tp_group`/`ep_group`; KV sized by `tp_size`; **`num_kvcache_blocks` reconciled to the global `min` across ranks** (fixes a `tp=1` KV-cache OOB — see below). |
 | `nanovllm/layers/linear.py`, `layers/embed_head.py`, `models/qwen3.py` | **[C7/C8 mesh]** shard / all_reduce / LM-head gather over `tp_group` via the accessors (was the flat world). |
 | `repro_fused_moe_bug.py` | **new** — single-GPU probe + fused-vs-loop check for the *latent* [C9] int32 overflow (a separate issue from the fixed tp=1 KV-cache crash). |
+| `engine/llm_engine.py`, `engine/model_runner.py`, `engine/sequence.py`, `utils/parallel.py` | **[DP step 3]** per-replica `Scheduler`s + round-robin admission; `run_dp` synchronized global step + `run_dummy` lockstep filler for idle replicas; per-replica leader sampling + dp-leader `gather_object` token return; `Sequence` pickles `temperature`. `DP=1` byte-identical. |
 
 ## MoE block: two expert kernels on one representation
 
@@ -94,12 +95,17 @@ Layers read `get_tp_*()` / `get_ep_*()` accessors (set once in `model_runner`)
 instead of `dist.get_world_size()/get_rank()`. **`DP=1` keeps `tp_group=None` (the
 world) → byte-identical to the old flat path.**
 
-`tp_size < world` is now expressible: `TP=4 DP=2` is the **C8** shape (two TP groups
-over one EP world), `TP=1 DP=8` is **C7** (pure EP). NOTE: there is **no DP engine
-yet** (step 3) — the batch is still **replicated** across DP replicas, so `DP>1`
-builds and validates the subgroup collectives but the replicas do redundant work
-until step 3 partitions the batch. `MOE_EP_MODE=allreduce` (C6) stays the default;
-`ep_size==1` is the single-GPU path.
+`tp_size < world` is expressible: `TP=4 DP=2` is the **C8** shape (two TP groups over
+one EP world), `TP=1 DP=8` is **C7** (pure EP). **[step 3] the DP engine is implemented**:
+`llm_engine` holds one `Scheduler` per replica (requests round-robin'd at admission,
+KV never migrates); `model_runner.run_dp` runs a synchronized global step where each
+replica forwards its **distinct** batch shard; a drained/idle replica runs a **dummy
+forward** (`run_dummy`, 1 token, `slot=-1`) to stay in `ep_group`-collective lockstep;
+each replica's leader samples its shard and a **dp-leader `gather_object`** returns
+tokens to rank 0. So `DP>1` is now a real throughput win, not redundant work. **`DP>1`
+requires `MOE_EP_MODE=hybrid`** (allreduce mode all-reduces `[T,H]` over the world →
+shape mismatch across replicas; asserted in `model_runner`). `ep_size==1` is the
+single-GPU path.
 
 ### [C7/C8] `TP=1` KV-cache OOB — FIXED (and why it looked like a kernel bug)
 
@@ -176,11 +182,16 @@ grep -rn "\[C4\]\|\[C5-b\]\|\[C6\]\|\[C7/C8\]\|\[C9\]\|\[contract" nanovllm/
 ## Scope / status
 
 - **Single-GPU and expert-parallel** with a **TP/EP device mesh** (`world = TP × DP`,
-  step 2) and two EP schedules — **C6** (`all_reduce`, default) and the **C7/C8 hybrid
-  block** (`MOE_EP_MODE=hybrid`). `tp_size < world` is expressible: **C8** shape
-  (`TP=4 DP=2`), **C7** shape (`TP=1 DP=8`). `DP=1` is byte-identical to the old flat
-  path. Still **no DP engine** (step 3) — `DP>1` replicas process the *replicated* batch
-  redundantly until the batch is partitioned. `ep ∈ {1,2,4,8}` (128 % ep == 0).
+  step 2) + a real **data-parallel engine** (step 3) and two EP schedules — **C6**
+  (`all_reduce`, default) and the **C7/C8 hybrid block** (`MOE_EP_MODE=hybrid`).
+  `tp_size < world` runs true **C8** (`TP=4 DP=2`) and **C7** (`TP=1 DP=8`) with each
+  replica on a **distinct** batch shard. `DP=1` is byte-identical to the old flat path.
+  `ep ∈ {1,2,4,8}` (128 % ep == 0).
+- **[step 3] Real DP — throughput win** (full 1319 GSM8K, 8×A100, fused hybrid): DP=1
+  (TP=8) **0.9030 / 309s** → C8 (TP=4 DP=2) **0.8992 / 234s (1.3×)** → C7 (TP=1 DP=8)
+  **0.8939 / 153s (2.0×)**. Monotonic wall-clock speedup at in-band accuracy — the
+  payoff that step 2's redundant replicas lacked. Validated across mixed prefill/decode
+  and drained-replica dummy-forward lockstep with no NCCL hang.
 - **Validated quantitatively** against the production-vLLM GSM8K oracle (strict
   **0.8923**): C6 lands **0.8886–0.8969 across ep=1–8** (loop and fused, within the
   oracle's ±0.85%). The **mesh + hybrid** reproduce it across shapes: DP=1 hybrid

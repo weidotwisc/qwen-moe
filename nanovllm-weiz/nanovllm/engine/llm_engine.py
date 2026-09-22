@@ -33,7 +33,14 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        # [DP step 3] one Scheduler per DP replica (each is a self-contained per-replica unit:
+        # its own waiting/running/block_manager). DP==1 keeps the single scheduler untouched.
+        self.dp = config.data_parallel_size
+        if self.dp == 1:
+            self.scheduler = Scheduler(config)
+        else:
+            self.schedulers = [Scheduler(config) for _ in range(self.dp)]
+            self._rr = 0
         atexit.register(self.exit)
 
     def exit(self):
@@ -46,18 +53,46 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+        if self.dp == 1:
+            self.scheduler.add(seq)
+        else:
+            # [DP step 3] static round-robin: a request lives on one replica for its lifetime
+            # (KV never migrates), like a DistributedSampler shard fixed at admission.
+            self.schedulers[self._rr % self.dp].add(seq)
+            self._rr += 1
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        if self.dp == 1:
+            seqs, is_prefill = self.scheduler.schedule()
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            return outputs, num_tokens
+        # [DP step 3] synchronized global step: schedule every replica (a drained replica gets
+        # an empty sub-batch -> a dummy forward keeps it in ep-collective lockstep), run all in
+        # one lockstep forward, gather per-replica tokens on rank 0, then postprocess each.
+        payload = [([], False) if s.is_finished() else s.schedule() for s in self.schedulers]
+        token_lists = self.model_runner.call("run_dp", payload)   # rank 0 -> list indexed by replica
+        outputs = []
+        prefill_toks = decode_seqs = 0
+        for j, s in enumerate(self.schedulers):
+            sub_seqs, is_prefill = payload[j]
+            if not sub_seqs:                    # dummy replica this step
+                continue
+            s.postprocess(sub_seqs, token_lists[j], is_prefill)
+            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in sub_seqs if seq.is_finished]
+            if is_prefill:
+                prefill_toks += sum(seq.num_scheduled_tokens for seq in sub_seqs)
+            else:
+                decode_seqs += len(sub_seqs)
+        num_tokens = prefill_toks if prefill_toks else -decode_seqs   # tqdm throughput display only
         return outputs, num_tokens
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        if self.dp == 1:
+            return self.scheduler.is_finished()
+        return all(s.is_finished() for s in self.schedulers)
 
     def generate(
         self,
