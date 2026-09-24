@@ -1,0 +1,264 @@
+<title>nanovllm DP Orchestration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root{
+    --bg:#f4f6f8; --surface:#ffffff; --surface-2:#eef2f6;
+    --ink:#16202b; --muted:#586674; --line:#ccd6e0;
+    --control:#2563a5; --control-bg:#e8f0fa;
+    --data:#0f766e; --data-bg:#e2f2ef;
+    --rank0:#b45309; --rank0-bg:#fbf1e4;
+    --shadow:0 1px 2px rgba(20,32,45,.06),0 3px 12px rgba(20,32,45,.05);
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+    --bg:#0d1319; --surface:#141c25; --surface-2:#1a2430;
+    --ink:#e6edf4; --muted:#93a3b4; --line:#2a3745;
+    --control:#78ade0; --control-bg:#16273a;
+    --data:#4fc4b7; --data-bg:#12312d;
+    --rank0:#e2a559; --rank0-bg:#2a1f10;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 3px 14px rgba(0,0,0,.35);
+    color-scheme:dark;
+  }}
+  :root[data-theme="dark"]{
+    --bg:#0d1319; --surface:#141c25; --surface-2:#1a2430;
+    --ink:#e6edf4; --muted:#93a3b4; --line:#2a3745;
+    --control:#78ade0; --control-bg:#16273a;
+    --data:#4fc4b7; --data-bg:#12312d;
+    --rank0:#e2a559; --rank0-bg:#2a1f10;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 3px 14px rgba(0,0,0,.35);
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+    line-height:1.5;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1000px;margin:0 auto;padding-block:40px;padding-left:20px;padding-right:20px;}
+  code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;}
+  header .eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--data);font-weight:600;}
+  h1{font-size:clamp(28px,5vw,40px);line-height:1.08;margin:.28em 0 .18em;font-weight:700;text-wrap:balance;letter-spacing:-.01em;}
+  .lede{color:var(--muted);font-size:16px;max-width:64ch;margin:0;}
+  h2{font-size:13px;letter-spacing:.13em;text-transform:uppercase;color:var(--muted);font-weight:600;
+     margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);}
+  section{margin-top:44px;}
+  .legend{display:flex;flex-wrap:wrap;gap:10px 20px;margin-top:26px;padding:14px 16px;
+    background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);}
+  .legend div{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--ink);}
+  .sw{width:26px;height:12px;border-radius:3px;flex:none;}
+  .sw.line{height:0;border-top-width:2.5px;border-top-style:solid;border-radius:0;}
+  .sw.c{background:var(--control-bg);border:1px solid var(--control);}
+  .sw.d{border-top-color:var(--data);}
+  .sw.r{background:var(--rank0-bg);border:1px solid var(--rank0);}
+  figure{margin:0;}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;
+    background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:8px 10px;}
+  svg{display:block;width:100%;height:auto;min-width:560px;color:var(--ink);}
+  figcaption{margin-top:12px;color:var(--muted);font-size:14px;max-width:78ch;}
+  figcaption b{color:var(--ink);font-weight:600;}
+  /* svg tokens */
+  .fill-surface{fill:var(--surface)} .fill-surface2{fill:var(--surface-2)}
+  .stroke-line{stroke:var(--line)} .fill-ink{fill:var(--ink)} .fill-muted{fill:var(--muted)}
+  .box{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+  .box2{fill:var(--surface-2);stroke:var(--line);stroke-width:1.5}
+  .rank0{fill:var(--rank0-bg);stroke:var(--rank0);stroke-width:1.5}
+  .ctrlbox{fill:var(--control-bg);stroke:var(--control);stroke-width:1.5}
+  .databox{fill:var(--data-bg);stroke:var(--data);stroke-width:1.5}
+  .t{fill:var(--ink);font-family:"IBM Plex Sans",sans-serif;font-size:13px}
+  .t.sm{font-size:11.5px} .t.mut{fill:var(--muted)} .t.b{font-weight:600}
+  .m{fill:var(--ink);font-family:"IBM Plex Mono",monospace;font-size:11px}
+  .m.mut{fill:var(--muted)} .m.c{fill:var(--control)} .m.d{fill:var(--data)}
+  .lab-c{fill:var(--control);font-family:"IBM Plex Mono",monospace;font-size:11px}
+  .ttl-r{fill:var(--rank0);font-weight:700;font-family:"IBM Plex Sans",sans-serif;font-size:14px}
+  .ttl-c{fill:var(--control);font-weight:700;font-family:"IBM Plex Sans",sans-serif;font-size:14px}
+  .ln{stroke:var(--ink);stroke-width:1.6;fill:none}
+  .ln-c{stroke:var(--control);stroke-width:1.8;fill:none}
+  .ln-d{stroke:var(--data);stroke-width:1.8;fill:none}
+  .fill-c{fill:var(--control)} .fill-d{fill:var(--data)}
+  table{width:100%;border-collapse:collapse;margin-top:6px;font-size:13.5px;}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;}
+  td.step{white-space:nowrap;font-weight:600;}
+  td code{font-size:12.5px;color:var(--control);}
+  .callout{margin-top:20px;padding:16px 18px;border-left:3px solid var(--rank0);
+    background:var(--rank0-bg);border-radius:0 10px 10px 0;font-size:14px;}
+  .callout b{color:var(--rank0);}
+  .foot{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px;}
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">nano-vLLM · Qwen3-30B-A3B MoE</div>
+    <h1>DP Orchestration</h1>
+    <p class="lede">How the data-parallel engine launches one process per GPU, hands tokenized prompts to each replica, and reports sampled tokens back to rank 0 to drive scheduling — a single-controller / SPMD-worker loop.</p>
+  </header>
+
+  <div class="legend" role="list">
+    <div role="listitem"><span class="sw r"></span> rank 0 — controller <em>and</em> worker</div>
+    <div role="listitem"><span class="sw c"></span> control plane — shared memory + Events</div>
+    <div role="listitem"><span class="sw line d"></span> data plane — NCCL collective</div>
+  </div>
+
+  <section>
+    <h2>1 · Launch — one OS process per GPU</h2>
+    <figure>
+      <div class="scroll">
+        <svg viewBox="0 0 860 400" role="img" aria-label="LLMEngine spawns one worker process per GPU; rank 0 runs in the engine process as controller and worker; all ranks join one NCCL world with TP subgroups and ep_group equal to the whole world.">
+          <defs>
+            <marker id="a1" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-ink"/></marker>
+            <marker id="ad" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-d"/></marker>
+          </defs>
+
+          <!-- user script -->
+          <rect x="310" y="14" width="240" height="42" rx="8" class="box2"/>
+          <text x="430" y="32" text-anchor="middle" class="t b">user script</text>
+          <text x="430" y="48" text-anchor="middle" class="m mut">LLM(TP, DP).generate(prompts)</text>
+          <line x1="430" y1="56" x2="430" y2="88" class="ln" marker-end="url(#a1)"/>
+
+          <!-- engine process (rank 0) -->
+          <rect x="22" y="92" width="470" height="208" rx="12" class="rank0"/>
+          <text x="40" y="114" class="ttl-r">engine process · rank 0</text>
+          <rect x="40" y="124" width="434" height="44" rx="6" class="box"/>
+          <text x="52" y="142" class="t b sm">schedulers[0 … DP−1]</text>
+          <text x="52" y="159" class="m">add_request(): round-robin shard → scheduler[_rr % DP]</text>
+          <rect x="40" y="176" width="434" height="44" rx="6" class="box"/>
+          <text x="52" y="194" class="t b sm">rank-0 ModelRunner → GPU 0</text>
+          <text x="52" y="211" class="m">step(): build payload · collect results · detokenize</text>
+          <rect x="40" y="228" width="434" height="44" rx="6" class="ctrlbox"/>
+          <text x="52" y="246" class="t b sm">SharedMemory("nanovllm") + Event[N−1]</text>
+          <text x="52" y="263" class="m c">control-plane broadcast → workers</text>
+          <text x="40" y="290" class="t sm mut">rank 0 is both controller and a GPU-0 worker</text>
+
+          <!-- workers -->
+          <rect x="576" y="100" width="262" height="52" rx="8" class="box"/>
+          <text x="590" y="121" class="t b sm">rank 1 · ModelRunner → GPU 1</text>
+          <text x="590" y="139" class="m mut">loop() → read_shm() → run(…)</text>
+          <rect x="576" y="166" width="262" height="52" rx="8" class="box"/>
+          <text x="590" y="187" class="t b sm">rank 2 · ModelRunner → GPU 2</text>
+          <text x="590" y="205" class="m mut">pure worker</text>
+          <rect x="576" y="232" width="262" height="52" rx="8" class="box"/>
+          <text x="590" y="253" class="t b sm">⋯  rank N−1 · ModelRunner → GPU N−1</text>
+          <text x="590" y="271" class="m mut">pure worker</text>
+
+          <!-- spawn arrows -->
+          <text x="500" y="94" class="m mut">ctx.Process("spawn") ×(N−1)</text>
+          <line x1="494" y1="150" x2="574" y2="126" class="ln" marker-end="url(#a1)"/>
+          <line x1="494" y1="176" x2="574" y2="192" class="ln" marker-end="url(#a1)"/>
+          <line x1="494" y1="200" x2="574" y2="258" class="ln" marker-end="url(#a1)"/>
+
+          <!-- NCCL world -->
+          <line x1="257" y1="300" x2="257" y2="322" class="ln-d"/>
+          <line x1="707" y1="284" x2="707" y2="322" class="ln-d"/>
+          <rect x="22" y="322" width="816" height="58" rx="10" class="databox"/>
+          <text x="430" y="346" text-anchor="middle" class="t b sm">one NCCL world · init_process_group("nccl", tcp://localhost:2333)</text>
+          <text x="430" y="365" text-anchor="middle" class="m d">tp_group = contiguous tp_size block   ·   ep_group = whole world (all GPUs)</text>
+        </svg>
+      </div>
+      <figcaption><b>world_size = TP × DP = #GPUs.</b> <code>LLMEngine.__init__</code> spawns <code>world_size − 1</code> worker processes (spawn context) and runs rank 0's <code>ModelRunner</code> in its own process. Every rank binds one GPU (<code>set_device(rank)</code>) and joins the same NCCL world; TP shards live in contiguous <code>tp_group</code> blocks, the MoE <code>ep_group</code> is the whole world.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>2 · One global step — hand out work, run, report back</h2>
+    <figure>
+      <div class="scroll">
+        <svg viewBox="0 0 900 480" role="img" aria-label="Each global step: rank 0 schedules a sub-batch per replica (empty if idle), broadcasts it over shared memory, all ranks run one lockstep forward with a per-layer ep_group all-to-all, TP-leaders gather sampled tokens back to rank 0, which postprocesses and loops until all schedulers are finished.">
+          <defs>
+            <marker id="b1" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-ink"/></marker>
+            <marker id="bc" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-c"/></marker>
+            <marker id="bd0" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-d"/></marker>
+            <marker id="bd1" markerWidth="9" markerHeight="9" refX="2" refY="4" orient="auto"><path d="M8,0 L0,4 L8,8 z" class="fill-d"/></marker>
+          </defs>
+
+          <!-- (1) schedule -->
+          <rect x="20" y="46" width="196" height="92" rx="10" class="rank0"/>
+          <text x="32" y="66" class="ttl-r">① schedule</text>
+          <text x="32" y="90" class="m">payload[j] =</text>
+          <text x="32" y="106" class="m">  s.schedule()</text>
+          <text x="32" y="122" class="m mut">  or [] &#8592; idle replica</text>
+
+          <line x1="216" y1="92" x2="252" y2="92" class="ln-c" marker-end="url(#bc)"/>
+
+          <!-- (2) broadcast -->
+          <rect x="254" y="46" width="176" height="92" rx="10" class="ctrlbox"/>
+          <text x="266" y="66" class="ttl-c">② broadcast</text>
+          <text x="266" y="90" class="m c">write_shm(payload)</text>
+          <text x="266" y="106" class="m c">Event.set() ×(N−1)</text>
+          <text x="266" y="126" class="m mut">shared memory</text>
+
+          <text x="530" y="30" text-anchor="middle" class="lab-c">workers read_shm → run the same method (SPMD)</text>
+          <line x1="430" y1="92" x2="454" y2="92" class="ln-c" marker-end="url(#bc)"/>
+
+          <!-- (3) run_dp -->
+          <rect x="454" y="46" width="262" height="186" rx="12" class="box2"/>
+          <text x="466" y="66" class="t b">③ run_dp — every rank</text>
+          <rect x="470" y="78" width="112" height="98" rx="8" class="box"/>
+          <text x="526" y="98" text-anchor="middle" class="t b sm">replica 0</text>
+          <text x="526" y="114" text-anchor="middle" class="t sm mut">GPU 0</text>
+          <text x="526" y="138" text-anchor="middle" class="m">run(seqs)</text>
+          <text x="526" y="154" text-anchor="middle" class="m mut">prefill /</text>
+          <text x="526" y="168" text-anchor="middle" class="m mut">decode</text>
+          <rect x="588" y="78" width="112" height="98" rx="8" class="box"/>
+          <text x="644" y="98" text-anchor="middle" class="t b sm">replica 1</text>
+          <text x="644" y="114" text-anchor="middle" class="t sm mut">GPU 1</text>
+          <text x="644" y="138" text-anchor="middle" class="m">run() or</text>
+          <text x="644" y="154" text-anchor="middle" class="m d">run_dummy()</text>
+          <!-- all-to-all U connector -->
+          <path d="M520,176 V196 H650 V176" class="ln-d" marker-start="url(#bd1)" marker-end="url(#bd0)"/>
+          <text x="585" y="220" text-anchor="middle" class="m d">ep_group all-to-all · every MoE layer</text>
+
+          <line x1="716" y1="92" x2="742" y2="92" class="ln-c" marker-end="url(#bc)"/>
+
+          <!-- (4) gather -->
+          <rect x="742" y="50" width="150" height="84" rx="10" class="ctrlbox"/>
+          <text x="754" y="70" class="ttl-c">④ gather</text>
+          <text x="754" y="92" class="m c">gather_object</text>
+          <text x="754" y="108" class="m c">TP-leaders → r0</text>
+          <text x="754" y="126" class="m mut">dp_leader_group</text>
+
+          <!-- (4)->(5) -->
+          <polyline points="817,134 817,358 654,358" class="ln-c" marker-end="url(#bc)"/>
+
+          <!-- (5) postprocess -->
+          <rect x="250" y="316" width="400" height="84" rx="10" class="rank0"/>
+          <text x="262" y="338" class="ttl-r">⑤ postprocess  (rank 0)</text>
+          <text x="262" y="362" class="m">s.postprocess(seqs, tokens)</text>
+          <text x="262" y="380" class="m mut">append token · mark finished · free KV blocks</text>
+
+          <line x1="450" y1="400" x2="450" y2="424" class="ln" marker-end="url(#b1)"/>
+
+          <!-- decision -->
+          <rect x="238" y="426" width="424" height="40" rx="20" class="box"/>
+          <text x="450" y="451" text-anchor="middle" class="t sm">is_finished() = all(schedulers)?   no → next step   ·   yes → return outputs</text>
+
+          <!-- loopback -->
+          <polyline points="238,446 12,446 12,92 18,92" class="ln" marker-end="url(#b1)"/>
+          <text x="150" y="440" class="t sm mut">loop → next global step</text>
+        </svg>
+      </div>
+      <figcaption><b>Rank 0 owns the schedulers and drives one synchronized step across all replicas.</b> A drained replica gets an empty sub-batch (<code>[]</code>) and runs <code>run_dummy()</code> — a full forward on one synthetic token — so it still posts every layer's <code>all_to_all</code> and the world can't deadlock. Only <b>TP-leaders</b> gather sampled tokens back; rank 0 postprocesses per scheduler and loops until <code>all(schedulers)</code> are finished. Tokens/commands move over shared memory (blue); tensors never do — they move over NCCL (teal).</figcaption>
+    </figure>
+
+    <div class="callout">
+      <b>Concrete trace</b> — 2 GPUs (DP=2, TP=1), prompt 1 → replica 0 (+100 tokens), prompt 2 → replica 1 (+50). Both take the <code>run()</code> branch through prefill and the first ~50 decode steps. Once prompt 2 hits 50 tokens, <code>schedulers[1].is_finished()</code> flips → replica 1's slot becomes <code>[]</code> → <code>run_dummy()</code> for ~50 steps while prompt 1 finishes. <code>is_finished()</code> returns true only when <em>both</em> schedulers are done, so the two ranks stop on the same step.
+    </div>
+  </section>
+
+  <section>
+    <h2>3 · Where each step lives in the code</h2>
+    <table>
+      <thead><tr><th>Step</th><th>Code</th></tr></thead>
+      <tbody>
+        <tr><td class="step">launch</td><td><code>LLMEngine.__init__</code> — spawn workers, rank-0 in-process &nbsp;·&nbsp; llm_engine.py:24–33</td></tr>
+        <tr><td class="step">① shard + schedule</td><td><code>add_request</code> (round-robin) &nbsp;·&nbsp; <code>step()</code> builds payload &nbsp;·&nbsp; llm_engine.py:59, :75</td></tr>
+        <tr><td class="step">② broadcast</td><td><code>ModelRunner.call → write_shm</code> + Events &nbsp;·&nbsp; model_runner.py:132, :122</td></tr>
+        <tr><td class="step">③ run / dummy</td><td><code>run_dp</code> picks payload[replica]; <code>run</code> or <code>run_dummy</code> &nbsp;·&nbsp; model_runner.py:304, :289</td></tr>
+        <tr><td class="step">④ gather</td><td><code>dist.gather_object(…, group=dp_leader_group)</code> &nbsp;·&nbsp; model_runner.py:321</td></tr>
+        <tr><td class="step">⑤ postprocess</td><td><code>Scheduler.postprocess</code> — append / finish / free KV &nbsp;·&nbsp; llm_engine.py:83</td></tr>
+        <tr><td class="step">loop</td><td><code>is_finished() = all(s.is_finished())</code> &nbsp;·&nbsp; llm_engine.py:95</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <p class="foot">DP=1 (pure TP+EP) is the same machinery with one scheduler, <code>tp_group = None</code> (= world), and no dp-leader group — byte-identical to upstream nano-vLLM. DP&gt;1 adds N schedulers, round-robin admission, and the <code>run_dp</code> lockstep above.</p>
+</div>
