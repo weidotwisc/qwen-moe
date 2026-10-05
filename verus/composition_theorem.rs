@@ -23,6 +23,10 @@ pub use kernel_refinement::*;
 mod schedule_refinement;
 pub use schedule_refinement::*;
 
+#[path = "all_gather_refinement.rs"]
+mod all_gather_refinement;
+pub use all_gather_refinement::*;
+
 #[path = "component_integration.rs"]
 mod component_integration;
 pub use component_integration::*;
