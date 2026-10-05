@@ -164,7 +164,44 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             sorted_out[start:end] = h @ self.w_down[e].t()      # [n_e, H]
         return sorted_out
 
+    # ---- [C-KDA] agent-generated full-MoE kernels (single-GPU, ep=1) -----------
+    # Jun's KDA kernels (nanovllm/layers/kda_{triton,cuda}) do routing + dispatch +
+    # SwiGLU experts + weighted combine in ONE call (vLLM-style w13/w2 layout), so
+    # they replace the whole block, not just the _expert_compute box. Single-device
+    # only: all E experts at local_expert_offset=0, no cross-rank collective. Routing
+    # is topk->softmax == nano's norm_topk_prob, so results match.
+    def _kda_weights(self):
+        # Fuse nano's stacked w_gate/w_up ([E,I,H] each) into w13=[E,2I,H] (gate over
+        # up) and reuse w_down as w2=[E,H,I]. Built lazily (weights load post-init),
+        # cached thereafter.
+        if getattr(self, "_kda_w13", None) is None:
+            # Fuse gate|up -> w13 [E,2I,H] and FREE the originals. Each of the 48 MoE
+            # blocks would otherwise hold BOTH w_gate/w_up AND their w13 copy, duplicating
+            # ~2/3 of the expert weights (~36 GB total) -> OOM on one 80 GB GPU. w_down is
+            # already the [E,H,I] layout w2 wants, so reuse it (no copy).
+            self._kda_w13 = torch.cat([self.w_gate.data, self.w_up.data], dim=1).contiguous()
+            self._kda_w2 = self.w_down.data
+            self.w_gate = None
+            self.w_up = None
+        return self._kda_w13, self._kda_w2
+
+    def _forward_kda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.ep_size == 1, "MOE_KERNEL=kda_* is single-GPU (ep=1) only"
+        logits = self.gate(hidden_states)                                 # [T, E]
+        w13, w2 = self._kda_weights()
+        if self.kernel == "kda_triton":
+            from nanovllm.layers.kda_triton.triton_moe import moe_forward
+            out = moe_forward(hidden_states, w13, w2, logits, 0, top_k=self.top_k)
+        else:  # kda_cuda  (note: CUDA op takes routing_logits FIRST, then hidden)
+            from nanovllm.layers.kda_cuda import moe_ext
+            out = moe_ext.load().moe_forward(logits, hidden_states, w13, w2, 0)
+        return out.to(hidden_states.dtype)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # [C-KDA] agent-generated full-MoE kernels do the whole block in one call,
+        # so short-circuit here (single-GPU ep=1 only; see _forward_kda).
+        if self.kernel in ("kda_triton", "kda_cuda"):
+            return self._forward_kda(hidden_states)
         # [C7/C8] Hybrid dispatch schedule (stripe -> all-to-all dispatch -> local
         # experts -> combine -> all_gather), selected by MOE_EP_MODE=hybrid. Only under
         # EP; the default "allreduce" (and every ep_size==1 run) falls through to the

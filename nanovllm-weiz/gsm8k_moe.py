@@ -84,7 +84,10 @@ def main():
     print(f"[gsm8k] MOE_KERNEL={kernel}  TP={tp} DP={dp} (world={tp*dp}=ep)  "
           f"MOE_EP_MODE={os.environ.get('MOE_EP_MODE', 'allreduce')}  "
           f"n={len(prompts)}  n_shot={n_shot}  max_tokens={max_tokens}", flush=True)
-    llm = LLM(resolve_model(), enforce_eager=True, tensor_parallel_size=tp, data_parallel_size=dp, max_model_len=4096)
+    max_batched = int(os.environ.get("MAX_BATCHED", 16384))
+    gpu_util = float(os.environ.get("GPU_UTIL", 0.9))
+    llm = LLM(resolve_model(), enforce_eager=True, tensor_parallel_size=tp, data_parallel_size=dp,
+              max_model_len=4096, max_num_batched_tokens=max_batched, gpu_memory_utilization=gpu_util)
     sp = SamplingParams(temperature=0.1, max_tokens=max_tokens)   # near-greedy (nano-vLLM forbids temp=0)
     t0 = perf_counter()
     outs = llm.generate(prompts, sp)   # all prompts submitted up front -> scheduler batches greedily
