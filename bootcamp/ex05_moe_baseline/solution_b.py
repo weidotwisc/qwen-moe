@@ -117,24 +117,17 @@ class PermutedSparseMoE(nn.Module):
         x_flat = x.reshape(-1, original_shape[-1]) # BxT, H, aka (N,H)
         N = x_flat.shape[0] 
         y_flat = torch.zeros_like(x_flat) # (N,H)
-        # ============ Step 1: Router (SAME as Ex05a) ============
-        # TODO(you):
-        # - router_logits = self.gate(x_flat)                               # [N, E]
-        # - routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        # - routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        # - if norm_topk_prob: normalize routing_weights.
-        # - Cast routing_weights back to x_flat.dtype.
-        # After this step:
-        #   selected_experts: [N, top_k]  expert IDs per token per k
-        #   routing_weights:  [N, top_k]  weights per token per k (sum to 1 per token if norm)
-
+        
+        
+        # weiz step1: prepare inputs
+        # step 1.1 : sort based on router logits
         router_logits = self.gate(x_flat) # N,E
         top_k_weights, top_k_experts = torch.topk(router_logits, k=self.top_k, dim=-1) # both N,k
         if self.norm_topk_prob:
             top_k_weights = F.softmax(top_k_weights,dim=-1) # N,k
         else:
             top_k_weights = F.softmax(router_logits, dim=-1).gather(dim=-1, index=top_k_experts)
-
+        # step 1.2: argsort + perm trick to prepare X sorted based on expert id
         top_k_experts_flat = top_k_experts.reshape(-1) # (Nk,)
         top_k_weights_flat = top_k_weights.reshape(-1) # (Nk,)
         top_k_experts_ids, top_k_experts_permutation = torch.sort(top_k_experts_flat) # both (Nk,)
@@ -144,6 +137,8 @@ class PermutedSparseMoE(nn.Module):
         x_flat_permuted = x_flat[token_idx_rep_permuted_by_experts] # (Nk,H) improvment 1! prepare the input X upfront
         top_k_weights_flat_permuted = top_k_weights_flat[top_k_experts_permutation] # bug fix! (Nk,), now this weights is grouped by expert id
         expert_output = torch.zeros_like(x_flat_permuted) # (Nk,H) improvement 2, having a write buffer, 
+        
+        # weiz step2: per expert calculation
         start=0
         for expert_id, token_cnt_tensor in enumerate(expert_bincnt):
             token_cnt = token_cnt_tensor.item() # token_cnt is number of tokens corresponding to this expert
@@ -161,6 +156,7 @@ class PermutedSparseMoE(nn.Module):
             # update start
             start += token_cnt
         expert_output *= top_k_weights_flat_permuted[:,None] # (Nk,H) improvement! one big scaling, 
+        # weiz step 3 collect results back
         y_flat.index_add_(dim=0, index=token_idx_rep_permuted_by_experts, source=expert_output) # imporvement on big scaling
         return y_flat.reshape(original_shape)
             
@@ -168,51 +164,4 @@ class PermutedSparseMoE(nn.Module):
 
 
 
-        # ============ Step 2: Flatten routing to (N * top_k) triples ============
-        # Every (token, expert-choice) pair becomes an independent record.
-        # TODO(you):
-        # - token_ids  = torch.arange(N, device=x.device).repeat_interleave(self.top_k)
-        #   equivalently: torch.arange(N).unsqueeze(-1).expand(N, top_k).reshape(-1)
-        #   Result: [0, 0, ..., 0, 1, 1, ..., 1, ..., N-1, ..., N-1]  (each rank 0..N-1 repeated top_k times)
-        # - expert_ids = selected_experts.reshape(-1)                         # [N * top_k]
-        # - weights    = routing_weights.reshape(-1)                          # [N * top_k]
-
-            #y_flat.index_add_(dim=0, index=token_ids,source=expert_tokens_contribution)
-        # ============ Step 3: Argsort by expert_id to compute permutation ============
-        # TODO(you):
-        # - permutation = torch.argsort(expert_ids)                           # [N * top_k]
-        #   After permuting, all records for expert 0 come first, then expert 1, ...
-        # - sorted_expert_ids = expert_ids[permutation]
-        # - sorted_token_ids  = token_ids[permutation]
-        # - sorted_weights    = weights[permutation]
-
-        # ============ Step 4: Compute per-expert offsets ============
-        # TODO(you):
-        # - counts  = torch.bincount(sorted_expert_ids, minlength=self.num_experts)   # [num_experts]
-        # - offsets = torch.cat([
-        #       torch.zeros(1, dtype=torch.long, device=x.device),
-        #       counts.cumsum(0),
-        #   ])   # [num_experts + 1]. offsets[e] is where expert e's slice starts.
-
-        # ============ Step 5: Gather sorted input ============
-        # TODO(you):
-        # - sorted_x = x_flat[sorted_token_ids]  # [N * top_k, hidden]
-
-        # ============ Step 6: Grouped per-expert compute ============
-        # TODO(you):
-        # - sorted_out = torch.empty_like(sorted_x)
-        # - for e in range(self.num_experts):
-        #       start, end = int(offsets[e]), int(offsets[e + 1])
-        #       if start == end: continue
-        #       sorted_out[start:end] = self.experts[e](sorted_x[start:end])
-        #   NOTE: unlike Ex05a's naive loop, each expert here gets a CONTIGUOUS slice —
-        #   the underlying matmul is one big call, not many small ones per token.
-
-        # ============ Step 7: Weight + unpermute + combine ============
-        # TODO(you):
-        # - sorted_out = sorted_out * sorted_weights.unsqueeze(-1)             # elementwise weight
-        # - output = torch.zeros_like(x_flat)
-        # - output.index_add_(0, sorted_token_ids, sorted_out)
-        #   Each token gets top_k contributions summed into its output slot.
-        # - return output.reshape(original_shape)
         
